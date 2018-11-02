@@ -207,7 +207,7 @@ drop language plpythonu;
 create language plpythonu;
 create function update_on_segment(tabname text, segid int, numseg int) returns boolean as
 $$
-import pygresql.pg as pg
+import pg
 conn = pg.connect(dbname='regression')
 port = conn.query("select port from gp_segment_configuration where content = %d and role = 'p'" % segid).getresult()[0][0]
 conn.close()
@@ -223,7 +223,7 @@ LANGUAGE plpythonu;
 
 create function select_on_segment(sql text, segid int) returns int as
 $$
-import pygresql.pg as pg
+import pg
 conn = pg.connect(dbname='regression')
 port = conn.query("select port from gp_segment_configuration where content = %d and role = 'p'" % segid).getresult()[0][0]
 conn.close()
