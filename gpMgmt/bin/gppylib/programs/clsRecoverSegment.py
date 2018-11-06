@@ -626,7 +626,7 @@ class GpRecoverSegmentProgram:
             confProvider.sendPgElogFromMaster("Recovery of %d segment(s) has been started." % \
                                               len(mirrorBuilder.getMirrorsToBuild()), True)
 
-            self.trigger_fts_probe(gpArray)
+            # self.trigger_fts_probe(gpArray)
 
             self.logger.info("******************************************************************")
             self.logger.info("Updating segments for streaming is completed.")
