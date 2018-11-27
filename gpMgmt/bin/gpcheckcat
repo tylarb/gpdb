@@ -3690,7 +3690,7 @@ class CatForeignKeyIssue:
 
     def report(self):
 
-        ids = segids 
+        ids = self.segids 
         idstr = ''
         if len(ids) == len(GV.report_cfg):
             idstr = 'all segments'
