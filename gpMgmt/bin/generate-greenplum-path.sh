@@ -40,19 +40,9 @@ if [ -h \${GPHOME}/../greenplum-db ]; then
 fi
 EOF
 
-cat <<EOF
-#setup PYTHONHOME
-if [ -x \$GPHOME/ext/python/bin/python ]; then
-    PYTHONHOME="\$GPHOME/ext/python"
-fi
-EOF
 
 #setup PYTHONPATH
-if [ "x${PYTHONPATH}" == "x" ]; then
-    PYTHONPATH="\$GPHOME/lib/python"
-else
-    PYTHONPATH="\$GPHOME/lib/python:${PYTHONPATH}"
-fi
+PYTHONPATH="\$GPHOME/lib/python:${PYTHONPATH}"
 cat <<EOF
 PYTHONPATH=${PYTHONPATH}
 EOF
@@ -60,10 +50,6 @@ EOF
 GP_BIN_PATH=\$GPHOME/bin
 GP_LIB_PATH=\$GPHOME/lib
 
-if [ -n "$PYTHONHOME" ]; then
-    GP_BIN_PATH=${GP_BIN_PATH}:\$PYTHONHOME/bin
-    GP_LIB_PATH=${GP_LIB_PATH}:\$PYTHONHOME/lib
-fi
 cat <<EOF
 PATH=${GP_BIN_PATH}:\$PATH
 EOF
@@ -87,7 +73,10 @@ fi
 
 # openssl configuration file path
 cat <<EOF
+if [ -e \$GPHOME/etc/openssl.cnf ]; then
 OPENSSL_CONF=\$GPHOME/etc/openssl.cnf
+export OPENSSL_CONF
+fi
 EOF
 
 cat <<EOF
@@ -97,9 +86,5 @@ EOF
 
 cat <<EOF
 export PYTHONPATH
-export PYTHONHOME
 EOF
 
-cat <<EOF
-export OPENSSL_CONF
-EOF

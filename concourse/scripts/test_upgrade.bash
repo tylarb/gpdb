@@ -98,6 +98,14 @@ load_old_db_data() {
         source '"${OLD_GPHOME}"'/greenplum_path.sh
         unxz < /tmp/dump.sql.xz | '"${psql_env}"' psql '"${psql_opts}"' -f - postgres
     '
+
+    # There are some states, important for upgrade, that can't be reached
+    # by restoring from a dump file only, so we explicitly setup these cases here.
+    scp "${DIRNAME}"/../../src/test/regress/sql/gp_upgrade_cornercases.sql ${MASTER_HOST}:/tmp/
+    ssh -n ${MASTER_HOST} '
+        source '"${OLD_GPHOME}"'/greenplum_path.sh
+        '"${psql_env}"' psql '"${psql_opts}"' -d postgres -f /tmp/gp_upgrade_cornercases.sql
+    '
 }
 
 dump_cluster() {
@@ -201,7 +209,6 @@ gpinitsystem_for_upgrade() {
         # XXX Disable mirrors for now.
         echo "unset MIRROR_DATA_DIRECTORY" >> gpinitsystem_config_new
         echo "unset MIRROR_PORT_BASE" >> gpinitsystem_config_new
-        echo "unset MIRROR_REPLICATION_PORT_BASE" >> gpinitsystem_config_new
 
         # echo "HEAP_CHECKSUM=off" >> gpinitsystem_config_new
         # echo "standard_conforming_strings = off" >> upgrade_addopts
@@ -229,6 +236,7 @@ run_upgrade() {
 
     ssh -ttn "$hostname" '
         source '"${NEW_GPHOME}"'/greenplum_path.sh
+        export TIMEFORMAT=$'\'''"$hostname"'::'"$datadir"'\telapsed\t%3lR\tuser\t%3lU\tsys\t%3lS'\''
         time pg_upgrade '"${upgrade_opts}"' '"$*"' \
             -b '"${OLD_GPHOME}"'/bin/ -B '"${NEW_GPHOME}"'/bin/ \
             -d '"$datadir"' \
@@ -308,7 +316,7 @@ compare_dumps() {
     scp "$DIRNAME/dumpsort.gawk" ${MASTER_HOST}:~
 
     ssh -n ${MASTER_HOST} "
-        diff -U3 --speed-large-files --ignore-space-change \
+        diff -w -U3 --speed-large-files --ignore-space-change \
             <(gawk -f ~/dumpsort.gawk < '$old_dump') \
             <(gawk -f ~/dumpsort.gawk < '$new_dump')
     "
@@ -427,8 +435,7 @@ while read -u30 hostname datadir; do
         --exclude /postmaster.opts \
         --exclude /gp_replication.conf \
         --exclude /gp_dbid \
-        --exclude /gpssh.conf \
-        --exclude /gpperfmon/
+        --exclude /gpssh.conf
 
     run_upgrade "$hostname" "$datadir" --mode=segment
 done 30< /tmp/segment_datadirs.txt
