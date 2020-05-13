@@ -31,19 +31,25 @@ if master_data_dir is None:
     raise Exception('MASTER_DATA_DIRECTORY is not set')
 
 
+def query_sql(dbname, sql):
+    result = None
+
+    with dbconn.connect(dbconn.DbURL(dbname=dbname), unsetSearchPath=False) as conn:
+        result = dbconn.query(conn, sql)
+        conn.commit()
+    return result
+
 def execute_sql(dbname, sql):
     result = None
 
     with dbconn.connect(dbconn.DbURL(dbname=dbname), unsetSearchPath=False) as conn:
-        result = dbconn.execSQL(conn, sql)
+        dbconn.execSQL(conn, sql)
         conn.commit()
-
-    return result
 
 def execute_sql_singleton(dbname, sql):
     result = None
     with dbconn.connect(dbconn.DbURL(dbname=dbname), unsetSearchPath=False) as conn:
-        result = dbconn.execSQLForSingleton(conn, sql)
+        result = dbconn.querySingleton(conn, sql)
 
     if result is None:
         raise Exception("error running query: %s" % sql)
@@ -208,7 +214,7 @@ def stop_database(context):
 def stop_primary(context, content_id):
     get_psegment_sql = 'select datadir, hostname from gp_segment_configuration where content=%i and role=\'p\';' % content_id
     with dbconn.connect(dbconn.DbURL(dbname='template1'), unsetSearchPath=False) as conn:
-        cur = dbconn.execSQL(conn, get_psegment_sql)
+        cur = dbconn.query(conn, get_psegment_sql)
         rows = cur.fetchall()
         seg_data_dir = rows[0][0]
         seg_host = rows[0][1]
@@ -231,14 +237,14 @@ def run_gprecoverseg():
 
 def getRows(dbname, exec_sql):
     with dbconn.connect(dbconn.DbURL(dbname=dbname), unsetSearchPath=False) as conn:
-        curs = dbconn.execSQL(conn, exec_sql)
+        curs = dbconn.query(conn, exec_sql)
         results = curs.fetchall()
     return results
 
 
 def getRow(dbname, exec_sql):
     with dbconn.connect(dbconn.DbURL(dbname=dbname), unsetSearchPath=False) as conn:
-        curs = dbconn.execSQL(conn, exec_sql)
+        curs = dbconn.query(conn, exec_sql)
         result = curs.fetchone()
     return result
 
@@ -248,7 +254,7 @@ def check_db_exists(dbname, host=None, port=0, user=None):
 
     results = []
     with dbconn.connect(dbconn.DbURL(hostname=host, username=user, port=port, dbname='template1'), unsetSearchPath=False) as conn:
-        curs = dbconn.execSQL(conn, LIST_DATABASE_SQL)
+        curs = dbconn.query(conn, LIST_DATABASE_SQL)
         results = curs.fetchall()
 
     for result in results:
@@ -315,7 +321,7 @@ def check_table_exists(context, dbname, table_name, table_type=None, host=None, 
 
         table_row = None
         try:
-            table_row = dbconn.execSQLForSingletonRow(conn, SQL)
+            table_row = dbconn.queryRow(conn, SQL)
         except Exception as e:
             context.exception = e
             return False
@@ -553,7 +559,7 @@ def create_int_table(context, table_name, table_type='heap', dbname='testdb'):
         dbconn.execSQL(conn, CREATE_TABLE_SQL)
         conn.commit()
 
-        result = dbconn.execSQLForSingleton(conn, SELECT_TABLE_SQL)
+        result = dbconn.querySingleton(conn, SELECT_TABLE_SQL)
         if result != NROW:
             raise Exception('Integer table creation was not successful. Expected %d does not match %d' % (NROW, result))
 
@@ -608,7 +614,7 @@ def check_row_count(context, tablename, dbname, nrows):
         dburl = dbconn.DbURL(dbname=dbname)
 
     with dbconn.connect(dburl, unsetSearchPath=False) as conn:
-        result = dbconn.execSQLForSingleton(conn, NUM_ROWS_QUERY)
+        result = dbconn.querySingleton(conn, NUM_ROWS_QUERY)
     if result != nrows:
         raise Exception('%d rows in table %s.%s, expected row count = %d' % (result, dbname, tablename, nrows))
 
@@ -702,7 +708,7 @@ def check_count_for_specific_query(dbname, query, nrows):
     NUM_ROWS_QUERY = '%s' % query
     # We want to bubble up the exception so that if table does not exist, the test fails
     with dbconn.connect(dbconn.DbURL(dbname=dbname), unsetSearchPath=False) as conn:
-        result = dbconn.execSQLForSingleton(conn, NUM_ROWS_QUERY)
+        result = dbconn.querySingleton(conn, NUM_ROWS_QUERY)
     if result != nrows:
         raise Exception('%d rows in query: %s. Expected row count = %d' % (result, query, nrows))
 
@@ -714,7 +720,7 @@ def get_primary_segment_host_port():
     FIRST_PRIMARY_DBID = 2
     get_psegment_sql = 'select hostname, port from gp_segment_configuration where dbid=%i;' % FIRST_PRIMARY_DBID
     with dbconn.connect(dbconn.DbURL(dbname='template1'), unsetSearchPath=False) as conn:
-        cur = dbconn.execSQL(conn, get_psegment_sql)
+        cur = dbconn.query(conn, get_psegment_sql)
         rows = cur.fetchall()
         primary_seg_host = rows[0][0]
         primary_seg_port = rows[0][1]

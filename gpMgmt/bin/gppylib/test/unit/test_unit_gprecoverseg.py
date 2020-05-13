@@ -73,8 +73,8 @@ class GpRecoversegTestCase(GpTestCase):
         self.apply_patches([
             patch('os.environ', new=self.os_env),
             patch('gppylib.db.dbconn.connect', return_value=self.conn),
-            patch('gppylib.db.dbconn.execSQL', return_value=self.cursor),
-            patch('gppylib.db.dbconn.execSQLForSingletonRow', return_value=["foo"]),
+            patch('gppylib.db.dbconn.query', return_value=self.cursor),
+            patch('gppylib.db.dbconn.queryRow', return_value=["foo"]),
             patch('gppylib.pgconf.readfile', return_value=self.pgconf_dict),
             patch('gppylib.commands.gp.GpVersion'),
             patch('gppylib.system.faultProberInterface.getFaultProber'),
@@ -164,7 +164,11 @@ class GpRecoversegTestCase(GpTestCase):
         self.return_one = False
 
         with self.assertRaises(SystemExit):
-            self.subject.run()
+            # the mock connection doesn't allow "with conn.cursor() as cursor" syntax required in
+            # execSQL used by trigger_fts_probe. We don't actually care about the probe, so we can
+            # mock the function entirely.
+            with patch.object(self.subject, 'trigger_fts_probe'):
+                self.subject.run()
 
         self.subject.logger.info.assert_any_call('No checksum validation necessary when '
                                                  'there are no segments to recover.')
@@ -257,7 +261,11 @@ class GpRecoversegTestCase(GpTestCase):
         self.mock_build_mirrors.return_value = True
 
         with self.assertRaises(SystemExit) as cm:
-            self.subject.run()
+            # the mock connection doesn't allow "with conn.cursor() as cursor" syntax required in
+            # execSQL used by trigger_fts_probe. We don't actually care about the probe, so we can
+            # mock the function entirely.
+            with patch.object(self.subject, 'trigger_fts_probe'):
+                self.subject.run()
 
         self.assertEqual(cm.exception.code, 0)
 
