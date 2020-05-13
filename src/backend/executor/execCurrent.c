@@ -3,7 +3,7 @@
  * execCurrent.c
  *	  executor support for WHERE CURRENT OF cursor
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *	src/backend/executor/execCurrent.c
@@ -12,6 +12,7 @@
  */
 #include "postgres.h"
 
+#include "access/relscan.h"
 #include "access/sysattr.h"
 #include "catalog/pg_type.h"
 #include "executor/executor.h"
@@ -23,11 +24,14 @@
 #include "parser/parse_relation.h"
 #include "parser/parsetree.h"
 #include "cdb/cdbvars.h"
+#include "cdb/cdbpartition.h"
 
 
 static char *fetch_cursor_param_value(ExprContext *econtext, int paramId);
-#ifdef NOT_USED
 static ScanState *search_plan_tree(PlanState *node, Oid table_oid);
+#ifdef NOT_USED
+static ScanState *search_plan_tree(PlanState *node, Oid table_oid,
+				 bool *pending_rescan);
 #endif /* NOT_USED */
 
 /*
@@ -184,31 +188,55 @@ getCurrentOf(CurrentOfExpr *cexpr,
 						cursor_name)));
 
 	/*
-	 * The referenced cursor must be simply updatable. This has already
-	 * been discerned by parse/analyze for the DECLARE CURSOR of the given
-	 * cursor. This flag assures us that gp_segment_id, ctid, and tableoid (if necessary)
-	 * will be available as junk metadata, courtesy of preprocess_targetlist.
+	 * gpdb partition table routine is different with upstream
+	 * so we hold private updatable check method.
 	 */
-	if (!queryDesc->plannedstmt->simplyUpdatable)
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_CURSOR_STATE),
-				 errmsg("cursor \"%s\" is not a simply updatable scan of table \"%s\"",
-						cursor_name, table_name)));
+	if(rel_is_partitioned(table_oid)
+	|| rel_is_leaf_partition(table_oid)
+	|| get_rel_persistence(table_oid) == RELPERSISTENCE_TEMP)
+	{
+		/*
+		 * The referenced cursor must be simply updatable. This has already
+		 * been discerned by parse/analyze for the DECLARE CURSOR of the given
+		 * cursor. This flag assures us that gp_segment_id, ctid, and tableoid (if necessary)
+		 * will be available as junk metadata, courtesy of preprocess_targetlist.
+		 */
+		if (!queryDesc->plannedstmt->simplyUpdatable)
+			ereport(ERROR,
+			        (errcode(ERRCODE_INVALID_CURSOR_STATE),
+					        errmsg("cursor \"%s\" is not a simply updatable scan of table \"%s\"",
+					               cursor_name, table_name)));
 
-	/*
-	 * The target relation must directly match the cursor's relation. This throws out
-	 * the simple case in which a cursor is declared against table X and the update is
-	 * issued against Y. Moreover, this disallows some subtler inheritance cases where
-	 * Y inherits from X. While such cases could be implemented, it seems wiser to
-	 * simply error out cleanly.
-	 */
-	Index varno = extractSimplyUpdatableRTEIndex(queryDesc->plannedstmt->rtable);
-	Oid cursor_relid = getrelid(varno, queryDesc->plannedstmt->rtable);
-	if (table_oid != cursor_relid)
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_CURSOR_STATE),
-				 errmsg("cursor \"%s\" is not a simply updatable scan of table \"%s\"",
-						cursor_name, table_name)));
+		/*
+		 * The target relation must directly match the cursor's relation. This throws out
+		 * the simple case in which a cursor is declared against table X and the update is
+		 * issued against Y. Moreover, this disallows some subtler inheritance cases where
+		 * Y inherits from X. While such cases could be implemented, it seems wiser to
+		 * simply error out cleanly.
+		 */
+		Index varno = extractSimplyUpdatableRTEIndex(queryDesc->plannedstmt->rtable);
+		Oid cursor_relid = getrelid(varno, queryDesc->plannedstmt->rtable);
+		if (table_oid != cursor_relid)
+			ereport(ERROR,
+			        (errcode(ERRCODE_INVALID_CURSOR_STATE),
+					        errmsg("cursor \"%s\" is not a simply updatable scan of table \"%s\"",
+					               cursor_name, table_name)));
+	}
+	else
+	{
+		ScanState  *scanstate;
+		/*
+		 * Without FOR UPDATE, we dig through the cursor's plan to find the
+		 * scan node.  Fail if it's not there or buried underneath
+		 * aggregation.
+		 */
+		scanstate = search_plan_tree(queryDesc->planstate, table_oid);
+		if (!scanstate)
+			ereport(ERROR,
+			        (errcode(ERRCODE_INVALID_CURSOR_STATE),
+					        errmsg("cursor \"%s\" is not a simply updatable scan of table \"%s\"",
+					               cursor_name, table_name)));
+	}
 
 	/*
 	 * The cursor must have a current result row: per the SQL spec, it's an
@@ -254,7 +282,7 @@ getCurrentOf(CurrentOfExpr *cexpr,
 			if (!RowMarkRequiresRowShareLock(thiserm->markType))
 				continue;		/* ignore non-FOR UPDATE/SHARE items */
 
-			if (RelationGetRelid(thiserm->relation) == table_oid)
+			if (thiserm->relid == table_oid)
 			{
 				if (erm)
 					ereport(ERROR,
@@ -297,17 +325,16 @@ getCurrentOf(CurrentOfExpr *cexpr,
 	}
 	else
 	{
-		ScanState  *scanstate;
-		bool		lisnull;
-		Oid tuple_tableoid PG_USED_FOR_ASSERTS_ONLY;
-		ItemPointer tuple_tid;
-
 		/*
 		 * Without FOR UPDATE, we dig through the cursor's plan to find the
 		 * scan node.  Fail if it's not there or buried underneath
 		 * aggregation.
 		 */
-		scanstate = search_plan_tree(queryDesc->planstate, table_oid);
+		ScanState  *scanstate;
+		bool		pending_rescan = false;
+
+		scanstate = search_plan_tree(queryDesc->planstate, table_oid,
+									 &pending_rescan);
 		if (!scanstate)
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_CURSOR_STATE),
@@ -327,25 +354,70 @@ getCurrentOf(CurrentOfExpr *cexpr,
 					 errmsg("cursor \"%s\" is not positioned on a row",
 							cursor_name)));
 
-		/* Now OK to return false if we found an inactive scan */
-		if (TupIsNull(scanstate->ss_ScanTupleSlot))
+		/*
+		 * Now OK to return false if we found an inactive scan.  It is
+		 * inactive either if it's not positioned on a row, or there's a
+		 * rescan pending for it.
+		 */
+		if (TupIsNull(scanstate->ss_ScanTupleSlot) || pending_rescan)
 			return false;
 
-		/* Use slot_getattr to catch any possible mistakes */
-		tuple_tableoid =
-			DatumGetObjectId(slot_getattr(scanstate->ss_ScanTupleSlot,
-										  TableOidAttributeNumber,
-										  &lisnull));
-		Assert(!lisnull);
-		tuple_tid = (ItemPointer)
-			DatumGetPointer(slot_getattr(scanstate->ss_ScanTupleSlot,
-										 SelfItemPointerAttributeNumber,
-										 &lisnull));
-		Assert(!lisnull);
+		/*
+		 * Extract TID of the scan's current row.  The mechanism for this is
+		 * in principle scan-type-dependent, but for most scan types, we can
+		 * just dig the TID out of the physical scan tuple.
+		 */
+		if (IsA(scanstate, IndexOnlyScanState))
+		{
+			/*
+			 * For IndexOnlyScan, the tuple stored in ss_ScanTupleSlot may be
+			 * a virtual tuple that does not have the ctid column, so we have
+			 * to get the TID from xs_ctup.t_self.
+			 */
+			IndexScanDesc scan = ((IndexOnlyScanState *) scanstate)->ioss_ScanDesc;
 
-		Assert(tuple_tableoid == table_oid);
+			*current_tid = scan->xs_ctup.t_self;
+		}
+		else
+		{
+			/*
+			 * Default case: try to fetch TID from the scan node's current
+			 * tuple.  As an extra cross-check, verify tableoid in the current
+			 * tuple.  If the scan hasn't provided a physical tuple, we have
+			 * to fail.
+			 */
+			Datum		ldatum;
+			bool		lisnull;
+			ItemPointer tuple_tid;
 
-		*current_tid = *tuple_tid;
+#ifdef USE_ASSERT_CHECKING
+			if (!slot_getsysattr(scanstate->ss_ScanTupleSlot,
+								 TableOidAttributeNumber,
+								 &ldatum,
+								 &lisnull))
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_CURSOR_STATE),
+						 errmsg("cursor \"%s\" is not a simply updatable scan of table \"%s\"",
+								cursor_name, table_name)));
+			Assert(!lisnull);
+			Assert(DatumGetObjectId(ldatum) == table_oid);
+#endif
+
+			if (!slot_getsysattr(scanstate->ss_ScanTupleSlot,
+								 SelfItemPointerAttributeNumber,
+								 &ldatum,
+								 &lisnull))
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_CURSOR_STATE),
+						 errmsg("cursor \"%s\" is not a simply updatable scan of table \"%s\"",
+								cursor_name, table_name)));
+			Assert(!lisnull);
+			tuple_tid = (ItemPointer) DatumGetPointer(ldatum);
+
+			*current_tid = *tuple_tid;
+		}
+
+		Assert(ItemPointerIsValid(current_tid));
 
 		return true;
 	}
@@ -461,7 +533,6 @@ fetch_cursor_param_value(ExprContext *econtext, int paramId)
  * Search through a PlanState tree for a scan node on the specified table.
  * Return NULL if not found or multiple candidates.
  */
-#ifdef NOT_USED
 static ScanState *
 search_plan_tree(PlanState *node, Oid table_oid)
 {
@@ -469,74 +540,71 @@ search_plan_tree(PlanState *node, Oid table_oid)
 		return NULL;
 	switch (nodeTag(node))
 	{
-			/*
-			 * scan nodes can all be treated alike
-			 */
+		/*
+		 * Relation scan nodes can all be treated alike
+		 */
 		case T_SeqScanState:
-		case T_AppendOnlyScanState:
-		case T_AOCSScanState:
-		case T_TableScanState:
-		case T_DynamicTableScanState:
+		case T_SampleScanState:
 		case T_IndexScanState:
 		case T_IndexOnlyScanState:
 		case T_BitmapHeapScanState:
-		case T_BitmapAppendOnlyScanState:
-		case T_BitmapTableScanState:
 		case T_TidScanState:
-			{
-				ScanState  *sstate = (ScanState *) node;
+		case T_ForeignScanState:
+		case T_CustomScanState:
+		{
+			ScanState  *sstate = (ScanState *) node;
 
-				if (RelationGetRelid(sstate->ss_currentRelation) == table_oid)
-					return sstate;
-				break;
-			}
+			if (RelationGetRelid(sstate->ss_currentRelation) == table_oid)
+				return sstate;
+			break;
+		}
 
 			/*
 			 * For Append, we must look through the members; watch out for
 			 * multiple matches (possible if it was from UNION ALL)
 			 */
 		case T_AppendState:
+		{
+			AppendState *astate = (AppendState *) node;
+			ScanState  *result = NULL;
+			int			i;
+
+			for (i = 0; i < astate->as_nplans; i++)
 			{
-				AppendState *astate = (AppendState *) node;
-				ScanState  *result = NULL;
-				int			i;
+				ScanState  *elem = search_plan_tree(astate->appendplans[i],
+				                                    table_oid);
 
-				for (i = 0; i < astate->as_nplans; i++)
-				{
-					ScanState  *elem = search_plan_tree(astate->appendplans[i],
-														table_oid);
-
-					if (!elem)
-						continue;
-					if (result)
-						return NULL;	/* multiple matches */
-					result = elem;
-				}
-				return result;
+				if (!elem)
+					continue;
+				if (result)
+					return NULL;	/* multiple matches */
+				result = elem;
 			}
+			return result;
+		}
 
 			/*
 			 * Similarly for MergeAppend
 			 */
 		case T_MergeAppendState:
+		{
+			MergeAppendState *mstate = (MergeAppendState *) node;
+			ScanState  *result = NULL;
+			int			i;
+
+			for (i = 0; i < mstate->ms_nplans; i++)
 			{
-				MergeAppendState *mstate = (MergeAppendState *) node;
-				ScanState  *result = NULL;
-				int			i;
+				ScanState  *elem = search_plan_tree(mstate->mergeplans[i],
+				                                    table_oid);
 
-				for (i = 0; i < mstate->ms_nplans; i++)
-				{
-					ScanState  *elem = search_plan_tree(mstate->mergeplans[i],
-														table_oid);
-
-					if (!elem)
-						continue;
-					if (result)
-						return NULL;	/* multiple matches */
-					result = elem;
-				}
-				return result;
+				if (!elem)
+					continue;
+				if (result)
+					return NULL;	/* multiple matches */
+				result = elem;
 			}
+			return result;
+		}
 
 			/*
 			 * Result and Limit can be descended through (these are safe
@@ -544,7 +612,6 @@ search_plan_tree(PlanState *node, Oid table_oid)
 			 */
 		case T_ResultState:
 		case T_LimitState:
-		case T_MotionState:
 			return search_plan_tree(node->lefttree, table_oid);
 
 			/*
@@ -552,7 +619,10 @@ search_plan_tree(PlanState *node, Oid table_oid)
 			 */
 		case T_SubqueryScanState:
 			return search_plan_tree(((SubqueryScanState *) node)->subplan,
-									table_oid);
+			                        table_oid);
+
+		case T_MotionState:
+			return search_plan_tree(node->lefttree, table_oid);
 
 		default:
 			/* Otherwise, assume we can't descend through it */
@@ -560,4 +630,3 @@ search_plan_tree(PlanState *node, Oid table_oid)
 	}
 	return NULL;
 }
-#endif /* NOT_USED */

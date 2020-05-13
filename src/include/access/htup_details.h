@@ -4,7 +4,7 @@
  *	  POSTGRES heap tuple header definitions.
  *
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/access/htup_details.h
@@ -97,6 +97,15 @@
  * unrelated tuple stored into a slot recently freed by VACUUM.  If either
  * check fails, one may assume that there is no live descendant version.
  *
+ * t_ctid is sometimes used to store a speculative insertion token, instead
+ * of a real TID.  A speculative token is set on a tuple that's being
+ * inserted, until the inserter is sure that it wants to go ahead with the
+ * insertion.  Hence a token should only be seen on a tuple with an XMAX
+ * that's still in-progress, or invalid/aborted.  The token is replaced with
+ * the tuple's real TID when the insertion is confirmed.  One should never
+ * see a speculative insertion token while following a chain of t_ctid links,
+ * because they are not used on updates, only insertions.
+ *
  * Following the fixed header fields, the nulls bitmap is stored (beginning
  * at t_bits).  The bitmap is *not* stored if t_infomask shows that there
  * are no nulls in the tuple.  If an OID field is present (as indicated by
@@ -139,7 +148,8 @@ struct HeapTupleHeaderData
 		DatumTupleFields t_datum;
 	}			t_choice;
 
-	ItemPointerData t_ctid;		/* current TID of this or newer tuple */
+	ItemPointerData t_ctid;		/* current TID of this or newer tuple (or a
+								 * speculative insertion token) */
 
 	/* Fields below here must match MinimalTupleData! */
 
@@ -151,12 +161,14 @@ struct HeapTupleHeaderData
 
 	/* ^ - 23 bytes - ^ */
 
-	bits8		t_bits[1];		/* bitmap of NULLs -- VARIABLE LENGTH */
+	bits8		t_bits[FLEXIBLE_ARRAY_MEMBER];	/* bitmap of NULLs */
 
 	/* MORE DATA FOLLOWS AT END OF STRUCT */
 };
 
 /* typedef appears in tupbasics.h */
+
+#define SizeofHeapTupleHeader offsetof(HeapTupleHeaderData, t_bits)
 
 /*
  * information stored in t_infomask:
@@ -207,6 +219,31 @@ struct HeapTupleHeaderData
 	 (((infomask) & (HEAP_XMAX_IS_MULTI | HEAP_LOCK_MASK)) == HEAP_XMAX_EXCL_LOCK))
 
 /*
+ * A tuple that has HEAP_XMAX_IS_MULTI and HEAP_XMAX_LOCK_ONLY but neither of
+ * XMAX_EXCL_LOCK and XMAX_KEYSHR_LOCK must come from a tuple that was
+ * share-locked in 9.2 or earlier and then pg_upgrade'd.
+ *
+ * In 9.2 and prior, HEAP_XMAX_IS_MULTI was only set when there were multiple
+ * FOR SHARE lockers of that tuple.  That set HEAP_XMAX_LOCK_ONLY (with a
+ * different name back then) but neither of HEAP_XMAX_EXCL_LOCK and
+ * HEAP_XMAX_KEYSHR_LOCK.  That combination is no longer possible in 9.3 and
+ * up, so if we see that combination we know for certain that the tuple was
+ * locked in an earlier release; since all such lockers are gone (they cannot
+ * survive through pg_upgrade), such tuples can safely be considered not
+ * locked.
+ *
+ * We must not resolve such multixacts locally, because the result would be
+ * bogus, regardless of where they stand with respect to the current valid
+ * multixact range.
+ */
+#define HEAP_LOCKED_UPGRADED(infomask) \
+( \
+	 ((infomask) & HEAP_XMAX_IS_MULTI) != 0 && \
+	 ((infomask) & HEAP_XMAX_LOCK_ONLY) != 0 && \
+	 (((infomask) & (HEAP_XMAX_EXCL_LOCK | HEAP_XMAX_KEYSHR_LOCK)) == 0) \
+)
+
+/*
  * Use these to test whether a particular lock is applied to a tuple
  */
 #define HEAP_XMAX_IS_SHR_LOCKED(infomask) \
@@ -237,7 +274,10 @@ struct HeapTupleHeaderData
 #define HEAP_HOT_UPDATED		0x4000	/* tuple was HOT-updated */
 #define HEAP_ONLY_TUPLE			0x8000	/* this is heap-only tuple */
 
-#define HEAP2_XACT_MASK			0xE000	/* visibility-related bits */
+#define HEAP2_XACT_MASK			0xF800	/* visibility-related bits
+										 * GPDB: include HEAP_XMIN_DISTRIBUTED_SNAPSHOT_IGNORE
+										 * and HEAP_XMAX_DISTRIBUTED_SNAPSHOT_IGNORE
+										 */
 
 /*
  * HEAP_TUPLE_HAS_MATCH is a temporary flag used during hash joins.  It is
@@ -246,6 +286,14 @@ struct HeapTupleHeaderData
  * instead of using up a dedicated bit.
  */
 #define HEAP_TUPLE_HAS_MATCH	HEAP_ONLY_TUPLE /* tuple has a join match */
+
+/*
+ * Special value used in t_ctid.ip_posid, to indicate that it holds a
+ * speculative insertion token rather than a real TID.  This must be higher
+ * than MaxOffsetNumber, so that it can be distinguished from a valid
+ * offset number in a regular item pointer.
+ */
+#define SpecTokenOffsetNumber		0xfffe
 
 /*
  * HeapTupleHeader accessor macros
@@ -383,6 +431,22 @@ do { \
 	(tup)->t_choice.t_heap.t_field3.t_xvac = (xid); \
 } while (0)
 
+#define HeapTupleHeaderIsSpeculative(tup) \
+( \
+	(tup)->t_ctid.ip_posid == SpecTokenOffsetNumber \
+)
+
+#define HeapTupleHeaderGetSpeculativeToken(tup) \
+( \
+	AssertMacro(HeapTupleHeaderIsSpeculative(tup)), \
+	ItemPointerGetBlockNumber(&(tup)->t_ctid) \
+)
+
+#define HeapTupleHeaderSetSpeculativeToken(tup, token)	\
+( \
+	ItemPointerSet(&(tup)->t_ctid, token, SpecTokenOffsetNumber) \
+)
+
 #define HeapTupleHeaderGetDatumLength(tup) \
 	VARSIZE(tup)
 
@@ -448,7 +512,7 @@ do { \
 
 #define HeapTupleHeaderIsHeapOnly(tup) \
 ( \
-  (tup)->t_infomask2 & HEAP_ONLY_TUPLE \
+  ((tup)->t_infomask2 & HEAP_ONLY_TUPLE) != 0 \
 )
 
 #define HeapTupleHeaderSetHeapOnly(tup) \
@@ -463,7 +527,7 @@ do { \
 
 #define HeapTupleHeaderHasMatch(tup) \
 ( \
-  (tup)->t_infomask2 & HEAP_TUPLE_HAS_MATCH \
+  ((tup)->t_infomask2 & HEAP_TUPLE_HAS_MATCH) != 0 \
 )
 
 #define HeapTupleHeaderSetMatch(tup) \
@@ -506,6 +570,7 @@ do { \
  * you can, say, fit 2 tuples of size MaxHeapTupleSize/2 on the same page.
  */
 #define MaxHeapTupleSize  (BLCKSZ - MAXALIGN(SizeOfPageHeaderData + sizeof(ItemIdData)))
+#define MinHeapTupleSize  MAXALIGN(SizeofHeapTupleHeader)
 
 /*
  * MaxHeapTuplesPerPage is an upper bound on the number of tuples that can
@@ -520,7 +585,7 @@ do { \
  */
 #define MaxHeapTuplesPerPage	\
 	((int) ((BLCKSZ - SizeOfPageHeaderData) / \
-			(MAXALIGN(offsetof(HeapTupleHeaderData, t_bits)) + sizeof(ItemIdData))))
+			(MAXALIGN(SizeofHeapTupleHeader) + sizeof(ItemIdData))))
 
 /*
  * MaxAttrSize is a somewhat arbitrary upper limit on the declared size of
@@ -586,12 +651,14 @@ struct MinimalTupleData
 
 	/* ^ - 23 bytes - ^ */
 
-	bits8		t_bits[1];		/* bitmap of NULLs -- VARIABLE LENGTH */
+	bits8		t_bits[FLEXIBLE_ARRAY_MEMBER];	/* bitmap of NULLs */
 
 	/* MORE DATA FOLLOWS AT END OF STRUCT */
 };
 
 /* typedef appears in htup.h */
+
+#define SizeofMinimalTupleHeader offsetof(MinimalTupleData, t_bits)
 
 
 /*
@@ -765,17 +832,6 @@ extern HeapTuple heap_modify_tuple(HeapTuple tuple,
 				  bool *doReplace);
 extern void heap_deform_tuple(HeapTuple tuple, TupleDesc tupleDesc,
 				  Datum *values, bool *isnull);
-
-/* these three are deprecated versions of the three above: */
-extern HeapTuple heap_formtuple(TupleDesc tupleDescriptor,
-			   Datum *values, char *nulls);
-extern HeapTuple heap_modifytuple(HeapTuple tuple,
-				 TupleDesc tupleDesc,
-				 Datum *replValues,
-				 char *replNulls,
-				 char *replActions);
-extern void heap_deformtuple(HeapTuple tuple, TupleDesc tupleDesc,
-				 Datum *values, char *nulls);
 extern void heap_freetuple(HeapTuple htup);
 extern MinimalTuple heap_form_minimal_tuple(TupleDesc tupleDescriptor,
 						Datum *values, bool *isnull);

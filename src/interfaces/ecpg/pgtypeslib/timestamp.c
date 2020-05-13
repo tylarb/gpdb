@@ -61,7 +61,7 @@ tm2timestamp(struct tm * tm, fsec_t fsec, int *tzp, timestamp * result)
 				time;
 #endif
 
-	/* Julian day routines are not correct for negative Julian days */
+	/* Prevent overflow in Julian-day routines */
 	if (!IS_VALID_JULIAN(tm->tm_year, tm->tm_mon, tm->tm_mday))
 		return -1;
 
@@ -82,6 +82,10 @@ tm2timestamp(struct tm * tm, fsec_t fsec, int *tzp, timestamp * result)
 #endif
 	if (tzp != NULL)
 		*result = dt2local(*result, -(*tzp));
+
+	/* final range check catches just-out-of-range timestamps */
+	if (!IS_VALID_TIMESTAMP(*result))
+		return -1;
 
 	return 0;
 }	/* tm2timestamp() */
@@ -419,7 +423,7 @@ dttofmtasc_replace(timestamp * ts, date dDate, int dow, struct tm * tm,
 					replace_val.str_val = months[tm->tm_mon];
 					replace_type = PGTYPES_TYPE_STRING_CONSTANT;
 					break;
-					/* the full name name of the month */
+					/* the full name of the month */
 					/* XXX should be locale aware */
 				case 'B':
 					replace_val.str_val = pgtypes_date_months[tm->tm_mon];

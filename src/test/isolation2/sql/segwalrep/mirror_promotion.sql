@@ -11,23 +11,7 @@
 -- between primary and mirror is still alive and hence walreceiver
 -- also exist during promotion.
 
--- start_ignore
-create language plpythonu;
--- end_ignore
-
-create extension if not exists gp_inject_fault;
-create or replace function pg_ctl(datadir text, command text)
-returns text as $$
-    import subprocess
-
-    cmd = 'pg_ctl -D %s ' % datadir
-    if command in ('stop'):
-        cmd = cmd + '-w -m immediate %s' % command
-    else:
-        return 'Invalid command input'
-
-    return subprocess.check_output(cmd, stderr=subprocess.STDOUT, shell=True).replace('.', '')
-$$ language plpythonu;
+include: helpers/server_helpers.sql;
 
 SELECT role, preferred_role, content, mode, status FROM gp_segment_configuration;
 -- stop a primary in order to trigger a mirror promotion
@@ -49,7 +33,7 @@ where content = 0;
 0Uq:
 
 -- fully recover the failed primary as new mirror
-!\retcode gprecoverseg -aF;
+!\retcode gprecoverseg -aF --no-progress;
 
 -- loop while segments come in sync
 do $$
@@ -102,8 +86,16 @@ where content = 0;
 -- -- wait for content 0 (earlier mirror, now primary) to finish the promotion
 0U: select 1;
 
+-- create tablespace to test if it works with gprecoverseg -F (pg_basebackup)
+!\retcode mkdir -p /tmp/mirror_promotion_tablespace_loc;
+create tablespace mirror_promotion_tablespace location '/tmp/mirror_promotion_tablespace_loc';
+create table mirror_promotion_tblspc_heap_table (a int) tablespace mirror_promotion_tablespace;
+
 -- -- now, let's fully recover the mirror
-!\retcode gprecoverseg -aF;
+!\retcode gprecoverseg -aF  --no-progress;
+
+drop table mirror_promotion_tblspc_heap_table;
+drop tablespace mirror_promotion_tablespace;
 
 -- loop while segments come in sync
 do $$

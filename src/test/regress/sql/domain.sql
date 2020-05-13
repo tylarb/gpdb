@@ -85,6 +85,7 @@ INSERT INTO domarrtest values ('{2,2}', '{{"a","b"},{"c","d"},{"e","f"}}');
 INSERT INTO domarrtest values ('{2,2}', '{{"a"},{"c"}}');
 INSERT INTO domarrtest values (NULL, '{{"a","b","c"},{"d","e","f"}}');
 INSERT INTO domarrtest values (NULL, '{{"toolong","b","c"},{"d","e","f"}}');
+INSERT INTO domarrtest (testint4arr[1], testint4arr[3]) values (11,22);
 select * from domarrtest;
 select testint4arr[1], testchar4arr[2:2] from domarrtest;
 select array_dims(testint4arr), array_dims(testchar4arr) from domarrtest;
@@ -100,6 +101,13 @@ COPY domarrtest FROM stdin;	-- fail
 
 select * from domarrtest;
 
+update domarrtest set
+  testint4arr[1] = testint4arr[1] + 1,
+  testint4arr[3] = testint4arr[3] - 1
+where testchar4arr is null;
+
+select * from domarrtest where testchar4arr is null;
+
 drop table domarrtest;
 drop domain domainint4arr restrict;
 drop domain domainchar4arr restrict;
@@ -110,6 +118,60 @@ select array_dims('{1,2,3}'::dia);
 select pg_typeof('{1,2,3}'::dia);
 select pg_typeof('{1,2,3}'::dia || 42); -- should be int[] not dia
 drop domain dia;
+
+
+-- Test domains over arrays of composite
+
+create type comptype as (r float8, i float8);
+create domain dcomptypea as comptype[];
+create table dcomptable (d1 dcomptypea unique);
+-- GPDB: marking the column as 'unique' fails, because a unique column needs
+-- to be part of the distribution key, and composite types can't be used as
+-- distribution keys because they have no hash opclasses.
+create table dcomptable (d1 dcomptypea /*unique*/);
+create index on dcomptable (d1);
+
+insert into dcomptable values (array[row(1,2)]::dcomptypea);
+insert into dcomptable values (array[row(3,4), row(5,6)]::comptype[]);
+insert into dcomptable values (array[row(7,8)::comptype, row(9,10)::comptype]);
+--insert into dcomptable values (array[row(1,2)]::dcomptypea);  -- fail on uniqueness
+insert into dcomptable (d1[1]) values(row(9,10));
+insert into dcomptable (d1[1].r) values(11);
+
+select * from dcomptable;
+select d1[2], d1[1].r, d1[1].i from dcomptable;
+update dcomptable set d1[2] = row(d1[2].i, d1[2].r);
+select * from dcomptable;
+update dcomptable set d1[1].r = d1[1].r + 1 where d1[1].i > 0;
+select * from dcomptable;
+
+alter domain dcomptypea add constraint c1 check (value[1].r <= value[1].i);
+alter domain dcomptypea add constraint c2 check (value[1].r > value[1].i);  -- fail
+
+select array[row(2,1)]::dcomptypea;  -- fail
+insert into dcomptable values (array[row(1,2)]::comptype[]);
+insert into dcomptable values (array[row(2,1)]::comptype[]);  -- fail
+insert into dcomptable (d1[1].r) values(99);
+insert into dcomptable (d1[1].r, d1[1].i) values(99, 100);
+insert into dcomptable (d1[1].r, d1[1].i) values(100, 99);  -- fail
+update dcomptable set d1[1].r = d1[1].r + 1 where d1[1].i > 0;  -- fail
+update dcomptable set d1[1].r = d1[1].r - 1, d1[1].i = d1[1].i + 1
+  where d1[1].i > 0;
+select * from dcomptable;
+
+explain (verbose, costs off)
+  update dcomptable set d1[1].r = d1[1].r - 1, d1[1].i = d1[1].i + 1
+    where d1[1].i > 0;
+create rule silly as on delete to dcomptable do instead
+  update dcomptable set d1[1].r = d1[1].r - 1, d1[1].i = d1[1].i + 1
+    where d1[1].i > 0;
+\d+ dcomptable
+
+drop table dcomptable;
+drop type comptype cascade;
+
+
+-- Test not-null restrictions
 
 create domain dnotnull varchar(15) NOT NULL;
 create domain dnull    varchar(15);
@@ -395,10 +457,27 @@ insert into ddtest2 values(row(-1));
 alter domain posint add constraint c1 check(value >= 0);
 drop table ddtest2;
 
+-- Likewise for domains within arrays of composite
 create table ddtest2(f1 ddtest1[], distkey int) distributed by (distkey);
 insert into ddtest2 values('{(-1)}');
 alter domain posint add constraint c1 check(value >= 0);
 drop table ddtest2;
+
+-- Likewise for domains within domains over array of composite
+create domain ddtest1d as ddtest1[];
+create table ddtest2(f1 ddtest1d);
+insert into ddtest2 values('{(-1)}');
+alter domain posint add constraint c1 check(value >= 0);
+drop table ddtest2;
+drop domain ddtest1d;
+
+-- Doesn't work for ranges, either
+create type rposint as range (subtype = posint);
+create table ddtest2(f1 rposint);
+insert into ddtest2 values('(-1,3]');
+alter domain posint add constraint c1 check(value >= 0);
+drop table ddtest2;
+drop type rposint;
 
 alter domain posint add constraint c1 check(value >= 0);
 
@@ -488,6 +567,57 @@ select array_elem_check(-1);
 
 drop function array_elem_check(int);
 
+--
+-- Check enforcement of changing constraints in plpgsql
+--
+
+create domain di as int;
+
+create function dom_check(int) returns di as $$
+declare d di;
+begin
+  d := $1;
+  return d;
+end
+$$ language plpgsql immutable;
+
+select dom_check(0);
+
+alter domain di add constraint pos check (value > 0);
+
+select dom_check(0); -- fail
+
+alter domain di drop constraint pos;
+
+select dom_check(0);
+
+drop function dom_check(int);
+
+drop domain di;
+
+--
+-- Check use of a (non-inline-able) SQL function in a domain constraint;
+-- this has caused issues in the past
+--
+
+create function sql_is_distinct_from(anyelement, anyelement)
+returns boolean language sql
+as 'select $1 is distinct from $2 limit 1';
+
+create domain inotnull int
+  check (sql_is_distinct_from(value, null));
+
+select 1::inotnull;
+select null::inotnull;
+
+create table dom_table (x inotnull);
+insert into dom_table values ('1');
+insert into dom_table values (1);
+insert into dom_table values (null);
+
+drop table dom_table;
+drop domain inotnull;
+drop function sql_is_distinct_from(anyelement, anyelement);
 
 --
 -- Renaming

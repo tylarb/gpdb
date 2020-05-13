@@ -17,6 +17,7 @@ typedef struct PLyDatumToOb
 {
 	PLyDatumToObFunc func;
 	FmgrInfo	typfunc;		/* The type's output function */
+	FmgrInfo	typtransform;	/* from-SQL transform */
 	Oid			typoid;			/* The OID of the type */
 	int32		typmod;			/* The typmod of the type */
 	Oid			typioparam;
@@ -48,6 +49,7 @@ typedef struct PLyObToDatum
 {
 	PLyObToDatumFunc func;
 	FmgrInfo	typfunc;		/* The type's input function */
+	FmgrInfo	typtransform;	/* to-SQL transform */
 	Oid			typoid;			/* The OID of the type */
 	int32		typmod;			/* The typmod of the type */
 	Oid			typioparam;
@@ -69,7 +71,7 @@ typedef union PLyTypeOutput
 	PLyObToTuple r;
 } PLyTypeOutput;
 
-/* all we need to move Postgresql data to Python objects,
+/* all we need to move PostgreSQL data to Python objects,
  * and vice versa
  */
 typedef struct PLyTypeInfo
@@ -86,13 +88,15 @@ typedef struct PLyTypeInfo
 	Oid			typ_relid;
 	TransactionId typrel_xmin;
 	ItemPointerData typrel_tid;
+
+	/* context for subsidiary data (doesn't belong to this struct though) */
+	MemoryContext mcxt;
 } PLyTypeInfo;
 
-extern void PLy_typeinfo_init(PLyTypeInfo *arg);
-extern void PLy_typeinfo_dealloc(PLyTypeInfo *arg);
+extern void PLy_typeinfo_init(PLyTypeInfo *arg, MemoryContext mcxt);
 
-extern void PLy_input_datum_func(PLyTypeInfo *arg, Oid typeOid, HeapTuple typeTup);
-extern void PLy_output_datum_func(PLyTypeInfo *arg, HeapTuple typeTup);
+extern void PLy_input_datum_func(PLyTypeInfo *arg, Oid typeOid, HeapTuple typeTup, Oid langid, List *trftypes);
+extern void PLy_output_datum_func(PLyTypeInfo *arg, HeapTuple typeTup, Oid langid, List *trftypes);
 
 extern void PLy_input_tuple_funcs(PLyTypeInfo *arg, TupleDesc desc);
 extern void PLy_output_tuple_funcs(PLyTypeInfo *arg, TupleDesc desc);

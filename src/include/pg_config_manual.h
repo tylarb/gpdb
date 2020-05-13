@@ -6,7 +6,7 @@
  * for developers.  If you edit any of these, be sure to do a *full*
  * rebuild (and an initdb if noted).
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/pg_config_manual.h
@@ -48,13 +48,8 @@
 /*
  * Set the upper and lower bounds of sequence values.
  */
-#define SEQ_MAXVALUE	INT64CONST(0x7FFFFFFFFFFFFFFF)
+#define SEQ_MAXVALUE	PG_INT64_MAX
 #define SEQ_MINVALUE	(-SEQ_MAXVALUE)
-
-/*
- * Number of spare LWLocks to allocate for user-defined add-on code.
- */
-#define NUM_USER_DEFINED_LWLOCKS	4
 
 /*
  * When we don't have native spinlocks, we use semaphores to simulate them.
@@ -62,7 +57,7 @@
  * may improve performance, but supplying a real spinlock implementation is
  * probably far better.
  */
-#define NUM_SPINLOCK_SEMAPHORES		1024
+#define NUM_SPINLOCK_SEMAPHORES		128
 
 /*
  * When we have neither spinlocks nor atomic operations support we're
@@ -70,7 +65,7 @@
  * be safe against atomic operations while holding a spinlock separate
  * semaphores have to be used.
  */
-#define NUM_ATOMICS_SEMAPHORES      64
+#define NUM_ATOMICS_SEMAPHORES		64
 
 /*
  * Define this if you want to allow the lo_import and lo_export SQL
@@ -153,6 +148,15 @@
 #endif
 
 /*
+ * USE_SSL code should be compiled only when compiling with an SSL
+ * implementation.  (Currently, only OpenSSL is supported, but we might add
+ * more implementations in the future.)
+ */
+#ifdef USE_OPENSSL
+#define USE_SSL
+#endif
+
+/*
  * This is the default directory in which AF_UNIX socket files are
  * placed.  Caution: changing this risks breaking your existing client
  * applications, which are likely to continue to look in the old
@@ -163,6 +167,11 @@
 #define DEFAULT_PGSOCKET_DIR  "/tmp"
 
 /*
+ * This is the default event source for Windows event log.
+ */
+#define DEFAULT_EVENT_SOURCE  "PostgreSQL"
+
+/*
  * The random() function is expected to yield values between 0 and
  * MAX_RANDOM_VALUE.  Currently, all known implementations yield
  * 0..2^31-1, so we just hardwire this constant.  We could do a
@@ -171,7 +180,7 @@
  * the older rand() function, which is often different from --- and
  * considerably inferior to --- random().
  */
-#define MAX_RANDOM_VALUE  (0x7FFFFFFF)
+#define MAX_RANDOM_VALUE  PG_INT32_MAX
 
 /*
  * On PPC machines, decide whether to use the mutex hint bit in LWARX
@@ -200,15 +209,15 @@
 #endif
 
 /*
- * Assumed cache line size. This doesn't affect correctness, but can be
- * used for low-level optimizations. Currently, this is only used to pad
- * some data structures in xlog.c, to ensure that highly-contended fields
- * are on different cache lines. Too small a value can hurt performance due
- * to false sharing, while the only downside of too large a value is a few
- * bytes of wasted memory. The default is 128, which should be large enough
- * for all supported platforms.
+ * Assumed cache line size. This doesn't affect correctness, but can be used
+ * for low-level optimizations. Currently, this is used to pad some data
+ * structures in xlog.c, to ensure that highly-contended fields are on
+ * different cache lines. Too small a value can hurt performance due to false
+ * sharing, while the only downside of too large a value is a few bytes of
+ * wasted memory. The default is 128, which should be large enough for all
+ * supported platforms.
  */
-#define CACHE_LINE_SIZE		128
+#define PG_CACHE_LINE_SIZE		128
 
 /*
  *------------------------------------------------------------------------
@@ -266,6 +275,13 @@
 /* #define COPY_PARSE_PLAN_TREES */
 
 /*
+ * Define this to force all raw parse trees for DML statements to be scanned
+ * by raw_expression_tree_walker(), to facilitate catching errors and
+ * omissions in that function.
+ */
+/* #define RAW_EXPRESSION_COVERAGE_TEST */
+
+/*
  * Enable debugging print statements for lock-related operations.
  */
 /* #define LOCK_DEBUG */
@@ -297,11 +313,3 @@
  */
 /* #define HEAPDEBUGALL */
 /* #define ACLDEBUG */
-/* #define RTDEBUG */
-
-/*
- * Automatic configuration file name for ALTER SYSTEM.
- * This file will be used to store values of configuration parameters
- * set by ALTER SYSTEM command.
- */
-#define PG_AUTOCONF_FILENAME		"postgresql.auto.conf"

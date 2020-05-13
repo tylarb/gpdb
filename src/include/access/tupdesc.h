@@ -4,7 +4,7 @@
  *	  POSTGRES tuple descriptor definitions.
  *
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/access/tupdesc.h
@@ -95,6 +95,9 @@ typedef struct tupleDescNode
 	int			natts;
 	TupleDesc	tuple;
 } TupleDescNode;
+
+/* Accessor for the i'th attribute of tupdesc. */
+#define TupleDescAttr(tupdesc, i) ((tupdesc)->attrs[(i)])
 
 extern TupleDesc CreateTemplateTupleDesc(int natts, bool hasoid);
 

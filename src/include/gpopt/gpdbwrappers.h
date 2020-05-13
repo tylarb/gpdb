@@ -39,6 +39,7 @@ struct ListCell;
 struct TargetEntry;
 struct Expr;
 struct ExtTableEntry;
+struct ForeignScan;
 struct Uri;
 struct CdbComponentDatabases;
 struct StringInfoData;
@@ -165,6 +166,12 @@ namespace gpdb {
 	// intermediate result type of given aggregate
 	Oid GetAggIntermediateResultType(Oid aggid);
 
+	// Identify the specific datatypes passed to an aggregate call.
+	int GetAggregateArgTypes(Aggref *aggref, Oid *inputTypes);
+
+	// Identify the transition state value's datatype for an aggregate call.
+	Oid ResolveAggregateTransType(Oid aggfnoid, Oid aggtranstype, Oid *inputTypes, int numArguments);
+
 	// replace Vars that reference JOIN outputs with references to the original
 	// relation variables instead
 	Query *FlattenJoinAliasVar(Query *query, gpos::ULONG query_level);
@@ -180,10 +187,6 @@ namespace gpdb {
 
 	// array type oid
 	Oid GetArrayType(Oid typid);
-
-	// deconstruct array
-	void DeconstructArray(struct ArrayType *array, Oid elmtype, int elmlen, bool elmbyval,
-			char elmalign, Datum **elemsp, bool **nullsp, int *nelemsp);
 
 	// attribute stats slot
 	bool GetAttrStatsSlot(AttStatsSlot *sslot, HeapTuple statstuple, int reqkind,
@@ -250,7 +253,7 @@ namespace gpdb {
 	bool GetCastFunc(Oid src_oid, Oid dest_oid, bool *is_binary_coercible, Oid *cast_fn_oid, CoercionPathType *pathtype);
 	
 	// get type of operator
-	unsigned int GetComparisonType(Oid op_oid, Oid left_oid, Oid right_oid);
+	unsigned int GetComparisonType(Oid op_oid);
 	
 	// get scalar comparison between given types
 	Oid GetComparisonOperator(Oid left_oid, Oid right_oid, unsigned int cmpt);
@@ -330,8 +333,26 @@ namespace gpdb {
 	// does an index exist with the given oid
 	bool IndexExists(Oid oid);
 
-	// check if given oid is hashable internally in Greenplum Database
-	bool IsGreenplumDbHashable(Oid typid);
+	// get the default hash opclass for type
+	Oid GetDefaultDistributionOpclassForType(Oid typid);
+
+	// get the column-definition hash opclass for type
+	Oid GetColumnDefOpclassForType(List *opclassName, Oid typid);
+
+	// get the default hash opfamily for type
+	Oid GetDefaultDistributionOpfamilyForType(Oid typid);
+
+	// get the hash function in an opfamily for given datatype
+	Oid GetHashProcInOpfamily(Oid opfamily, Oid typid);
+
+	// is the given hash function a legacy cdbhash function?
+	Oid IsLegacyCdbHashFunction(Oid hashfunc);
+
+	// is the given hash function a legacy cdbhash function?
+	Oid GetLegacyCdbHashOpclassForBaseType(Oid typid);
+
+	// return the operator family the given opclass belongs to
+	Oid GetOpclassFamily(Oid opclass);
 
 	// append an element to a list
 	List *LAppend(List *list, void *datum);
@@ -384,9 +405,6 @@ namespace gpdb {
 	// deep free of a list
 	void ListFreeDeep(List *list);
 
-	// is this a Gather motion
-	bool IsMotionGather(const Motion *motion);
-
 	// does a partition table have an appendonly child
 	bool IsAppendOnlyPartitionTable(Oid root_oid);
 
@@ -407,7 +425,10 @@ namespace gpdb {
 
 	// make a NULL constant of the given type
 	Node *MakeNULLConst(Oid type_oid);
-	
+
+	// make a NULL constant of the given type
+	Node *MakeSegmentFilterExpr(int segid);
+
 	// create a new target entry
 	TargetEntry *MakeTargetEntry(Expr *expr, AttrNumber resno, char *resname, bool resjunk);
 
@@ -453,6 +474,9 @@ namespace gpdb {
 	// is the given operator hash-joinable
 	bool IsOpHashJoinable(Oid opno, Oid inputtype);
 
+	// is the given operator merge-joinable
+	bool IsOpMergeJoinable(Oid opno, Oid inputtype);
+
 	// is the given operator strict
 	bool IsOpStrict(Oid opno);
 
@@ -461,9 +485,6 @@ namespace gpdb {
 
 	// does an operator exist with the given oid
 	bool OperatorExists(Oid oid);
-
-	// fetch detoasted copies of toastable datatypes
-	struct varlena *DetoastDatum(struct varlena * datum);
 
 	// expression tree walker
 	bool WalkExpressionTree(Node *node, bool(*walker)(), void *context);
@@ -495,9 +516,9 @@ namespace gpdb {
 	// check whether a relation is inherited
 	bool HasSubclassSlow(Oid rel_oid);
 
-    // check whether a relation has parquet children
-    bool HasParquetChildren(Oid rel_oid);
-    
+	// check whether table with given oid is an external table
+	bool RelIsExternalTable(Oid relid);
+
     // return the distribution policy of a relation; if the table is partitioned
     // and the parts are distributed differently, return Random distribution
     GpPolicy *GetDistributionPolicy(Relation rel);
@@ -514,8 +535,8 @@ namespace gpdb {
 	bool RelationExists(Oid oid);
 
 	// estimate the relation size using the real number of blocks and tuple density
-	void EstimateRelationSize(Relation rel,	int32 *attr_widths,	BlockNumber *pages,	double *tuples, double *allvisfrac);
 	void CdbEstimateRelationSize (RelOptInfo *relOptInfo, Relation rel, int32 *attr_widths, BlockNumber *pages, double *tuples, double *allvisfrac);
+	double CdbEstimatePartitionedNumTuples (Relation rel);
 
 	// close the given relation
 	void CloseRelation(Relation rel);
@@ -538,8 +559,8 @@ namespace gpdb {
 	// get external table entry with given oid
 	ExtTableEntry *GetExternalTableEntry(Oid rel_oid);
 
-	// get external table entry with given oid
-	List *GetExternalScanUriList(ExtTableEntry *ext, bool *ismasteronlyp);
+	// get ForeignScan node to scan an external table
+	ForeignScan *CreateForeignScanForExternalTable(Oid rel_oid, Index scanrelid, List *qual, List *targetlist);
 
 	// return the first member of the given targetlist whose expression is
 	// equal to the given expression, or NULL if no such member exists
@@ -557,6 +578,8 @@ namespace gpdb {
 
 	// check whether a type is composite
 	bool IsCompositeType(Oid typid);
+
+	bool IsTextRelatedType(Oid typid);
 
 	// get integer value from an Integer value node
 	int GetIntFromValue(Node *node);
@@ -591,27 +614,36 @@ namespace gpdb {
 
 	// replace any polymorphic type with correct data type deduced from input arguments
 	bool ResolvePolymorphicArgType(int numargs, Oid *argtypes, char *argmodes, FuncExpr *call_expr);
-	
-	// hash a const value with GPDB's hash function
-	int32 CdbHashConst(Const *constant, int num_segments);
-
-	// pick a random segment from a pool of segments using GPDB's hash function
-	int32 CdbHashRandom(int num_segments);
 
 	// hash a list of const values with GPDB's hash function
-	int32 CdbHashConstList(List *constants, int num_segments);
-	
+	int32 CdbHashConstList(List *constants, int num_segments, Oid *hashfuncs);
+
+	// get a random segment number
+	unsigned int CdbHashRandomSeg(int num_segments);
+
 	// check permissions on range table 
 	void CheckRTPermissions(List *rtable);
-	
+
+	// throw an error if table has update triggers.
+	bool HasUpdateTriggers(Oid relid);
+
 	// get index operator family properties
 	void IndexOpProperties(Oid opno, Oid opfamily, int *strategy, Oid *subtype);
 	
 	// get oids of families this operator belongs to
 	List *GetOpFamiliesForScOp(Oid opno);
+
+	// get the OID of hash equality operator(s) compatible with the given op
+	Oid GetCompatibleHashOpFamily(Oid opno);
+
+	// get the OID of legacy hash equality operator(s) compatible with the given op
+	Oid GetCompatibleLegacyHashOpFamily(Oid opno);
 	
 	// get oids of op classes for the index keys
 	List *GetIndexOpFamilies(Oid index_oid);
+
+	// get oids of op classes for the merge join
+	List *GetMergeJoinOpFamilies(Oid opno);
 
 	// returns the result of evaluating 'expr' as an Expr. Caller keeps ownership of 'expr'
 	// and takes ownership of the result 
@@ -633,7 +665,7 @@ namespace gpdb {
 	SelectedParts *RunStaticPartitionSelection(PartitionSelector *ps);
 
 	// simple fault injector used by COptTasks.cpp to inject GPDB fault
-	FaultInjectorType_e InjectFaultInOptTasks(FaultInjectorIdentifier_e identifier);
+	FaultInjectorType_e InjectFaultInOptTasks(const char* fault_name);
 
 	// return the number of leaf partition for a given table oid
 	gpos::ULONG CountLeafPartTables(Oid oidRelation);
@@ -642,16 +674,28 @@ namespace gpdb {
 	// table has been changed?)
 	bool MDCacheNeedsReset(void);
 
-	// functions for tracking ORCA memory consumption
-	void *OptimizerAlloc(size_t size);
-
-	void OptimizerFree(void *ptr);
-
 	// returns true if a query cancel is requested in GPDB
 	bool IsAbortRequested(void);
 
 	GpPolicy *MakeGpPolicy(GpPolicyType ptype, int nattrs,
 						   int numsegments);
+
+
+	uint32 HashChar(Datum d);
+
+	uint32 HashBpChar(Datum d);
+
+	uint32 HashText(Datum d);
+
+	uint32 HashName(Datum d);
+
+	uint32 UUIDHash(Datum d);
+
+	void * GPDBMemoryContextAlloc(MemoryContext context, Size size);
+
+	MemoryContext GPDBAllocSetContextCreate();
+
+	void GPDBMemoryContextDelete(MemoryContext context);
 
 } //namespace gpdb
 

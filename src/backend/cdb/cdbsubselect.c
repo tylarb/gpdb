@@ -64,14 +64,14 @@ typedef struct ConvertSubqueryToJoinContext
 	Node	   *joinQual;		/* Qual to employ to join subquery */
 	Node	   *innerQual;		/* Qual to leave behind in subquery */
 	List	   *targetList;		/* targetlist for subquery */
-	bool		extractGrouping;	/* extract grouping information based on
-									 * join conditions */
 	List	   *groupClause;	/* grouping clause for subquery */
 } ConvertSubqueryToJoinContext;
 
 static void ProcessSubqueryToJoin(Query *subselect, ConvertSubqueryToJoinContext *context);
+static void ProcessSubqueryToJoin_walker(Node *jtree, ConvertSubqueryToJoinContext *context);
 static void SubqueryToJoinWalker(Node *node, ConvertSubqueryToJoinContext *context);
 static void RemoveInnerJoinQuals(Query *subselect);
+static void RemoveInnerJoinQuals_walker(Node *jtree);
 
 static bool find_nonnullable_vars_walker(Node *node, NonNullableVarsContext *context);
 static bool is_attribute_nonnullable(Oid relationOid, AttrNumber attrNumber);
@@ -134,7 +134,6 @@ InitConvertSubqueryToJoinContext(ConvertSubqueryToJoinContext *ctx)
 	ctx->innerQual = NULL;
 	ctx->groupClause = NIL;
 	ctx->targetList = NIL;
-	ctx->extractGrouping = false;
 }
 
 /**
@@ -145,55 +144,39 @@ InitConvertSubqueryToJoinContext(ConvertSubqueryToJoinContext *ctx)
 static bool
 IsCorrelatedOpExpr(OpExpr *opexp, Expr **innerExpr)
 {
-	Assert(opexp);
-	Assert(list_length(opexp->args) > 1);
-	Assert(innerExpr);
+	Expr	   *e1;
+	Expr	   *e2;
 
 	if (list_length(opexp->args) != 2)
-	{
 		return false;
-	}
 
-	Expr	   *e1 = (Expr *) list_nth(opexp->args, 0);
-	Expr	   *e2 = (Expr *) list_nth(opexp->args, 1);
+	e1 = (Expr *) list_nth(opexp->args, 0);
+	e2 = (Expr *) list_nth(opexp->args, 1);
 
-	/**
+	/*
 	 * One of the vars must be outer, and other must be inner.
-	 *
-	 * If both sides of the condition referring to outer variable,
-	 * then fail to extract the innerExpr.
 	 */
-	if (contain_vars_of_level((Node *) e1, 1) && contain_vars_of_level((Node *) e2, 1))
+	if (contain_vars_of_level((Node *) e1, 1) &&
+			!contain_vars_of_level((Node *) e1, 0) &&
+			contain_vars_of_level((Node *) e2, 0) &&
+			!contain_vars_of_level((Node *) e2, 1))
 	{
-		return false;
+		*innerExpr = (Expr *) copyObject(e2);
+
+		return true;
 	}
 
-	Expr	   *tOuterExpr = NULL;
-	Expr	   *tInnerExpr = NULL;
-
-	if (contain_vars_of_level((Node *) e1, 1))
+	if (contain_vars_of_level((Node *) e1, 0) &&
+			!contain_vars_of_level((Node *) e1, 1) &&
+			contain_vars_of_level((Node *) e2, 1) &&
+			!contain_vars_of_level((Node *) e2, 0))
 	{
-		tOuterExpr = (Expr *) copyObject(e1);
-		tInnerExpr = (Expr *) copyObject(e2);
-	}
-	else if ((contain_vars_of_level((Node *) e2, 1)))
-	{
-		tOuterExpr = (Expr *) copyObject(e2);
-		tInnerExpr = (Expr *) copyObject(e1);
-	}
+		*innerExpr = (Expr *) copyObject(e1);
 
-	/**
-	 * It is correlated only if we found an outer var and inner expr
-	 */
-
-	if (tOuterExpr && contain_vars_of_level((Node *) tInnerExpr, 0))
-	{
-		*innerExpr = tInnerExpr;
 		return true;
 	}
 
 	return false;
-
 }
 
 /**
@@ -261,7 +244,15 @@ IsCorrelatedEqualityOpExpr(OpExpr *opexp, Expr **innerExpr, Oid *eqOp, Oid *sort
 }
 
 /**
- * Process subquery to extract useful information to be able to convert it to a join
+ * Process subquery to extract useful information to be able to convert it to
+ * a join.
+ *
+ * This scans the join tree, and verifies that it consists entirely of inner
+ * joins. The inner joins can be represented as explicit JOIN_INNER JoinExprs*
+ * or as FromExprs. All the join quals are collected in context->innerQual.
+ *
+ * context->safeToConvert must be 'true' on entry. This sets it to false if
+ * there are any non-inner joins in the tree.
  */
 static void
 ProcessSubqueryToJoin(Query *subselect, ConvertSubqueryToJoinContext *context)
@@ -269,42 +260,58 @@ ProcessSubqueryToJoin(Query *subselect, ConvertSubqueryToJoinContext *context)
 	Assert(context);
 	Assert(context->safeToConvert);
 	Assert(subselect);
-	Assert(list_length(subselect->jointree->fromlist) == 1);
-	Node	   *joinQual = NULL;
 
-	/**
-	 * If subselect's join tree is not a plain relation or an inner join, we refuse to convert.
-	 */
-	Node	   *jtree = (Node *) list_nth(subselect->jointree->fromlist, 0);
+	ProcessSubqueryToJoin_walker((Node *) subselect->jointree, context);
+}
 
+static void
+ProcessSubqueryToJoin_walker(Node *jtree, ConvertSubqueryToJoinContext *context)
+{
 	if (IsA(jtree, JoinExpr))
 	{
 		JoinExpr   *je = (JoinExpr *) jtree;
 
+		/*
+		 * If subselect's join tree is not a plain relation or an inner join,
+		 * we refuse to convert.
+		 */
 		if (je->jointype != JOIN_INNER)
 		{
 			context->safeToConvert = false;
 			return;
 		}
-		joinQual = je->quals;
+
+		ProcessSubqueryToJoin_walker(je->larg, context);
+		if (!context->safeToConvert)
+			return;
+		ProcessSubqueryToJoin_walker(je->rarg, context);
+		if (!context->safeToConvert)
+			return;
+
+		SubqueryToJoinWalker(je->quals, context);
 	}
-
-	SubqueryToJoinWalker(subselect->jointree->quals, context);
-
-	if (context->safeToConvert)
+	else if (IsA(jtree, FromExpr))
 	{
-		SubqueryToJoinWalker(joinQual, context);
-	}
+		FromExpr   *fe = (FromExpr *) jtree;
+		ListCell   *lc;
 
-	/**
-	 * If we haven't been able to extract a proper joinQual, then it is not safe to convert
-	 */
-	if (!context->joinQual)
+		foreach(lc, fe->fromlist)
+		{
+			ProcessSubqueryToJoin_walker(lfirst(lc), context);
+			if (!context->safeToConvert)
+				return;
+		}
+
+		SubqueryToJoinWalker(fe->quals, context);
+	}
+	else if (IsA(jtree, RangeTblRef))
 	{
-		context->safeToConvert = false;
+		/* nothing to do */
 	}
-
-	return;
+	else
+	{
+		elog(ERROR, "unexpected node of type %d in join tree", jtree->type);
+	}
 }
 
 /**
@@ -313,21 +320,50 @@ ProcessSubqueryToJoin(Query *subselect, ConvertSubqueryToJoinContext *context)
 static void
 RemoveInnerJoinQuals(Query *subselect)
 {
-	Assert(subselect);
-	Assert(list_length(subselect->jointree->fromlist) == 1);
+	RemoveInnerJoinQuals_walker((Node *) subselect->jointree);
+}
 
-	subselect->jointree->quals = NULL;
-
-	Node	   *jtree = (Node *) list_nth(subselect->jointree->fromlist, 0);
-
+static void
+RemoveInnerJoinQuals_walker(Node *jtree)
+{
 	if (IsA(jtree, JoinExpr))
 	{
 		JoinExpr   *je = (JoinExpr *) jtree;
 
-		Assert(je->jointype == JOIN_INNER);
+		/*
+		 * We already checked in ProcessSubqueryToJoin() that there
+		 * are no outer joins, but doesn't hurt to check again.
+		 */
+		if (je->jointype != JOIN_INNER)
+		{
+			elog(ERROR, "unexpected join type encountered while converting subquery to join");
+		}
+
+		RemoveInnerJoinQuals_walker(je->larg);
+		RemoveInnerJoinQuals_walker(je->rarg);
+
 		je->quals = NULL;
 	}
-	return;
+	else if (IsA(jtree, FromExpr))
+	{
+		FromExpr   *fe = (FromExpr *) jtree;
+		ListCell   *lc;
+
+		foreach(lc, fe->fromlist)
+		{
+			RemoveInnerJoinQuals_walker(lfirst(lc));
+		}
+
+		fe->quals = NULL;
+	}
+	else if (IsA(jtree, RangeTblRef))
+	{
+		/* nothing to do */
+	}
+	else
+	{
+		elog(ERROR, "unexpected node of type %d in join tree", jtree->type);
+	}
 }
 
 /**
@@ -417,29 +453,26 @@ SubqueryToJoinWalker(Node *node, ConvertSubqueryToJoinContext *context)
 
 		if (considerOpExpr)
 		{
+			TargetEntry *tle;
+			SortGroupClause *gc;
 
-			TargetEntry *tle = makeTargetEntry(copyObject(innerExpr),
+			tle = makeTargetEntry(innerExpr,
 											   list_length(context->targetList) + 1,
 											   NULL,
 											   false);
-
-			if (context->extractGrouping)
-			{
-				SortGroupClause *gc = makeNode(SortGroupClause);
-
-				gc->tleSortGroupRef = list_length(context->groupClause) + 1;
-				gc->eqop = eqOp;
-				gc->sortop = sortOp;
-				gc->hashable = hashable;
-
-				context->groupClause = lappend(context->groupClause, gc);
-				tle->ressortgroupref = list_length(context->targetList) + 1;
-			}
-
+			tle->ressortgroupref = list_length(context->targetList) + 1;
 			context->targetList = lappend(context->targetList, tle);
-			context->joinQual = make_and_qual(context->joinQual, (Node *) opexp);
 
-			AssertImply(context->extractGrouping, list_length(context->groupClause) == list_length(context->targetList));
+			gc = makeNode(SortGroupClause);
+			gc->tleSortGroupRef = list_length(context->groupClause) + 1;
+			gc->eqop = eqOp;
+			gc->sortop = sortOp;
+			gc->hashable = hashable;
+			context->groupClause = lappend(context->groupClause, gc);
+
+			Assert(list_length(context->groupClause) == list_length(context->targetList));
+
+			context->joinQual = make_and_qual(context->joinQual, (Node *) opexp);
 
 			return;
 		}
@@ -516,6 +549,16 @@ safe_to_convert_EXPR(SubLink *sublink, ConvertSubqueryToJoinContext *ctx1)
 		return false;
 
 	/**
+	 * A LIMIT or OFFSET could interfere with the transformation of the
+	 * correlated qual to GROUP BY. (LIMIT >0 in a subquery that contains a
+	 * plain aggregate is actually a no-op, so we could try to remove it,
+	 * but it doesn't seem worth the trouble to optimize queries with
+	 * pointless limits like that.)
+	 */
+	if (subselect->limitOffset || subselect->limitCount)
+		return false;
+
+	/**
 	 * Cannot support grouping clause in subselect.
 	 */
 	if (subselect->groupClause)
@@ -561,7 +604,6 @@ convert_EXPR_to_join(PlannerInfo *root, OpExpr *opexp)
 	ConvertSubqueryToJoinContext ctx1;
 
 	InitConvertSubqueryToJoinContext(&ctx1);
-	ctx1.extractGrouping = true;
 
 	if (safe_to_convert_EXPR(sublink, &ctx1))
 	{
@@ -606,13 +648,7 @@ convert_EXPR_to_join(PlannerInfo *root, OpExpr *opexp)
 		/**
 		 * Construct the join expression involving the new pulled up subselect.
 		 */
-		Assert(list_length(root->parse->jointree->fromlist) == 1);
-
-		/* represents the top-level join tree entry */
-		Assert(linitial(root->parse->jointree->fromlist) != NULL);
-
 		JoinExpr   *join_expr = make_join_expr(NULL, rteIndex, JOIN_INNER);
-
 		Node	   *joinQual = ctx1.joinQual;
 
 		/**
@@ -825,14 +861,9 @@ add_expr_subquery_rte(Query *parse, Query *subselect)
 
 	foreach(lc, subselect->targetList)
 	{
-		StringInfoData si;
-
-		initStringInfo(&si);
-		appendStringInfo(&si, "csq_c%d", teNum);
-
 		TargetEntry *te = (TargetEntry *) lfirst(lc);
 
-		te->resname = si.data;
+		te->resname = psprintf("csq_c%d", teNum);
 		teNum++;
 	}
 
@@ -1320,8 +1351,6 @@ convert_IN_to_antijoin(PlannerInfo *root, SubLink *sublink,
 		/* Delete ORDER BY and DISTINCT. */
 		cdbsubselect_drop_orderby(subselect);
 		cdbsubselect_drop_distinct(subselect);
-
-		Assert(list_length(parse->jointree->fromlist) == 1);
 
 		int			subq_indx = add_notin_subquery_rte(parse, subselect);
 		bool		inner_nullable = is_targetlist_nullable(subselect);

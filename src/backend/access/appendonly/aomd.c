@@ -32,13 +32,17 @@
 #include "access/appendonlytid.h"
 #include "access/appendonlywriter.h"
 #include "catalog/catalog.h"
+#include "catalog/pg_appendonly_fn.h"
 #include "cdb/cdbappendonlystorage.h"
 #include "cdb/cdbappendonlyxlog.h"
 #include "common/relpath.h"
 #include "utils/guc.h"
 
+#define SEGNO_SUFFIX_LENGTH 12
+
 static bool mdunlink_ao_perFile(const int segno, void *ctx);
 static bool copy_append_only_data_perFile(const int segno, void *ctx);
+static bool truncate_ao_perFile(const int segno, void *ctx);
 
 int
 AOSegmentFilePathNameLen(Relation rel)
@@ -200,18 +204,44 @@ TruncateAOSegmentFile(File fd, Relation rel, int32 segFileNum, int64 offset)
 					    relname)));
 	if (RelationNeedsWAL(rel))
 		xlog_ao_truncate(rel->rd_node, segFileNum, offset);
+
+	if (file_truncate_hook)
+	{
+		RelFileNodeBackend rnode;
+		rnode.node = rel->rd_node;
+		rnode.backend = rel->rd_backend;
+		(*file_truncate_hook)(rnode);
+	}
 }
 
-struct mdunlink_ao_callback_ctx {
+struct mdunlink_ao_callback_ctx
+{
 	char *segPath;
 	char *segpathSuffixPosition;
 };
 
-void
-mdunlink_ao(const char *path)
+struct truncate_ao_callback_ctx
 {
+	char *segPath;
+	char *segpathSuffixPosition;
+	Relation rel;
+};
+
+void
+mdunlink_ao(const char *path, ForkNumber forkNumber)
+{
+	/*
+	 * Unlogged AO tables have INIT_FORK, in addition to MAIN_FORK.  This
+	 * function is called for each fork type.  For INIT_FORK, the "_init"
+	 * file is unlinked generically by mdunlinkfork.
+	 */
+	if (forkNumber == INIT_FORKNUM)
+		return;
+
+	Assert(forkNumber == MAIN_FORKNUM);
+
 	int pathSize = strlen(path);
-	char *segPath = (char *) palloc(pathSize + 12);
+	char *segPath = (char *) palloc(pathSize + SEGNO_SUFFIX_LENGTH);
 	char *segPathSuffixPosition = segPath + pathSize;
 	struct mdunlink_ao_callback_ctx unlinkFiles = { 0 };
 
@@ -338,7 +368,6 @@ struct copy_append_only_data_callback_ctx {
 /*
  * Like copy_relation_data(), but for AO tables.
  *
- * Currently, AO tables don't have any extra forks.
  */
 void
 copy_append_only_data(RelFileNode src, RelFileNode dst,
@@ -365,6 +394,14 @@ copy_append_only_data(RelFileNode src, RelFileNode dst,
 	copyFiles.useWal = useWal;
 
     ao_foreach_extent_file(copy_append_only_data_perFile, &copyFiles);
+
+	if (file_extend_hook)
+	{
+		RelFileNodeBackend rnode;
+		rnode.node = dst;
+		rnode.backend = backendid;
+		(*file_extend_hook)(rnode);
+	}
 }
 
 static bool
@@ -391,3 +428,71 @@ copy_append_only_data_perFile(const int segno, void *ctx)
 	return true;
 }
 
+/*
+ * ao_truncate_one_rel
+ *
+ * This routine deletes all data within the specified ao relation.
+ */
+void
+ao_truncate_one_rel(Relation rel)
+{
+	char *basepath;
+	char *segPath;
+	char *segPathSuffixPosition;
+	struct truncate_ao_callback_ctx truncateFiles = { 0 };
+	int pathSize;
+
+	/* Get base path for this relation file */
+	basepath = relpathbackend(rel->rd_node, rel->rd_backend, MAIN_FORKNUM);
+
+	pathSize = strlen(basepath);
+	segPath = (char *) palloc(pathSize + SEGNO_SUFFIX_LENGTH);
+	segPathSuffixPosition = segPath + pathSize;
+	strncpy(segPath, basepath, pathSize);
+
+	truncateFiles.segPath = segPath;
+	truncateFiles.segpathSuffixPosition = segPathSuffixPosition;
+	truncateFiles.rel = rel;
+
+	/* Truncate the actual file */
+	ao_foreach_extent_file(truncate_ao_perFile, &truncateFiles);
+
+	pfree(segPath);
+	pfree(basepath);
+}
+
+/*
+ * Truncate a specific segment file of ao relation.
+ */
+static bool
+truncate_ao_perFile(const int segno, void *ctx)
+{
+	File		fd;
+	Relation aorel;
+
+	const struct truncate_ao_callback_ctx *truncateFiles = ctx;
+
+	char *segPath = truncateFiles->segPath;
+	char *segPathSuffixPosition = truncateFiles->segpathSuffixPosition;
+	aorel = truncateFiles->rel;
+
+	sprintf(segPathSuffixPosition, ".%u", segno);
+
+	fd = OpenAOSegmentFile(aorel, segPath, segno, 0);
+
+	if (fd >= 0)
+	{
+		TruncateAOSegmentFile(fd, aorel, segno, 0);
+		CloseAOSegmentFile(fd);
+	}
+	else
+	{
+		/* 
+		 * we traverse possible segment files of AO/AOCS tables and call
+		 * truncate_ao_perFile to truncate them. It is ok that some files do not exist
+		 */
+		return false;
+	}
+
+	return true;
+}

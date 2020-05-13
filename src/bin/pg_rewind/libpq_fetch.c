@@ -3,7 +3,7 @@
  * libpq_fetch.c
  *	  Functions for fetching files from a remote server.
  *
- * Copyright (c) 2013-2015, PostgreSQL Global Development Group
+ * Copyright (c) 2013-2016, PostgreSQL Global Development Group
  *
  *-------------------------------------------------------------------------
  */
@@ -352,7 +352,7 @@ receiveFileChunks(const char *sql)
 		if (PQgetisnull(res, 0, 2))
 		{
 			pg_log(PG_DEBUG,
-			  "received null value for chunk for file \"%s\", file has been deleted\n",
+				   "received null value for chunk for file \"%s\", file has been deleted\n",
 				   filename);
 			remove_target_file(filename, true);
 			pg_free(filename);
@@ -655,11 +655,13 @@ escape_quotes(const char *src)
 	return result;
 }
 
+#define GP_WALRECEIVER_APPNAME "gp_walreceiver"
+
 /*
  * Create a recovery.conf file in memory using a PQExpBuffer
  */
 void
-GenerateRecoveryConf(void)
+GenerateRecoveryConf(char *replication_slot)
 {
 	PQconninfoOption *connOptions;
 	PQconninfoOption *option;
@@ -713,6 +715,7 @@ GenerateRecoveryConf(void)
 		free(escaped);
 	}
 
+	appendPQExpBuffer(&conninfo_buf, " application_name=%s", GP_WALRECEIVER_APPNAME);
 	/*
 	 * Escape the connection string, so that it can be put in the config file.
 	 * Note that this is different from the escaping of individual connection
@@ -721,6 +724,13 @@ GenerateRecoveryConf(void)
 	escaped = escape_quotes(conninfo_buf.data);
 	appendPQExpBuffer(recoveryconfcontents, "primary_conninfo = '%s'\n", escaped);
 	free(escaped);
+
+	if (replication_slot)
+	{
+		escaped = escape_quotes(replication_slot);
+		appendPQExpBuffer(recoveryconfcontents, "primary_slot_name = '%s'\n", replication_slot);
+		free(escaped);
+	}
 
 	if (PQExpBufferBroken(recoveryconfcontents) ||
 		PQExpBufferDataBroken(conninfo_buf))

@@ -5,7 +5,7 @@
  *		bits of hard-wired knowledge
  *
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -42,6 +42,7 @@
 #include "catalog/pg_resqueuecapability.h"
 #include "catalog/pg_resgroup.h"
 #include "catalog/pg_db_role_setting.h"
+#include "catalog/pg_replication_origin.h"
 #include "catalog/pg_shdepend.h"
 #include "catalog/pg_shdescription.h"
 #include "catalog/pg_shseclabel.h"
@@ -67,22 +68,6 @@
 #include "cdb/cdbvars.h"
 
 static bool IsAoSegmentClass(Form_pg_class reltuple);
-
-/*
- * Return directory name within tablespace location to use, for this server.
- * This is the GPDB replacement for PostgreSQL's TABLESPACE_VERSION_DIRECTORY
- * constant.
- */
-const char *
-tablespace_version_directory(void)
-{
-	static char path[MAXPGPATH] = "";
-
-	if (!path[0])
-		snprintf(path, MAXPGPATH, "%s_db%d", GP_TABLESPACE_VERSION_DIRECTORY, GpIdentity.dbid);
-
-	return path;
-}
 
 /*
  * Like relpath(), but gets the directory containing the data file
@@ -213,7 +198,7 @@ IsCatalogClass(Oid relid, Form_pg_class reltuple)
 	 * We could instead check whether the relation is pinned in pg_depend, but
 	 * this is noticeably cheaper and doesn't require catalog access.
 	 *
-	 * This test is safe since even a oid wraparound will preserve this
+	 * This test is safe since even an oid wraparound will preserve this
 	 * property (c.f. GetNewObjectId()) and it has the advantage that it works
 	 * correctly even if a user decides to create a relation in the pg_catalog
 	 * namespace.
@@ -306,8 +291,9 @@ IsAoSegmentNamespace(Oid namespaceId)
  *		True iff name starts with the pg_ prefix.
  *
  *		For some classes of objects, the prefix pg_ is reserved for
- *		system objects only.  As of 8.0, this is only true for
- *		schema and tablespace names.
+ *		system objects only.  As of 8.0, this was only true for
+ *		schema and tablespace names.  With 9.6, this is also true
+ *		for roles.
  *
  *      As of Greenplum 4.0 we also reserve the prefix gp_
  */
@@ -369,7 +355,8 @@ IsSharedRelation(Oid relationId)
 		relationId == SharedDependRelationId ||
 		relationId == SharedSecLabelRelationId ||
 		relationId == TableSpaceRelationId ||
-		relationId == DbRoleSettingRelationId)
+		relationId == DbRoleSettingRelationId ||
+		relationId == ReplicationOriginRelationId)
 		return true;
 
 	/* GPDB additions */
@@ -404,7 +391,9 @@ IsSharedRelation(Oid relationId)
 		relationId == SharedSecLabelObjectIndexId ||
 		relationId == TablespaceOidIndexId ||
 		relationId == TablespaceNameIndexId ||
-		relationId == DbRoleSettingDatidRolidIndexId)
+		relationId == DbRoleSettingDatidRolidIndexId ||
+		relationId == ReplicationOriginIdentIndex ||
+		relationId == ReplicationOriginNameIndex)
 		return true;
 
 	/* GPDB added indexes */
@@ -438,7 +427,9 @@ IsSharedRelation(Oid relationId)
 	if (relationId == PgShdescriptionToastTable ||
 		relationId == PgShdescriptionToastIndex ||
 		relationId == PgDbRoleSettingToastTable ||
-		relationId == PgDbRoleSettingToastIndex)
+		relationId == PgDbRoleSettingToastIndex ||
+		relationId == PgShseclabelToastTable ||
+		relationId == PgShseclabelToastIndex)
 		return true;
 
 	/* GPDB added toast tables and their indexes */
@@ -510,8 +501,12 @@ RelationNeedsSynchronizedOIDs(Relation relation)
  * managed to cycle through 2^32 OIDs and generate the same OID before we
  * finish inserting our row.  This seems unlikely to be a problem.  Note
  * that if we had to *commit* the row to end the race condition, the risk
- * would be rather higher; therefore we use SnapshotDirty in the test,
- * so that we will see uncommitted rows.
+ * would be rather higher; therefore we use SnapshotAny in the test, so that
+ * we will see uncommitted rows.  (We used to use SnapshotDirty, but that has
+ * the disadvantage that it ignores recently-deleted rows, creating a risk
+ * of transient conflicts for as long as our own MVCC snapshots think a
+ * recently-deleted row is live.  The risk is far higher when selecting TOAST
+ * OIDs, because SnapshotToast considers dead rows as active indefinitely.)
  */
 Oid
 GetNewOid(Relation relation)
@@ -581,12 +576,9 @@ Oid
 GetNewOidWithIndex(Relation relation, Oid indexId, AttrNumber oidcolumn)
 {
 	Oid			newOid;
-	SnapshotData SnapshotDirty;
 	SysScanDesc scan;
 	ScanKeyData key;
 	bool		collides;
-
-	InitDirtySnapshot(SnapshotDirty);
 
 	/* Generate new OIDs until we find one not in the table */
 	do
@@ -600,9 +592,9 @@ GetNewOidWithIndex(Relation relation, Oid indexId, AttrNumber oidcolumn)
 					BTEqualStrategyNumber, F_OIDEQ,
 					ObjectIdGetDatum(newOid));
 
-		/* see notes above about using SnapshotDirty */
+		/* see notes above about using SnapshotAny */
 		scan = systable_beginscan(relation, indexId, true,
-								  &SnapshotDirty, 1, &key);
+								  SnapshotAny, 1, &key);
 
 		collides = HeapTupleIsValid(systable_getnext(scan));
 
@@ -671,7 +663,7 @@ GetNewRelFileNode(Oid reltablespace, Relation pg_class, char relpersistence)
 	switch (relpersistence)
 	{
 		case RELPERSISTENCE_TEMP:
-			backend = TempRelBackendId;
+			backend = BackendIdForTempRelations();
 			break;
 		case RELPERSISTENCE_UNLOGGED:
 		case RELPERSISTENCE_PERMANENT:

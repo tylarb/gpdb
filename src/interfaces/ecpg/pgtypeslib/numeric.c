@@ -2,6 +2,7 @@
 
 #include "postgres_fe.h"
 #include <ctype.h>
+#include <float.h>
 #include <limits.h>
 
 #include "extern.h"
@@ -262,8 +263,7 @@ set_var_from_str(char *str, char **ptr, numeric *dest)
 			return -1;
 		}
 		(*ptr) = endptr;
-		if (exponent > NUMERIC_MAX_PRECISION ||
-			exponent < -NUMERIC_MAX_PRECISION)
+		if (exponent >= INT_MAX / 2 || exponent <= -(INT_MAX / 2))
 		{
 			errno = PGTYPES_NUM_BAD_NUMERIC;
 			return -1;
@@ -1368,15 +1368,15 @@ PGTYPESnumeric_cmp(numeric *var1, numeric *var2)
 {
 	/* use cmp_abs function to calculate the result */
 
-	/* both are positive: normal comparation with cmp_abs */
+	/* both are positive: normal comparison with cmp_abs */
 	if (var1->sign == NUMERIC_POS && var2->sign == NUMERIC_POS)
 		return cmp_abs(var1, var2);
 
-	/* both are negative: return the inverse of the normal comparation */
+	/* both are negative: return the inverse of the normal comparison */
 	if (var1->sign == NUMERIC_NEG && var2->sign == NUMERIC_NEG)
 	{
 		/*
-		 * instead of inverting the result, we invert the paramter ordering
+		 * instead of inverting the result, we invert the parameter ordering
 		 */
 		return cmp_abs(var2, var1);
 	}
@@ -1497,11 +1497,11 @@ PGTYPESnumeric_copy(numeric *src, numeric *dst)
 int
 PGTYPESnumeric_from_double(double d, numeric *dst)
 {
-	char		buffer[100];
+	char		buffer[DBL_DIG + 100];
 	numeric    *tmp;
 	int			i;
 
-	if (sprintf(buffer, "%f", d) == 0)
+	if (sprintf(buffer, "%.*g", DBL_DIG, d) <= 0)
 		return -1;
 
 	if ((tmp = PGTYPESnumeric_from_asc(buffer, NULL)) == NULL)

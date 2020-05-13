@@ -7,11 +7,10 @@ REGRESS = exttab1 custom_format gpfdist2
 
 ifeq ($(enable_gpfdist),yes)
 ifeq ($(with_openssl),yes)
-	REGRESS += gpfdist_ssl
+	REGRESS += gpfdist_ssl gpfdists_multiCA
 endif
 endif
 
-PSQLDIR = $(prefix)/bin
 REGRESS_OPTS = --init-file=init_file
 
 installcheck: watchdog
@@ -21,7 +20,7 @@ ifeq ($(with_openssl),yes)
 	cp data/gpfdist_ssl/certs_matching/root.crt data/gpfdist_ssl/certs_not_matching
 endif
 endif
-	$(top_builddir)/src/test/regress/pg_regress --psqldir=$(PSQLDIR) --dbname=gpfdist_regression $(REGRESS) $(REGRESS_OPTS)
+	$(top_builddir)/src/test/regress/pg_regress --dbname=gpfdist_regression $(REGRESS) $(REGRESS_OPTS)
 
 watchdog:
 	sh test_watchdog.sh

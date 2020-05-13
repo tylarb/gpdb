@@ -70,16 +70,12 @@ eval_propagation_expression(PartitionSelectorState *node, Oid part_oid)
  * ----------------------------------------------------------------
  */
 static bool
-eval_part_qual(ExprState *exprstate, PartitionSelectorState *node, TupleTableSlot *inputTuple)
+eval_part_qual(ExprContext *econtext, TupleTableSlot *inputTuple, List *qualList)
 {
-	/* evaluate generalPredicate */
-	ExprContext *econtext = node->ps.ps_ExprContext;
-
+	/* evaluate predicate */
 	ResetExprContext(econtext);
 	econtext->ecxt_outertuple = inputTuple;
 	econtext->ecxt_scantuple = inputTuple;
-
-	List	   *qualList = list_make1(exprstate);
 
 	return ExecQual(qualList, econtext, false /* result is not for null */ );
 }
@@ -152,11 +148,10 @@ partition_rules_for_general_predicate(PartitionSelectorState *node, int level,
 	Assert(NULL != parentNode);
 
 	List	   *result = NIL;
-	ListCell   *lc = NULL;
 
-	foreach(lc, parentNode->rules)
+	for (int i = 0; i < parentNode->num_rules; i++)
 	{
-		PartitionRule *rule = (PartitionRule *) lfirst(lc);
+		PartitionRule *rule = parentNode->rules[i];
 
 		/*
 		 * We need to register it to allLevelParts to evaluate the current
@@ -165,9 +160,9 @@ partition_rules_for_general_predicate(PartitionSelectorState *node, int level,
 		node->levelPartRules[level] = rule;
 
 		/* evaluate generalPredicate */
-		ExprState  *exprstate = (ExprState *) lfirst(list_nth_cell(node->levelExprStates, level));
+		List  *qualList = (List *) lfirst(list_nth_cell(node->levelExprStateLists, level));
 
-		if (eval_part_qual(exprstate, node, inputTuple))
+		if (eval_part_qual(node->ps.ps_ExprContext, inputTuple, qualList))
 		{
 			result = lappend(result, rule);
 		}
@@ -182,9 +177,9 @@ partition_rules_for_general_predicate(PartitionSelectorState *node, int level,
 		node->levelPartRules[level] = parentNode->default_part;
 
 		/* evaluate generalPredicate */
-		ExprState  *exprstate = (ExprState *) lfirst(list_nth_cell(node->levelExprStates, level));
+		List  *qualList = (List *) lfirst(list_nth_cell(node->levelExprStateLists, level));
 
-		if (eval_part_qual(exprstate, node, inputTuple))
+		if (eval_part_qual(node->ps.ps_ExprContext, inputTuple, qualList))
 		{
 			result = lappend(result, parentNode->default_part);
 		}
@@ -314,21 +309,10 @@ processLevel(PartitionSelectorState *node, int level, TupleTableSlot *inputTuple
 		/*
 		 * Neither equality predicate nor general predicate exists. Return all
 		 * the next level PartitionRule.
-		 *
-		 * WARNING: Do NOT use list_concat with satisfiedRules and
-		 * parentNode->rules. list_concat will destructively modify
-		 * satisfiedRules to point to parentNode->rules, which will then be
-		 * freed when we free satisfiedRules. This does not apply when we
-		 * execute partition_rules_for_general_predicate as it creates its own
-		 * list.
 		 */
-		ListCell   *lc = NULL;
-
-		foreach(lc, parentNode->rules)
+		for (int i = 0; i < parentNode->num_rules; i++)
 		{
-			PartitionRule *rule = (PartitionRule *) lfirst(lc);
-
-			satisfiedRules = lappend(satisfiedRules, rule);
+			satisfiedRules = lappend(satisfiedRules, parentNode->rules[i]);
 		}
 
 		if (NULL != parentNode->default_part)
@@ -358,9 +342,7 @@ processLevel(PartitionSelectorState *node, int level, TupleTableSlot *inputTuple
 			if (NULL != ps->residualPredicate)
 			{
 				/* evaluate residualPredicate */
-				ExprState  *exprstate = node->residualPredicateExprState;
-
-				shouldPropagate = eval_part_qual(exprstate, node, inputTuple);
+				shouldPropagate = eval_part_qual(node->ps.ps_ExprContext, inputTuple, node->residualPredicateExprStateList);
 			}
 
 			if (shouldPropagate)
@@ -435,14 +417,14 @@ initPartitionSelection(PartitionSelector *node, EState *estate)
 	{
 		Expr	   *generalExpr = (Expr *) lfirst(lc);
 
-		psstate->levelExprStates = lappend(psstate->levelExprStates,
-										   ExecInitExpr(generalExpr, (PlanState *) psstate));
+		ExprState *generalExprState = ExecInitExpr(generalExpr, (PlanState *) psstate);
+		psstate->levelExprStateLists = lappend(psstate->levelExprStateLists, list_make1(generalExprState));
 	}
 
-	psstate->residualPredicateExprState = ExecInitExpr((Expr *) node->residualPredicate,
-													   (PlanState *) psstate);
-	psstate->propagationExprState = ExecInitExpr((Expr *) node->propagationExpression,
-												 (PlanState *) psstate);
+	ExprState *residualPredicateExprState = ExecInitExpr((Expr *) node->residualPredicate,
+														 (PlanState *) psstate);
+	psstate->residualPredicateExprStateList = list_make1(residualPredicateExprState);
+	psstate->propagationExprState = ExecInitExpr((Expr *) node->propagationExpression, (PlanState *) psstate);
 
 	psstate->ps.targetlist = (List *) ExecInitExpr((Expr *) node->plan.targetlist,
 												   (PlanState *) psstate);

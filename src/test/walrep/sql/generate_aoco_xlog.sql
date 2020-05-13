@@ -8,7 +8,7 @@ INSERT INTO tmp SELECT 1, gp_execution_segment(),pg_current_xlog_location() FROM
 gp_dist_random('gp_id');
 
 -- Generate some xlog records for AOCO
-INSERT INTO generate_aoco_xlog_table VALUES (1, 10), (2, 10), (8, 10), (3, 10);
+INSERT INTO generate_aoco_xlog_table SELECT i,i+3 FROM generate_series(1,15)i;
 
 -- Verify that AO xlog record was received
 SELECT gp_segment_id, relname, record_type, segment_filenum, recordlen, file_offset
@@ -42,4 +42,3 @@ SELECT gp_segment_id, relname, record_type, segment_filenum, recordlen, file_off
 WHERE spcNode = (SELECT oid FROM pg_tablespace WHERE spcname = 'pg_default')
 AND dbNode = (SELECT oid FROM pg_database WHERE datname = current_database())
 ORDER BY gp_segment_id, xrecoff;
-

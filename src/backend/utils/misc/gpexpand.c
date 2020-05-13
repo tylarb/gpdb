@@ -95,7 +95,7 @@ gp_expand_bump_version(PG_FUNCTION_ARGS)
 Datum
 gp_expand_lock_catalog(PG_FUNCTION_ARGS)
 {
-	LockAcquire(&gp_expand_locktag, AccessExclusiveLock, false, false);
+	(void) LockAcquire(&gp_expand_locktag, AccessExclusiveLock, false, false);
 
 	PG_RETURN_VOID();
 }
@@ -154,7 +154,7 @@ gp_expand_protect_catalog_changes(Relation relation)
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 				 errmsg("gpexpand in progress, catalog changes are disallowed.")));
 
-	oldVersion = cdbcomponent_getCdbComponents(true)->expand_version;
+	oldVersion = cdbcomponent_getCdbComponents()->expand_version;
 	newVersion = GetGpExpandVersion();
 	if (oldVersion != newVersion)
 		ereport(FATAL,

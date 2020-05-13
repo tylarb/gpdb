@@ -23,7 +23,6 @@
  *	 ExecTableFunctionNext			retrieve next tuple in sequential order.
  *	 ExecInitTableFunctionScan		creates and initializes a externalscan node.
  *	 ExecEndTableFunctionScan		releases any storage allocated.
- *	 ExecStopTableFunctionScan		closes external resources before EOD.
  *	 ExecTableFunctionReScan		rescans the relation
  *
  * Portions Copyright (c) 2011, EMC
@@ -46,6 +45,7 @@
 #include "nodes/nodeFuncs.h"
 #include "parser/parsetree.h"
 #include "utils/lsyscache.h"
+#include "utils/memutils.h"
 
 
 static void setupFunctionArguments(TableFunctionState *node);
@@ -470,15 +470,14 @@ ExecEndTableFunction(TableFunctionState *node)
 	
 	/* End the subplans */
 	ExecEndNode(outerPlanState(node));
-	
-	EndPlanStateGpmonPkt(&node->ss.ps);
 }
 
 void
 ExecReScanTableFunction(TableFunctionState *node)
 {
 	/* TableFunction Planner marks TableFunction nodes as not rescannable */
-	elog(ERROR, "invalid rescan of TableFunctionScan");
+	if (!node->is_firstcall)
+		elog(ERROR, "invalid rescan of TableFunctionScan");
 }
 
 

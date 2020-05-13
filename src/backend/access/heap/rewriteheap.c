@@ -92,7 +92,7 @@
  * heap's TOAST table will go through the normal bufmgr.
  *
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994-5, Regents of the University of California
  *
  * IDENTIFICATION
@@ -113,6 +113,7 @@
 #include "access/transam.h"
 #include "access/tuptoaster.h"
 #include "access/xact.h"
+#include "access/xloginsert.h"
 
 #include "catalog/catalog.h"
 
@@ -194,7 +195,7 @@ typedef struct
 typedef OldToNewMappingData *OldToNewMapping;
 
 /*
- * In-Memory data for a xid that might need logical remapping entries
+ * In-Memory data for an xid that might need logical remapping entries
  * to be logged.
  */
 typedef struct RewriteMappingFile
@@ -208,7 +209,7 @@ typedef struct RewriteMappingFile
 } RewriteMappingFile;
 
 /*
- * A single In-Memeory logical rewrite mapping, hanging of
+ * A single In-Memory logical rewrite mapping, hanging off
  * RewriteMappingFile->mappings.
  */
 typedef struct RewriteMappingDataEntry
@@ -282,13 +283,12 @@ begin_heap_rewrite(Relation old_heap, Relation new_heap, TransactionId oldest_xm
 	hash_ctl.keysize = sizeof(TidHashKey);
 	hash_ctl.entrysize = sizeof(UnresolvedTupData);
 	hash_ctl.hcxt = state->rs_cxt;
-	hash_ctl.hash = tag_hash;
 
 	state->rs_unresolved_tups =
 		hash_create("Rewrite / Unresolved ctids",
 					128,		/* arbitrary initial size */
 					&hash_ctl,
-					HASH_ELEM | HASH_FUNCTION | HASH_CONTEXT);
+					HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
 
 	hash_ctl.entrysize = sizeof(OldToNewMappingData);
 
@@ -296,7 +296,7 @@ begin_heap_rewrite(Relation old_heap, Relation new_heap, TransactionId oldest_xm
 		hash_create("Rewrite / Old to new tid map",
 					128,		/* arbitrary initial size */
 					&hash_ctl,
-					HASH_ELEM | HASH_FUNCTION | HASH_CONTEXT);
+					HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
 
 	MemoryContextSwitchTo(old_cxt);
 
@@ -407,7 +407,10 @@ rewrite_heap_tuple(RewriteState state,
 	 * While we have our hands on the tuple, we may as well freeze any
 	 * eligible xmin or xmax, so that future VACUUM effort can be saved.
 	 */
-	heap_freeze_tuple(new_tuple->t_data, state->rs_freeze_xid,
+	heap_freeze_tuple(new_tuple->t_data,
+					  state->rs_old_rel->rd_rel->relfrozenxid,
+					  state->rs_old_rel->rd_rel->relminmxid,
+					  state->rs_freeze_xid,
 					  state->rs_cutoff_multi);
 
 	/*
@@ -648,11 +651,24 @@ raw_heap_insert(RewriteState state, HeapTuple tup)
 		heaptup = tup;
 	}
 	else if (HeapTupleHasExternal(tup) || tup->t_len > TOAST_TUPLE_THRESHOLD)
+	{
+		int options = HEAP_INSERT_SKIP_FSM;
+
+		if (!state->rs_use_wal)
+			options |= HEAP_INSERT_SKIP_WAL;
+
+		/*
+		 * The new relfilenode's relcache entrye doesn't have the necessary
+		 * information to determine whether a relation should emit data for
+		 * logical decoding.  Force it to off if necessary.
+		 */
+		if (!RelationIsLogicallyLogged(state->rs_old_rel))
+			options |= HEAP_INSERT_NO_LOGICAL;
+
 		heaptup = toast_insert_or_update(state->rs_new_rel, tup, NULL,
 										 TOAST_TUPLE_TARGET, false,
-										 HEAP_INSERT_SKIP_FSM |
-										 (state->rs_use_wal ?
-										  0 : HEAP_INSERT_SKIP_WAL));
+										 options);
+	}
 	else
 		heaptup = tup;
 
@@ -703,6 +719,9 @@ raw_heap_insert(RewriteState state, HeapTuple tup)
 
 			state->rs_blockno++;
 			state->rs_buffer_valid = false;
+
+			if (state->rs_use_wal)
+				wait_to_avoid_large_repl_lag();
 		}
 	}
 
@@ -764,9 +783,9 @@ raw_heap_insert(RewriteState state, HeapTuple tup)
  *
  * Crash-Safety: This module diverts from the usual patterns of doing WAL
  * since it cannot rely on checkpoint flushing out all buffers and thus
- * waiting for exlusive locks on buffers. Usually the XLogInsert() covering
+ * waiting for exclusive locks on buffers. Usually the XLogInsert() covering
  * buffer modifications is performed while the buffer(s) that are being
- * modified are exlusively locked guaranteeing that both the WAL record and
+ * modified are exclusively locked guaranteeing that both the WAL record and
  * the modified heap are on either side of the checkpoint. But since the
  * mapping files we log aren't in shared_buffers that interlock doesn't work.
  *
@@ -834,13 +853,12 @@ logical_begin_heap_rewrite(RewriteState state)
 	hash_ctl.keysize = sizeof(TransactionId);
 	hash_ctl.entrysize = sizeof(RewriteMappingFile);
 	hash_ctl.hcxt = state->rs_cxt;
-	hash_ctl.hash = tag_hash;
 
 	state->rs_logical_mappings =
 		hash_create("Logical rewrite mapping",
 					128,		/* arbitrary initial size */
 					&hash_ctl,
-					HASH_ELEM | HASH_FUNCTION | HASH_CONTEXT);
+					HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
 }
 
 /*
@@ -865,7 +883,6 @@ logical_heap_rewrite_flush_mappings(RewriteState state)
 	hash_seq_init(&seq_status, state->rs_logical_mappings);
 	while ((src = (RewriteMappingFile *) hash_seq_search(&seq_status)) != NULL)
 	{
-		XLogRecData rdata[2];
 		char	   *waldata;
 		char	   *waldata_start;
 		xl_heap_rewrite_mapping xlrec;
@@ -888,11 +905,6 @@ logical_heap_rewrite_flush_mappings(RewriteState state)
 		xlrec.mapped_db = dboid;
 		xlrec.offset = src->off;
 		xlrec.start_lsn = state->rs_begin_lsn;
-
-		rdata[0].data = (char *) (&xlrec);
-		rdata[0].len = sizeof(xlrec);
-		rdata[0].buffer = InvalidBuffer;
-		rdata[0].next = &(rdata[1]);
 
 		/* write all mappings consecutively */
 		len = src->num_mappings * sizeof(LogicalRewriteMappingData);
@@ -934,13 +946,12 @@ logical_heap_rewrite_flush_mappings(RewriteState state)
 							written, len)));
 		src->off += len;
 
-		rdata[1].data = waldata_start;
-		rdata[1].len = len;
-		rdata[1].buffer = InvalidBuffer;
-		rdata[1].next = NULL;
+		XLogBeginInsert();
+		XLogRegisterData((char *) (&xlrec), sizeof(xlrec));
+		XLogRegisterData(waldata_start, len);
 
 		/* write xlog record */
-		XLogInsert(RM_HEAP2_ID, XLOG_HEAP2_REWRITE, rdata);
+		XLogInsert(RM_HEAP2_ID, XLOG_HEAP2_REWRITE);
 
 		pfree(waldata_start);
 	}
@@ -1010,7 +1021,7 @@ logical_rewrite_log_mapping(RewriteState state, TransactionId xid,
 			dboid = MyDatabaseId;
 
 		snprintf(path, MAXPGPATH,
-				 "pg_llog/mappings/" LOGICAL_REWRITE_FORMAT,
+				 "pg_logical/mappings/" LOGICAL_REWRITE_FORMAT,
 				 dboid, relid,
 				 (uint32) (state->rs_begin_lsn >> 32),
 				 (uint32) state->rs_begin_lsn,
@@ -1123,7 +1134,7 @@ logical_rewrite_heap_tuple(RewriteState state, ItemPointerData old_tid,
  * Replay XLOG_HEAP2_REWRITE records
  */
 void
-heap_xlog_logical_rewrite(XLogRecPtr lsn, XLogRecord *r)
+heap_xlog_logical_rewrite(XLogReaderState *r)
 {
 	char		path[MAXPGPATH];
 	int			fd;
@@ -1134,11 +1145,11 @@ heap_xlog_logical_rewrite(XLogRecPtr lsn, XLogRecord *r)
 	xlrec = (xl_heap_rewrite_mapping *) XLogRecGetData(r);
 
 	snprintf(path, MAXPGPATH,
-			 "pg_llog/mappings/" LOGICAL_REWRITE_FORMAT,
+			 "pg_logical/mappings/" LOGICAL_REWRITE_FORMAT,
 			 xlrec->mapped_db, xlrec->mapped_rel,
 			 (uint32) (xlrec->start_lsn >> 32),
 			 (uint32) xlrec->start_lsn,
-			 xlrec->mapped_xid, r->xl_xid);
+			 xlrec->mapped_xid, XLogRecGetXid(r));
 
 	fd = OpenTransientFile(path,
 						   O_CREAT | O_WRONLY | PG_BINARY,
@@ -1162,7 +1173,7 @@ heap_xlog_logical_rewrite(XLogRecPtr lsn, XLogRecord *r)
 	if (lseek(fd, xlrec->offset, SEEK_SET) != xlrec->offset)
 		ereport(ERROR,
 				(errcode_for_file_access(),
-				 errmsg("could not seek to the end of file \"%s\": %m",
+				 errmsg("could not seek to end of file \"%s\": %m",
 						path)));
 
 	data = XLogRecGetData(r) + sizeof(*xlrec);
@@ -1170,10 +1181,16 @@ heap_xlog_logical_rewrite(XLogRecPtr lsn, XLogRecord *r)
 	len = xlrec->num_mappings * sizeof(LogicalRewriteMappingData);
 
 	/* write out tail end of mapping file (again) */
+	errno = 0;
 	if (write(fd, data, len) != len)
+	{
+		/* if write didn't set errno, assume problem is no disk space */
+		if (errno == 0)
+			errno = ENOSPC;
 		ereport(ERROR,
 				(errcode_for_file_access(),
 				 errmsg("could not write to file \"%s\": %m", path)));
+	}
 
 	/*
 	 * Now fsync all previously written data. We could improve things and only
@@ -1205,7 +1222,7 @@ CheckPointLogicalRewriteHeap(void)
 	XLogRecPtr	redo;
 	DIR		   *mappings_dir;
 	struct dirent *mapping_de;
-	char		path[MAXPGPATH];
+	char		path[MAXPGPATH + 20];
 
 	/*
 	 * We start of with a minimum of the last redo pointer. No new decoding
@@ -1220,8 +1237,8 @@ CheckPointLogicalRewriteHeap(void)
 	if (cutoff != InvalidXLogRecPtr && redo < cutoff)
 		cutoff = redo;
 
-	mappings_dir = AllocateDir("pg_llog/mappings");
-	while ((mapping_de = ReadDir(mappings_dir, "pg_llog/mappings")) != NULL)
+	mappings_dir = AllocateDir("pg_logical/mappings");
+	while ((mapping_de = ReadDir(mappings_dir, "pg_logical/mappings")) != NULL)
 	{
 		struct stat statbuf;
 		Oid			dboid;
@@ -1236,7 +1253,7 @@ CheckPointLogicalRewriteHeap(void)
 			strcmp(mapping_de->d_name, "..") == 0)
 			continue;
 
-		snprintf(path, MAXPGPATH, "pg_llog/mappings/%s", mapping_de->d_name);
+		snprintf(path, sizeof(path), "pg_logical/mappings/%s", mapping_de->d_name);
 		if (lstat(path, &statbuf) == 0 && !S_ISREG(statbuf.st_mode))
 			continue;
 
@@ -1256,7 +1273,7 @@ CheckPointLogicalRewriteHeap(void)
 			if (unlink(path) < 0)
 				ereport(ERROR,
 						(errcode_for_file_access(),
-						 errmsg("could not unlink file \"%s\": %m", path)));
+						 errmsg("could not remove file \"%s\": %m", path)));
 		}
 		else
 		{

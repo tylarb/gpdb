@@ -3,7 +3,7 @@
  * relfilenodemap.c
  *	  relfilenode to oid mapping cache.
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -115,7 +115,6 @@ InitializeRelfilenodeMap(void)
 	MemSet(&ctl, 0, sizeof(ctl));
 	ctl.keysize = sizeof(RelfilenodeMapKey);
 	ctl.entrysize = sizeof(RelfilenodeMapEntry);
-	ctl.hash = tag_hash;
 	ctl.hcxt = CacheMemoryContext;
 
 	/*
@@ -124,8 +123,8 @@ InitializeRelfilenodeMap(void)
 	 * error.
 	 */
 	RelfilenodeMapHash =
-		hash_create("RelfilenodeMap cache", 1024, &ctl,
-					HASH_ELEM | HASH_FUNCTION | HASH_CONTEXT);
+		hash_create("RelfilenodeMap cache", 64, &ctl,
+					HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
 
 	/* Watch for invalidation events. */
 	CacheRegisterRelcacheCallback(RelfilenodeMapInvalidateCallback,
@@ -220,7 +219,6 @@ RelidByRelfilenode(Oid reltablespace, Oid relfilenode)
 			found = true;
 
 #ifdef USE_ASSERT_CHECKING
-			if (assert_enabled)
 			{
 				bool		isnull;
 				Oid			check;

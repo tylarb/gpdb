@@ -26,11 +26,7 @@
  * ----- Declarations of Greenplum-specific global variables ------
  */
 
-#ifdef sparc
-#define TUPLE_CHUNK_ALIGN	4
-#else
-#define TUPLE_CHUNK_ALIGN	1
-#endif
+#define WRITER_IS_MISSING_MSG "reader could not find writer proc entry"
 
 #ifndef PRIO_MAX
 #define PRIO_MAX 20
@@ -149,6 +145,7 @@ extern bool Gp_is_writer;
  * session throughout the entire Greenplum array.
  */
 extern int gp_session_id;
+#define InvalidGpSessionId	(-1)
 
 /* The Hostname where this segment's QD is located. This variable is NULL for the QD itself */
 extern char * qdHostname;
@@ -208,8 +205,8 @@ extern bool gp_debug_pgproc;
  * This run-time parameter is closely related to the PostgreSQL parameter
  * debug_print_plan which, if true, causes the final plan to display on the
  * server log prior to execution.  This parameter, if true, causes the
- * preliminary plan (from the optimizer prior to cdbparallelize) to display
- * on the log.
+ * preliminary plan (from the optimizer prior to adding Motions for subplans)
+ * to display on the log.
  */
 extern bool Debug_print_prelim_plan;
 
@@ -381,17 +378,6 @@ extern int	Gp_interconnect_debug_retry_interval;
 
 /* UDP recv buf size in KB.  For testing */
 extern int 	Gp_udp_bufsize_k;
-
-/*
- * Parameter Gp_interconnect_hash_multiplier
- *
- * The run-time parameter Gp_interconnect_hash_multiplier
- * controls the number of hash buckets used to track 'connections.'
- *
- * This guc is specific to the UDP-interconnect.
- *
- */
-extern int	Gp_interconnect_hash_multiplier;
 
 /*
  * Parameter gp_interconnect_aggressive_retry
@@ -610,70 +596,9 @@ extern bool gp_enable_agg_distinct;
  * prune values from DISTINCT-qualified aggregate function arguments?
  *
  * The code uses planner estimates to decide whether to use this feature,
- * when enabled.  See, however, gp_eager_dqa_pruning.
+ * when enabled.
  */
 extern bool gp_enable_dqa_pruning;
-
-/*
- * "gp_eager_agg_distinct_pruning"
- *
- * Should Greenplum bias planner estimates so as to favor the use of grouping
- * in the first phases of 3-phase aggregation to prune values from DISTINCT-
- * qualified aggregate function arguments?
- *
- * Note that this has effect only when gp_enable_dqa_pruning it true.  It
- * provided to facilitate testing and is not a tuning parameter.
- */
-extern bool gp_eager_dqa_pruning;
-
-/*
- * "gp_eager_one_phase_agg"
- *
- * Should Greenplum bias planner estimates so as to favor the use of one
- * phase aggregation?
- *
- * It is provided to facilitate testing and is not a tuning parameter.
- */
-extern bool gp_eager_one_phase_agg;
-
-/*
- * "gp_eager_two_phase_agg"
- *
- * Should Greenplum bias planner estimates so as to favor the use of two
- * phase aggregation?
- *
- * It is provided to facilitate testing and is not a tuning parameter.
- */
-extern bool gp_eager_two_phase_agg;
-
-/*
- * "gp_enable_groupext_distinct_pruning"
- *
- * Should Greenplum bias planner estimates so as to favor the use of
- * grouping in the first phases of 3-phase aggregation to prune values
- * from DISTINCT-qualified aggregate function arguments on a grouping
- * extension query?
- */
-extern bool gp_enable_groupext_distinct_pruning;
-
-/*
- * "gp_enable_groupext_distinct_gather"
- *
- * Should Greenplum bias planner estimates so as to favor the use of
- * gathering motion to gather the data into a single node to compute
- * DISTINCT-qualified aggregates on a grouping extension query?
- */
-extern bool gp_enable_groupext_distinct_gather;
-
-/*
- * "gp_distinct_grouping_sets_threshold"
- *
- * The planner will treat gp_enable_groupext_distinct_pruning as 'off'
- * when the number of grouping sets that have been rewritten based
- * on the multi-phrase aggregation exceeds the threshold value here divided by
- * the number of distinct-qualified aggregates.
- */
-extern int gp_distinct_grouping_sets_threshold;
 
 /* May Greenplum apply Unique operator (and possibly a Sort) in parallel prior
  * to the collocation motion for a Unique operator?  The idea is to reduce
@@ -697,6 +622,11 @@ extern bool gp_eager_preunique;
  */
 extern bool gp_enable_explain_allstat;
 
+/*
+ * What level of details of the memory accounting information to show during EXPLAIN ANALYZE?
+ */
+extern int explain_memory_verbosity;
+
 /* May Greenplum restrict ORDER BY sorts to the first N rows if the ORDER BY
  * is wrapped by a LIMIT clause (where N=OFFSET+LIMIT)?
  *
@@ -715,7 +645,6 @@ extern bool gp_enable_sort_distinct;
 
 /* Greenplum MK Sort */
 extern bool gp_enable_mk_sort;
-extern bool gp_enable_motion_mk_sort;
 
 #ifdef USE_ASSERT_CHECKING
 extern bool gp_mk_sort_check;
@@ -741,19 +670,19 @@ extern int gp_sort_max_distinct;
  */
 extern bool gp_dynamic_partition_pruning;
 
-/**
- * Sharing of plan fragments for common table expressions
- */
+/* Sharing of plan fragments for common table expressions */
 extern bool gp_cte_sharing;
+/* Enable RECURSIVE clauses in common table expressions */
+extern bool gp_recursive_cte;
+
+/* Enable check for compatibility of encoding and locale in createdb */
+extern bool gp_encoding_check_locale_compatibility;
 
 /* Priority for the segworkers relative to the postmaster's priority */
 extern int gp_segworker_relative_priority;
 
 /*  Max size of dispatched plans; 0 if no limit */
 extern int gp_max_plan_size;
-
-/* If we use two stage hashagg, we can stream the bottom half */
-extern bool gp_hashagg_streambottom;
 
 /* The default number of batches to use when the hybrid hashed aggregation
  * algorithm (re-)spills in-memory groups to disk.
@@ -766,48 +695,24 @@ extern bool 	gp_statistics_pullup_from_child_partition;
 /* Extract numdistinct from foreign key relationship */
 extern bool		gp_statistics_use_fkeys;
 
-/* Analyze related gucs */
-extern int 		gp_statistics_blocks_target;
-extern double	gp_statistics_ndistinct_scaling_ratio_threshold;
-extern double	gp_statistics_sampling_threshold;
-
 /* Analyze tools */
 extern int gp_motion_slice_noop;
 
 /* Disable setting of hint-bits while reading db pages */
 extern bool gp_disable_tuple_hints;
 
-/* Enable gpmon */
-extern bool gp_enable_gpperfmon;
-extern int gp_gpperfmon_send_interval;
+/* Enable metrics */
 extern bool gp_enable_query_metrics;
 extern int gp_instrument_shmem_size;
-extern bool force_bitmap_table_scan;
 
 extern bool dml_ignore_target_partition_check;
 
-/* gpmon alert level, control log alert level used by gpperfmon */
-typedef enum 
-{
-	GPPERFMON_LOG_ALERT_LEVEL_NONE,
-	GPPERFMON_LOG_ALERT_LEVEL_WARNING,
-	GPPERFMON_LOG_ALERT_LEVEL_ERROR,
-	GPPERFMON_LOG_ALERT_LEVEL_FATAL,
-	GPPERFMON_LOG_ALERT_LEVEL_PANIC
-} GpperfmonLogAlertLevel;
-extern int gpperfmon_log_alert_level;
-
-
-extern int gp_workfile_compress_algorithm;
-extern bool gp_workfile_checksumming;
-extern double gp_workfile_limit_per_segment;
-extern double gp_workfile_limit_per_query;
+extern int gp_workfile_limit_per_segment;
+extern int gp_workfile_limit_per_query;
 extern int gp_workfile_limit_files_per_query;
 extern int gp_workfile_caching_loglevel;
 extern int gp_sessionstate_loglevel;
 extern int gp_workfile_bytes_to_checksum;
-/* The type of work files that HashJoin should use */
-extern int gp_workfile_type_hashjoin;
 
 extern bool coredump_on_memerror;
 
@@ -870,6 +775,7 @@ typedef struct GpId
  * Global variable declaration for the data for the single row of gp_id table
  */
 extern GpId GpIdentity;
+extern int get_dbid_string_length(void);
 #define UNINITIALIZED_GP_IDENTITY_VALUE (-10000)
 #define IS_QUERY_DISPATCHER() (GpIdentity.segindex == MASTER_CONTENT_ID)
 
@@ -881,7 +787,7 @@ extern uint32 Gp_listener_port;
 /*
  * Thread-safe routine to write to the log
  */
-extern void write_log(const char *fmt,...) __attribute__((format(printf, 1, 2)));
+extern void write_log(const char *fmt,...) pg_attribute_printf(1, 2);
 
 
 extern void increment_command_count(void);
@@ -890,7 +796,6 @@ extern void increment_command_count(void);
 extern bool gp_create_table_random_default_distribution;
 
 /* Functions in guc_gp.c to lookup values in enum GUCs */
-extern GpperfmonLogAlertLevel lookup_loglevel_by_name(const char *name);
 extern const char * lookup_autostats_mode_by_value(GpAutoStatsModeValue val);
 
 #endif   /* CDBVARS_H */

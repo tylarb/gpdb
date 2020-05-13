@@ -10,6 +10,7 @@ include $(top_srcdir)/src/Makefile.mock
 override CPPFLAGS+= -I$(top_srcdir)/src/backend/libpq \
 					-I$(libpq_srcdir) \
 					-I$(top_srcdir)/src/backend/postmaster \
+					-I$(top_srcdir)/src/test/unit/mock/ \
 					-I. -I$(top_builddir)/src/port \
 					-DDLSUFFIX=$(DLSUFFIX) \
 					-I$(top_srcdir)/src/backend/utils/stat
@@ -48,7 +49,6 @@ EXCL_OBJS+=\
 	src/backend/utils/adt/jsonfuncs.o \
 	src/backend/utils/adt/like.o \
 	src/backend/utils/adt/like_match.o \
-	src/backend/utils/adt/lockfuncs.o \
 	src/backend/utils/adt/mac.o \
 	src/backend/utils/adt/matrix.o \
 	src/backend/utils/adt/oracle_compat.o \
@@ -120,7 +120,7 @@ WRAP_FUNCS=$(addprefix $(WRAP_FLAGS), \
 
 # The test target depends on $(OBJFILES) which would update files including mocks.
 %.t: $(OBJFILES) $(CMOCKERY_OBJS) $(MOCK_OBJS) %_test.o
-	$(CC) $(CFLAGS) $(LDFLAGS) $(call WRAP_FUNCS, $(top_srcdir)/$(subdir)/test/$*_test.c) $(call BACKEND_OBJS, $(top_srcdir)/$(subdir)/$*.o $(patsubst $(MOCK_DIR)/%_mock.o,$(top_builddir)/src/%.o, $^)) $(filter-out %/objfiles.txt, $^) $(MOCK_LIBS) -o $@
+	$(CXX) $(CFLAGS) $(LDFLAGS) $(call WRAP_FUNCS, $(top_srcdir)/$(subdir)/test/$*_test.c) $(call BACKEND_OBJS, $(top_srcdir)/$(subdir)/$*.o $(patsubst $(MOCK_DIR)/%_mock.o,$(top_builddir)/src/%.o, $^)) $(filter-out %/objfiles.txt, $^) $(MOCK_LIBS) -o $@
 
 # We'd like to call only src/backend, but it seems we should build src/port and
 # src/timezone before src/backend.  This is not the case when main build has finished,

@@ -9,14 +9,26 @@
  * list and row ID information needed for SELECT FOR UPDATE locking and/or
  * EvalPlanQual checking.
  *
- * NOTE: the rewriter's rewriteTargetListIU and rewriteTargetListUD
- * routines also do preprocessing of the targetlist.  The division of labor
- * between here and there is a bit arbitrary and historical.
+ * The rewriter's rewriteTargetListIU and rewriteTargetListUD routines
+ * also do preprocessing of the targetlist.  The division of labor between
+ * here and there is partially historical, but it's not entirely arbitrary.
+ * In particular, consider an UPDATE across an inheritance tree.  What the
+ * rewriter does need be done only once (because it depends only on the
+ * properties of the parent relation).  What's done here has to be done over
+ * again for each child relation, because it depends on the column list of
+ * the child, which might have more columns and/or a different column order
+ * than the parent.
  *
+ * The fact that rewriteTargetListIU sorts non-resjunk tlist entries by column
+ * position, which expand_targetlist depends on, violates the above comment
+ * because the sorting is only valid for the parent relation.  In inherited
+ * UPDATE cases, adjust_inherited_tlist runs in between to take care of fixing
+ * the tlists for child tables to keep expand_targetlist happy.  We do it like
+ * that because it's faster in typical non-inherited cases.
  *
  * Portions Copyright (c) 2006-2008, Greenplum inc
  * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -36,6 +48,7 @@
 #include "optimizer/plancat.h"
 #include "optimizer/prep.h"
 #include "optimizer/tlist.h"
+#include "optimizer/var.h"
 #include "parser/parsetree.h"
 #include "parser/parse_coerce.h"
 #include "parser/parse_relation.h"
@@ -63,7 +76,6 @@ preprocess_targetlist(PlannerInfo *root, List *tlist)
 	List	   *range_table = parse->rtable;
 	CmdType		command_type = parse->commandType;
 	ListCell   *lc;
-	RangeTblEntry *rte = NULL;
 
 	/*
 	 * Sanity check: if there is a result relation, it'd better be a real
@@ -71,7 +83,7 @@ preprocess_targetlist(PlannerInfo *root, List *tlist)
 	 */
 	if (result_relation)
 	{
-		rte = rt_fetch(result_relation, range_table);
+		RangeTblEntry *rte = rt_fetch(result_relation, range_table);
 
 		if (rte->subquery != NULL || rte->relid == InvalidOid)
 			elog(ERROR, "subquery cannot be result relation");
@@ -106,9 +118,9 @@ preprocess_targetlist(PlannerInfo *root, List *tlist)
 		if (rc->rti != rc->prti)
 			continue;
 
-		if (rc->markType != ROW_MARK_COPY)
+		if (rc->allMarkTypes & ~(1 << ROW_MARK_COPY))
 		{
-			/* It's a regular table, so fetch its TID */
+			/* Need to fetch TID */
 			var = makeVar(rc->rti,
 						  SelfItemPointerAttributeNumber,
 						  TIDOID,
@@ -121,32 +133,32 @@ preprocess_targetlist(PlannerInfo *root, List *tlist)
 								  pstrdup(resname),
 								  true);
 			tlist = lappend(tlist, tle);
-
-			/* if parent of inheritance tree, need the tableoid too */
-			if (rc->isParent)
-			{
-				var = makeVar(rc->rti,
-							  TableOidAttributeNumber,
-							  OIDOID,
-							  -1,
-							  InvalidOid,
-							  0);
-				snprintf(resname, sizeof(resname), "tableoid%u", rc->rowmarkId);
-				tle = makeTargetEntry((Expr *) var,
-									  list_length(tlist) + 1,
-									  pstrdup(resname),
-									  true);
-				tlist = lappend(tlist, tle);
-			}
 		}
-		else
+		if (rc->allMarkTypes & (1 << ROW_MARK_COPY))
 		{
-			/* Not a table, so we need the whole row as a junk var */
+			/* Need the whole row as a junk var */
 			var = makeWholeRowVar(rt_fetch(rc->rti, range_table),
 								  rc->rti,
 								  0,
 								  false);
 			snprintf(resname, sizeof(resname), "wholerow%u", rc->rowmarkId);
+			tle = makeTargetEntry((Expr *) var,
+								  list_length(tlist) + 1,
+								  pstrdup(resname),
+								  true);
+			tlist = lappend(tlist, tle);
+		}
+
+		/* If parent of inheritance tree, always fetch the tableoid too. */
+		if (rc->isParent)
+		{
+			var = makeVar(rc->rti,
+						  TableOidAttributeNumber,
+						  OIDOID,
+						  -1,
+						  InvalidOid,
+						  0);
+			snprintf(resname, sizeof(resname), "tableoid%u", rc->rowmarkId);
 			tle = makeTargetEntry((Expr *) var,
 								  list_length(tlist) + 1,
 								  pstrdup(resname),
@@ -168,7 +180,8 @@ preprocess_targetlist(PlannerInfo *root, List *tlist)
 		ListCell   *l;
 
 		vars = pull_var_clause((Node *) parse->returningList,
-							   PVC_RECURSE_AGGREGATES,
+							   PVC_RECURSE_AGGREGATES |
+							   PVC_RECURSE_WINDOWFUNCS |
 							   PVC_INCLUDE_PLACEHOLDERS);
 		foreach(l, vars)
 		{
@@ -194,6 +207,19 @@ preprocess_targetlist(PlannerInfo *root, List *tlist)
 
 	return tlist;
 }
+
+/*
+ * preprocess_onconflict_targetlist
+ *	  Process ON CONFLICT SET targetlist.
+ *
+ *	  Returns the new targetlist.
+ */
+List *
+preprocess_onconflict_targetlist(PlannerInfo *root, List *tlist, int result_relation, List *range_table)
+{
+	return expand_targetlist(root, tlist, CMD_UPDATE, result_relation, range_table);
+}
+
 
 /*****************************************************************************
  *
@@ -378,12 +404,13 @@ expand_targetlist(PlannerInfo *root, List *tlist, int command_type,
 	/*
 	 * If an UPDATE can move the tuples from one segment to another, we will
 	 * need to create a Split Update node for it. The node is created later
-	 * in the planning, but if it's needed, we must ensure that the target
-	 * list contains all the original values of each distribution key column,
-	 * because the Split Update needs them as input. The old distribution
-	 * key columns come in the target list after all the new values, and
-	 * before the 'ctid' and other resjunk columns. (The logic in
-	 * process_targetlist_for_splitupdate() relies on that order.)
+	 * in the planning, but if it's needed, and the table has OIDs, we must
+	 * ensure that the target list contains the old OID so that the Split
+	 * Update can copy it to the new tuple.
+	 *
+	 * GPDB_96_MERGE_FIXME: we used to copy all old distribution key columns,
+	 * but we only need this for the OID now. Can we desupport Split Updates
+	 * on tables with OIDs, and get rid of this?
 	 */
 	if (command_type == CMD_UPDATE)
 	{
@@ -406,42 +433,14 @@ expand_targetlist(PlannerInfo *root, List *tlist, int command_type,
 			}
 		}
 
-		if (key_col_updated || root->parse->needReshuffle)
+		if (key_col_updated)
 		{
 			/*
 			 * Yes, this is a split update.
 			 * Updating a hash column is a split update, of course.
-			 * We should note that current reshuffle implementation
-			 * is based on split-update, so if the query is a reshuffle
-			 * query, it is also a split-update even if we are reshuffling
-			 * a random distributed table.
 			 *
-			 * For each column that was changed, add the original column value
-			 * to the target list, if it's not there already.
+			 * Add the old OID to the tlist, if the table has OIDs.
 			 */
-			int			i;
-
-			for (i = 0; i < targetPolicy->nattrs; i++)
-			{
-				AttrNumber	keycolidx = targetPolicy->attrs[i];
-				Var		   *origvar;
-				Form_pg_attribute att_tup = rel->rd_att->attrs[keycolidx - 1];
-
-				origvar = makeVar(result_relation,
-								  keycolidx,
-								  att_tup->atttypid,
-								  att_tup->atttypmod,
-								  att_tup->attcollation,
-								  0);
-				TargetEntry *new_tle = makeTargetEntry((Expr *) origvar,
-													   attrno,
-													   NameStr(att_tup->attname),
-													   true);
-				new_tlist = lappend(new_tlist, new_tle);
-				attrno++;
-			}
-
-			/* Also add the old OID to the tlist, if the table has OIDs. */
 			if (rel->rd_rel->relhasoids)
 			{
 				TargetEntry *new_tle;

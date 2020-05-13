@@ -4,7 +4,7 @@
  *	  utilities routines for the postgres GiST index access method.
  *
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -16,10 +16,13 @@
 #include <math.h>
 
 #include "access/gist_private.h"
+#include "access/htup_details.h"
 #include "access/reloptions.h"
+#include "catalog/pg_opclass.h"
 #include "storage/indexfsm.h"
 #include "storage/lmgr.h"
 #include "utils/builtins.h"
+#include "utils/syscache.h"
 
 
 /*
@@ -294,8 +297,9 @@ gistDeCompressAtt(GISTSTATE *giststate, Relation r, IndexTuple tuple, Page p,
 
 	for (i = 0; i < r->rd_att->natts; i++)
 	{
-		Datum		datum = index_getattr(tuple, i + 1, giststate->tupdesc, &isnull[i]);
+		Datum		datum;
 
+		datum = index_getattr(tuple, i + 1, giststate->tupdesc, &isnull[i]);
 		gistdentryinit(giststate, i, &attdata[i],
 					   datum, r, p, o,
 					   FALSE, isnull[i]);
@@ -558,53 +562,33 @@ gistdentryinit(GISTSTATE *giststate, int nkey, GISTENTRY *e,
 		gistentryinit(*e, (Datum) 0, r, pg, o, l);
 }
 
-
-/*
- * initialize a GiST entry with a compressed version of key
- */
-void
-gistcentryinit(GISTSTATE *giststate, int nkey,
-			   GISTENTRY *e, Datum k, Relation r,
-			   Page pg, OffsetNumber o, bool l, bool isNull)
-{
-	if (!isNull)
-	{
-		GISTENTRY  *cep;
-
-		gistentryinit(*e, k, r, pg, o, l);
-		cep = (GISTENTRY *)
-			DatumGetPointer(FunctionCall1Coll(&giststate->compressFn[nkey],
-										   giststate->supportCollation[nkey],
-											  PointerGetDatum(e)));
-		/* compressFn may just return the given pointer */
-		if (cep != e)
-			gistentryinit(*e, cep->key, cep->rel, cep->page, cep->offset,
-						  cep->leafkey);
-	}
-	else
-		gistentryinit(*e, (Datum) 0, r, pg, o, l);
-}
-
 IndexTuple
 gistFormTuple(GISTSTATE *giststate, Relation r,
-			  Datum attdata[], bool isnull[], bool newValues)
+			  Datum attdata[], bool isnull[], bool isleaf)
 {
-	GISTENTRY	centry[INDEX_MAX_KEYS];
 	Datum		compatt[INDEX_MAX_KEYS];
 	int			i;
 	IndexTuple	res;
 
+	/*
+	 * Call the compress method on each attribute.
+	 */
 	for (i = 0; i < r->rd_att->natts; i++)
 	{
 		if (isnull[i])
 			compatt[i] = (Datum) 0;
 		else
 		{
-			gistcentryinit(giststate, i, &centry[i], attdata[i],
-						   r, NULL, (OffsetNumber) 0,
-						   newValues,
-						   FALSE);
-			compatt[i] = centry[i].key;
+			GISTENTRY	centry;
+			GISTENTRY  *cep;
+
+			gistentryinit(centry, attdata[i], r, NULL, (OffsetNumber) 0,
+						  isleaf);
+			cep = (GISTENTRY *)
+				DatumGetPointer(FunctionCall1Coll(&giststate->compressFn[i],
+											  giststate->supportCollation[i],
+												  PointerGetDatum(&centry)));
+			compatt[i] = cep->key;
 		}
 	}
 
@@ -612,10 +596,71 @@ gistFormTuple(GISTSTATE *giststate, Relation r,
 
 	/*
 	 * The offset number on tuples on internal pages is unused. For historical
-	 * reasons, it is set 0xffff.
+	 * reasons, it is set to 0xffff.
 	 */
 	ItemPointerSetOffsetNumber(&(res->t_tid), 0xffff);
 	return res;
+}
+
+/*
+ * initialize a GiST entry with fetched value in key field
+ */
+static Datum
+gistFetchAtt(GISTSTATE *giststate, int nkey, Datum k, Relation r)
+{
+	GISTENTRY	fentry;
+	GISTENTRY  *fep;
+
+	gistentryinit(fentry, k, r, NULL, (OffsetNumber) 0, false);
+
+	fep = (GISTENTRY *)
+		DatumGetPointer(FunctionCall1Coll(&giststate->fetchFn[nkey],
+										  giststate->supportCollation[nkey],
+										  PointerGetDatum(&fentry)));
+
+	/* fetchFn set 'key', return it to the caller */
+	return fep->key;
+}
+
+/*
+ * Fetch all keys in tuple.
+ * returns new IndexTuple that contains GISTENTRY with fetched data
+ */
+IndexTuple
+gistFetchTuple(GISTSTATE *giststate, Relation r, IndexTuple tuple)
+{
+	MemoryContext oldcxt = MemoryContextSwitchTo(giststate->tempCxt);
+	Datum		fetchatt[INDEX_MAX_KEYS];
+	bool		isnull[INDEX_MAX_KEYS];
+	int			i;
+
+	for (i = 0; i < r->rd_att->natts; i++)
+	{
+		Datum		datum;
+
+		datum = index_getattr(tuple, i + 1, giststate->tupdesc, &isnull[i]);
+
+		if (giststate->fetchFn[i].fn_oid != InvalidOid)
+		{
+			if (!isnull[i])
+				fetchatt[i] = gistFetchAtt(giststate, i, datum, r);
+			else
+				fetchatt[i] = (Datum) 0;
+		}
+		else
+		{
+			/*
+			 * Index-only scans not supported for this column. Since the
+			 * planner chose an index-only scan anyway, it is not interested
+			 * in this column, and we can replace it with a NULL.
+			 */
+			isnull[i] = true;
+			fetchatt[i] = (Datum) 0;
+		}
+	}
+	MemoryContextSwitchTo(oldcxt);
+
+	return index_form_tuple(giststate->fetchTupdesc, fetchatt, isnull);
 }
 
 float
@@ -690,8 +735,7 @@ gistcheckpage(Relation rel, Buffer buf)
 			 errmsg("index \"%s\" contains unexpected zero page at block %u",
 					RelationGetRelationName(rel),
 					BufferGetBlockNumber(buf)),
-				 errhint("Please REINDEX it."),
-				 errSendAlert(true)));
+				 errhint("Please REINDEX it.")));
 
 	/*
 	 * Additionally check that the special area looks sane.
@@ -702,8 +746,7 @@ gistcheckpage(Relation rel, Buffer buf)
 				 errmsg("index \"%s\" contains corrupted page at block %u",
 						RelationGetRelationName(rel),
 						BufferGetBlockNumber(buf)),
-				 errhint("Please REINDEX it."),
-				 errSendAlert(true)));
+				 errhint("Please REINDEX it.")));
 }
 
 
@@ -768,11 +811,9 @@ gistNewBuffer(Relation r)
 	return buffer;
 }
 
-Datum
-gistoptions(PG_FUNCTION_ARGS)
+bytea *
+gistoptions(Datum reloptions, bool validate)
 {
-	Datum		reloptions = PG_GETARG_DATUM(0);
-	bool		validate = PG_GETARG_BOOL(1);
 	relopt_value *options;
 	GiSTOptions *rdopts;
 	int			numoptions;
@@ -786,7 +827,7 @@ gistoptions(PG_FUNCTION_ARGS)
 
 	/* if none set, we're done */
 	if (numoptions == 0)
-		PG_RETURN_NULL();
+		return NULL;
 
 	rdopts = allocateReloptStruct(sizeof(GiSTOptions), options, numoptions);
 
@@ -795,8 +836,104 @@ gistoptions(PG_FUNCTION_ARGS)
 
 	pfree(options);
 
-	PG_RETURN_BYTEA_P(rdopts);
+	return (bytea *) rdopts;
+}
 
+/*
+ *	gistproperty() -- Check boolean properties of indexes.
+ *
+ * This is optional for most AMs, but is required for GiST because the core
+ * property code doesn't support AMPROP_DISTANCE_ORDERABLE.  We also handle
+ * AMPROP_RETURNABLE here to save opening the rel to call gistcanreturn.
+ */
+bool
+gistproperty(Oid index_oid, int attno,
+			 IndexAMProperty prop, const char *propname,
+			 bool *res, bool *isnull)
+{
+	HeapTuple	tuple;
+	Form_pg_index rd_index;
+	Form_pg_opclass rd_opclass;
+	Datum		datum;
+	bool		disnull;
+	oidvector  *indclass;
+	Oid			opclass,
+				opfamily,
+				opcintype;
+	int16		procno;
+
+	/* Only answer column-level inquiries */
+	if (attno == 0)
+		return false;
+
+	/*
+	 * Currently, GiST distance-ordered scans require that there be a distance
+	 * function in the opclass with the default types (i.e. the one loaded
+	 * into the relcache entry, see initGISTstate).  So we assume that if such
+	 * a function exists, then there's a reason for it (rather than grubbing
+	 * through all the opfamily's operators to find an ordered one).
+	 *
+	 * Essentially the same code can test whether we support returning the
+	 * column data, since that's true if the opclass provides a fetch proc.
+	 */
+
+	switch (prop)
+	{
+		case AMPROP_DISTANCE_ORDERABLE:
+			procno = GIST_DISTANCE_PROC;
+			break;
+		case AMPROP_RETURNABLE:
+			procno = GIST_FETCH_PROC;
+			break;
+		default:
+			return false;
+	}
+
+	/* First we need to know the column's opclass. */
+
+	tuple = SearchSysCache1(INDEXRELID, ObjectIdGetDatum(index_oid));
+	if (!HeapTupleIsValid(tuple))
+	{
+		*isnull = true;
+		return true;
+	}
+	rd_index = (Form_pg_index) GETSTRUCT(tuple);
+
+	/* caller is supposed to guarantee this */
+	Assert(attno > 0 && attno <= rd_index->indnatts);
+
+	datum = SysCacheGetAttr(INDEXRELID, tuple,
+							Anum_pg_index_indclass, &disnull);
+	Assert(!disnull);
+
+	indclass = ((oidvector *) DatumGetPointer(datum));
+	opclass = indclass->values[attno - 1];
+
+	ReleaseSysCache(tuple);
+
+	/* Now look up the opclass family and input datatype. */
+
+	tuple = SearchSysCache1(CLAOID, ObjectIdGetDatum(opclass));
+	if (!HeapTupleIsValid(tuple))
+	{
+		*isnull = true;
+		return true;
+	}
+	rd_opclass = (Form_pg_opclass) GETSTRUCT(tuple);
+
+	opfamily = rd_opclass->opcfamily;
+	opcintype = rd_opclass->opcintype;
+
+	ReleaseSysCache(tuple);
+
+	/* And now we can check whether the function is provided. */
+
+	*res = SearchSysCacheExists4(AMPROCNUM,
+								 ObjectIdGetDatum(opfamily),
+								 ObjectIdGetDatum(opcintype),
+								 ObjectIdGetDatum(opcintype),
+								 Int16GetDatum(procno));
+	return true;
 }
 
 /*

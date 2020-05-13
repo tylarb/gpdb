@@ -27,6 +27,9 @@
 /* The normal alignment of `long long int', in bytes. */
 #undef ALIGNOF_LONG_LONG_INT
 
+/* The normal alignment of `PG_INT128_TYPE', in bytes. */
+#undef ALIGNOF_PG_INT128_TYPE
+
 /* The normal alignment of `short', in bytes. */
 #undef ALIGNOF_SHORT
 
@@ -72,15 +75,18 @@
    reference if 'false' (always true in GPDB) */
 #undef FLOAT8PASSBYVAL
 
-/* Define to 1 if getpwuid_r() takes a 5th argument. */
-#undef GETPWUID_R_5ARG
-
 /* Define to 1 if gettimeofday() takes only 1 argument. */
 #undef GETTIMEOFDAY_1ARG
 
 #ifdef GETTIMEOFDAY_1ARG
 # define gettimeofday(a,b) gettimeofday(a)
 #endif
+
+/* Define to 1 to build ORCA in debug (GPOS_DEBUG=1) */
+#undef GPOS_DEBUG
+
+/* Define to 1 to build ORCA for MacOS (GPOS_Darwin=1) */
+#undef GPOS_Darwin
 
 /* Greenplum major version as a string */
 #undef GP_MAJORVERSION
@@ -100,11 +106,14 @@
 /* Define to 1 if you have the `ASN1_STRING_get0_data' function. */
 #undef HAVE_ASN1_STRING_GET0_DATA
 
-/* Define to 1 if you want to use atomics. */
+/* Define to 1 if you want to use atomics if available. */
 #undef HAVE_ATOMICS
 
 /* Define to 1 if you have the <atomic.h> header file. */
 #undef HAVE_ATOMIC_H
+
+/* Define to 1 if you have the `backtrace_symbols' function. */
+#undef HAVE_BACKTRACE_SYMBOLS
 
 /* Define to 1 if you have the `BIO_meth_new' function. */
 #undef HAVE_BIO_METH_NEW
@@ -130,10 +139,6 @@
 /* define if the compiler supports basic C++11 syntax */
 #undef HAVE_CXX11
 
-/* Define to 1 if you have the declaration of `CURLOPT_MAIL_FROM', and to 0 if
-   you don't. */
-#undef HAVE_DECL_CURLOPT_MAIL_FROM
-
 /* Define to 1 if you have the declaration of `fdatasync', and to 0 if you
    don't. */
 #undef HAVE_DECL_FDATASYNC
@@ -157,6 +162,14 @@
 /* Define to 1 if you have the declaration of `strlcpy', and to 0 if you
    don't. */
 #undef HAVE_DECL_STRLCPY
+
+/* Define to 1 if you have the declaration of `strtoll', and to 0 if you
+   don't. */
+#undef HAVE_DECL_STRTOLL
+
+/* Define to 1 if you have the declaration of `strtoull', and to 0 if you
+   don't. */
+#undef HAVE_DECL_STRTOULL
 
 /* Define to 1 if you have the declaration of `sys_siglist', and to 0 if you
    don't. */
@@ -269,15 +282,6 @@
 /* Define to 1 if you have the `gettimeofday' function. */
 #undef HAVE_GETTIMEOFDAY
 
-/* Define to 1 if you have the <gpdbcost/CCostModelGPDB.h> header file. */
-#undef HAVE_GPDBCOST_CCOSTMODELGPDB_H
-
-/* Define to 1 if you have the <gpopt/init.h> header file. */
-#undef HAVE_GPOPT_INIT_H
-
-/* Define to 1 if you have the <gpos/_api.h> header file. */
-#undef HAVE_GPOS__API_H
-
 /* Define to 1 if you have the <gssapi/gssapi.h> header file. */
 #undef HAVE_GSSAPI_GSSAPI_H
 
@@ -298,6 +302,9 @@
 
 /* Define to 1 if you have the `inet_aton' function. */
 #undef HAVE_INET_ATON
+
+/* Define to 1 if you have the `inet_ntop' function. */
+#undef HAVE_INET_NTOP
 
 /* Define to 1 if the system has the type `int64'. */
 #undef HAVE_INT64
@@ -341,15 +348,6 @@
 /* Define to 1 if you have the `execinfo' library (-lexecinfo). */
 #undef HAVE_LIBEXECINFO
 
-/* Define to 1 if you have the `gpdbcost' library (-lgpdbcost). */
-#undef HAVE_LIBGPDBCOST
-
-/* Define to 1 if you have the `gpopt' library (-lgpopt). */
-#undef HAVE_LIBGPOPT
-
-/* Define to 1 if you have the `gpos' library (-lgpos). */
-#undef HAVE_LIBGPOS
-
 /* Define to 1 if you have the `ldap' library (-lldap). */
 #undef HAVE_LIBLDAP
 
@@ -359,17 +357,14 @@
 /* Define to 1 if you have the `m' library (-lm). */
 #undef HAVE_LIBM
 
-/* Define to 1 if you have the `naucrates' library (-lnaucrates). */
-#undef HAVE_LIBNAUCRATES
-
-/* Define to 1 if you have the `netsnmp' library (-lnetsnmp). */
-#undef HAVE_LIBNETSNMP
-
 /* Define to 1 if you have the `numa' library (-lnuma). */
 #undef HAVE_LIBNUMA
 
 /* Define to 1 if you have the `pam' library (-lpam). */
 #undef HAVE_LIBPAM
+
+/* Define to 1 if you have the `quicklz' library (-lquicklz). */
+#undef HAVE_LIBQUICKLZ
 
 /* Define if you have a function readline library */
 #undef HAVE_LIBREADLINE
@@ -401,10 +396,6 @@
 /* Define to 1 if you have the `zstd' library (-lzstd). */
 #undef HAVE_LIBZSTD
 
-/* Define to 1 if constants of type 'long long int' should have the suffix LL.
-   */
-#undef HAVE_LL_CONSTANTS
-
 /* Define to 1 if the system has the type `locale_t'. */
 #undef HAVE_LOCALE_T
 
@@ -432,8 +423,8 @@
 /* Define to 1 if the system has the type `MINIDUMP_TYPE'. */
 #undef HAVE_MINIDUMP_TYPE
 
-/* Define to 1 if you have the <naucrates/init.h> header file. */
-#undef HAVE_NAUCRATES_INIT_H
+/* Define to 1 if you have the `mkdtemp' function. */
+#undef HAVE_MKDTEMP
 
 /* Define to 1 if you have the <netinet/in.h> header file. */
 #undef HAVE_NETINET_IN_H
@@ -443,9 +434,6 @@
 
 /* Define to 1 if you have the <net/if.h> header file. */
 #undef HAVE_NET_IF_H
-
-/* Define to 1 if you have the <net-snmp/net-snmp-config.h> header file. */
-#undef HAVE_NET_SNMP_NET_SNMP_CONFIG_H
 
 /* Define to 1 if you have the <numa.h> header file. */
 #undef HAVE_NUMA_H
@@ -468,8 +456,8 @@
 /* Define to 1 if you have the `posix_fadvise' function. */
 #undef HAVE_POSIX_FADVISE
 
-/* Define to 1 if you have the POSIX signal interface. */
-#undef HAVE_POSIX_SIGNALS
+/* Define to 1 if you have the `posix_fallocate' function. */
+#undef HAVE_POSIX_FALLOCATE
 
 /* Define to 1 if the assembler supports PPC's LWARX mutex hint bit. */
 #undef HAVE_PPC_LWARX_MUTEX_HINT
@@ -482,6 +470,12 @@
 
 /* Define if you have POSIX threads libraries and header files. */
 #undef HAVE_PTHREAD
+
+/* Define to 1 if you have the `pthread_is_threaded_np' function. */
+#undef HAVE_PTHREAD_IS_THREADED_NP
+
+/* Have PTHREAD_PRIO_INHERIT. */
+#undef HAVE_PTHREAD_PRIO_INHERIT
 
 /* Define to 1 if you have the <pwd.h> header file. */
 #undef HAVE_PWD_H
@@ -517,6 +511,9 @@
 /* Define to 1 if you have the `rl_filename_completion_function' function. */
 #undef HAVE_RL_FILENAME_COMPLETION_FUNCTION
 
+/* Define to 1 if you have the `rl_reset_screen_size' function. */
+#undef HAVE_RL_RESET_SCREEN_SIZE
+
 /* Define to 1 if you have the <security/pam_appl.h> header file. */
 #undef HAVE_SECURITY_PAM_APPL_H
 
@@ -528,15 +525,6 @@
 
 /* Define to 1 if you have the `shm_open' function. */
 #undef HAVE_SHM_OPEN
-
-/* Define to 1 if you have the `sigprocmask' function. */
-#undef HAVE_SIGPROCMASK
-
-/* Define to 1 if you have sigsetjmp(). */
-#undef HAVE_SIGSETJMP
-
-/* Define to 1 if the system has the type `sig_atomic_t'. */
-#undef HAVE_SIG_ATOMIC_T
 
 /* Define to 1 if you have the `snprintf' function. */
 #undef HAVE_SNPRINTF
@@ -573,6 +561,9 @@
 
 /* Define to 1 if you have the `strlcpy' function. */
 #undef HAVE_STRLCPY
+
+/* Define to use have a strong random number source */
+#undef HAVE_STRONG_RANDOM
 
 /* Define to 1 if you have the `strtoll' function. */
 #undef HAVE_STRTOLL
@@ -624,6 +615,9 @@
 
 /* Define to 1 if you have the syslog interface. */
 #undef HAVE_SYSLOG
+
+/* Define to 1 if you have the <sys/epoll.h> header file. */
+#undef HAVE_SYS_EPOLL_H
 
 /* Define to 1 if you have the <sys/ioctl.h> header file. */
 #undef HAVE_SYS_IOCTL_H
@@ -764,6 +758,12 @@
 /* Define to 1 if you have the <yaml.h> header file. */
 #undef HAVE_YAML_H
 
+/* Define to 1 if your compiler understands __builtin_bswap32. */
+#undef HAVE__BUILTIN_BSWAP32
+
+/* Define to 1 if your compiler understands __builtin_bswap64. */
+#undef HAVE__BUILTIN_BSWAP64
+
 /* Define to 1 if your compiler understands __builtin_constant_p. */
 #undef HAVE__BUILTIN_CONSTANT_P
 
@@ -785,8 +785,14 @@
 /* Define to 1 if your compiler understands __VA_ARGS__ in macros. */
 #undef HAVE__VA_ARGS
 
-/* Define to the appropriate snprintf format for 64-bit ints. */
-#undef INT64_FORMAT
+/* Define to 1 if you have the `__strtoll' function. */
+#undef HAVE___STRTOLL
+
+/* Define to 1 if you have the `__strtoull' function. */
+#undef HAVE___STRTOULL
+
+/* Define to the appropriate snprintf length modifier for 64-bit ints. */
+#undef INT64_MODIFIER
 
 /* Define to 1 if `locale_t' requires <xlocale.h>. */
 #undef LOCALE_T_IN_XLOCALE
@@ -831,10 +837,6 @@
 /* Define to gnu_printf if compiler supports it, else printf. */
 #undef PG_PRINTF_ATTRIBUTE
 
-/* Define to 1 if "static inline" works without unwanted warnings from
-   compilations where static inline functions are defined but not called. */
-#undef PG_USE_INLINE
-
 /* Postgres version Greenplum Database is based on */
 #undef PG_VERSION
 
@@ -848,7 +850,7 @@
    process. */
 #undef PROFILE_PID_DIR
 
-/* Define to the necessary symbol if this constant uses a non-standard name on
+/* Define to necessary symbol if this constant uses a non-standard name on
    your system. */
 #undef PTHREAD_CREATE_JOINABLE
 
@@ -880,14 +882,11 @@
 /* Define to 1 if you have the ANSI C header files. */
 #undef STDC_HEADERS
 
-/* Define to 1 if strerror_r() returns a int. */
+/* Define to 1 if strerror_r() returns int. */
 #undef STRERROR_R_INT
 
 /* Define to 1 if your <sys/time.h> declares `struct tm'. */
 #undef TM_IN_SYS_TIME
-
-/* Define to the appropriate snprintf format for unsigned 64-bit ints. */
-#undef UINT64_FORMAT
 
 /* Define to 1 to build with assertion checks. (--enable-cassert) */
 #undef USE_ASSERT_CHECKING
@@ -895,11 +894,14 @@
 /* Define to 1 to build with Bonjour support. (--with-bonjour) */
 #undef USE_BONJOUR
 
+/* Define to 1 to build with BSD Authentication support. (--with-bsd-auth) */
+#undef USE_BSD_AUTH
+
 /* Define to 1 to build with libcurl support. (--with-libcurl) */
 #undef USE_CURL
 
-/* Define to 1 to build with debug_ntuplestore. (--enable-ntuplestore) */
-#undef USE_DEBUG_NTUPLESTORE
+/* Define to use /dev/urandom for random number generation */
+#undef USE_DEV_URANDOM
 
 /* Define to 1 if you want float4 values to be passed by value. (Always
    defined in GPDB) */
@@ -932,6 +934,12 @@
 /* Define to select named POSIX semaphores. */
 #undef USE_NAMED_POSIX_SEMAPHORES
 
+/* Define to build with OpenSSL support. (--with-openssl) */
+#undef USE_OPENSSL
+
+/* Define to use OpenSSL for random number generation */
+#undef USE_OPENSSL_RANDOM
+
 /* Define to 1 to build with Greenplum ORCA optimizer. (--enable-orca) */
 #undef USE_ORCA
 
@@ -944,17 +952,14 @@
 /* Define to 1 to use Intel SSE 4.2 CRC instructions with a runtime check. */
 #undef USE_SLICING_BY_8_CRC32C
 
-/* Define to 1 to build with snmp capabilities. (--enable-snmp) */
-#undef USE_SNMP
-
 /* Define to 1 use Intel SSE 4.2 CRC instructions. */
 #undef USE_SSE42_CRC32C
 
 /* Define to 1 to use Intel SSSE 4.2 CRC instructions with a runtime check. */
 #undef USE_SSE42_CRC32C_WITH_RUNTIME_CHECK
 
-/* Define to build with (Open)SSL support. (--with-openssl) */
-#undef USE_SSL
+/* Define to build with systemd support. (--with-systemd) */
+#undef USE_SYSTEMD
 
 /* Define to select SysV-style semaphores. */
 #undef USE_SYSV_SEMAPHORES
@@ -962,17 +967,20 @@
 /* Define to select SysV-style shared memory. */
 #undef USE_SYSV_SHARED_MEMORY
 
-/* Define to 1 to build with testing utilities. (--enable-testutils) */
-#undef USE_TEST_UTILS
-
 /* Define to select unnamed POSIX semaphores. */
 #undef USE_UNNAMED_POSIX_SEMAPHORES
+
+/* Define to use native Windows API for random number generation */
+#undef USE_WIN32_RANDOM
 
 /* Define to select Win32-style semaphores. */
 #undef USE_WIN32_SEMAPHORES
 
 /* Define to select Win32-style shared memory. */
 #undef USE_WIN32_SHARED_MEMORY
+
+/* Define to 1 if `wcstombs_l' requires <xlocale.h>. */
+#undef WCSTOMBS_L_IN_XLOCALE
 
 /* Define WORDS_BIGENDIAN to 1 if your processor stores words with the most
    significant byte first (like Motorola and SPARC, unlike Intel). */

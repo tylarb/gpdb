@@ -19,7 +19,6 @@
 #include "libpq-fe.h"		/* prerequisite for libpq-int.h */
 #include "libpq-int.h"		/* PQExpBufferData */
 
-#include "lib/stringinfo.h"		/* StringInfoData */
 #include "utils/guc.h"			/* log_min_messages */
 
 #include "cdb/cdbconn.h"		/* SegmentDatabaseDescriptor */
@@ -27,7 +26,6 @@
 #include "cdb/cdbvars.h"
 #include "cdb/cdbsreh.h"
 #include "cdb/cdbdispatchresult.h"
-#include "commands/tablecmds.h"
 
 static int cdbdisp_snatchPGresults(CdbDispatchResult *dispatchResult,
 						struct pg_result **pgresultptrs, int maxresults);
@@ -175,7 +173,6 @@ cdbdisp_resetResult(CdbDispatchResult *dispatchResult)
 	 * Reset summary indicators.
 	 */
 	dispatchResult->errcode = 0;
-	dispatchResult->errindex = -1;
 	dispatchResult->okindex = -1;
 
 	/*
@@ -225,8 +222,6 @@ cdbdisp_seterrcode(int errcode, /* ERRCODE_xxx or 0 */
 	if (!dispatchResult->errcode)
 	{
 		dispatchResult->errcode = errcode;
-		if (resultIndex >= 0)
-			dispatchResult->errindex = resultIndex;
 	}
 
 	if (!meleeResults)
@@ -478,10 +473,12 @@ cdbdisp_dumpDispatchResult(CdbDispatchResult *dispatchResult)
 	if (dispatchResult->error_message &&
 		dispatchResult->error_message->len > 0)
 	{
+		if (errstart(ERROR, __FILE__, __LINE__, PG_FUNCNAME_MACRO, TEXTDOMAIN))
+			errdata = errfinish_and_return(errcode(ERRCODE_GP_INTERCONNECTION_ERROR),
+											errmsg("%s", dispatchResult->error_message->data));
+		else
+			pg_unreachable();
 
-		errdata = ereport_and_return(ERROR,
-									 (errcode(ERRCODE_GP_INTERCONNECTION_ERROR),
-									  errmsg("%s", dispatchResult->error_message->data)));
 		return errdata;
 	}
 
@@ -551,7 +548,8 @@ cdbdisp_get_PQerror(PGresult *pgresult)
 	 * command failed. And if a QE disconnected with FATAL, or PANICed,
 	 * we don't want to do the same in the QD. So, always an ERROR.
 	 */
-	errstart(ERROR, filename, lineno, funcname, TEXTDOMAIN);
+	if (!errstart(ERROR, filename, lineno, funcname, TEXTDOMAIN))
+		pg_unreachable(); /* unexpected path. */
 
 	fld = PQresultErrorField(pgresult, PG_DIAG_SQLSTATE);
 	if (fld)
@@ -580,7 +578,6 @@ cdbdisp_get_PQerror(PGresult *pgresult)
 	if (fld)
 		errcontext("%s", fld);
 
-	Assert(TopTransactionContext);
 	oldcontext = MemoryContextSwitchTo(TopTransactionContext);
 	ErrorData *edata = errfinish_and_return(0);
 	MemoryContextSwitchTo(oldcontext);
@@ -589,7 +586,6 @@ cdbdisp_get_PQerror(PGresult *pgresult)
 
 /*
  * Format a CdbDispatchResults object.
- * Appends error messages to caller's StringInfo buffer.
  * Returns an ErrorData object in *qeError if some error was found, or NIL if no errors.
  * Before calling this function, you must call CdbCheckDispatchResult().
  */
@@ -686,36 +682,6 @@ cdbdisp_sumRejectedRows(CdbDispatchResults *results)
 }
 
 /*
- * sum tuple counts that were added into a partitioned AO table
- */
-HTAB *
-cdbdisp_sumAoPartTupCount(PartitionNode *parts, CdbDispatchResults *results)
-{
-	int			i;
-	HTAB	   *ht = NULL;
-
-	if (!parts)
-		return NULL;
-
-	for (i = 0; i < results->resultCount; ++i)
-	{
-		CdbDispatchResult *dispatchResult = &results->resultArray[i];
-		int			nres = cdbdisp_numPGresult(dispatchResult);
-		int			ires;
-
-		for (ires = 0; ires < nres; ++ires)
-		{
-			PGresult   *pgresult = cdbdisp_getPGresult(dispatchResult, ires);
-
-			ht = PQprocessAoTupCounts(parts, ht, (void *) pgresult->aotupcounts,
-									  pgresult->naotupcounts);
-		}
-	}
-
-	return ht;
-}
-
-/*
  * Find the max of the lastOid values returned from the QEs
  */
 Oid
@@ -806,13 +772,7 @@ cdbdisp_returnResults(CdbDispatchResults *primaryResults, CdbPgResults *cdb_pgre
 	for (i = 0; i < primaryResults->resultCount; ++i)
 		nslots += cdbdisp_numPGresult(&primaryResults->resultArray[i]);
 
-
-	cdb_pgresults->pg_results = (struct pg_result **) calloc(nslots, sizeof(struct pg_result *));
-
-	if (!cdb_pgresults->pg_results)
-		ereport(ERROR, (errcode(ERRCODE_OUT_OF_MEMORY),
-						errmsg
-						("cdbdisp_returnResults failed: out of memory")));
+	cdb_pgresults->pg_results = (struct pg_result **) palloc0(nslots * sizeof(struct pg_result *));
 
 	/*
 	 * Collect results from primary gang.
@@ -908,6 +868,12 @@ cdbdisp_clearCdbPgResults(CdbPgResults *cdb_pgresults)
 	for (i = 0; i < cdb_pgresults->numResults; i++)
 		PQclear(cdb_pgresults->pg_results[i]);
 
+	if (cdb_pgresults->pg_results)
+	{
+		pfree(cdb_pgresults->pg_results);
+		cdb_pgresults->pg_results = NULL;
+	}
+
 	cdb_pgresults->numResults = 0;
 }
 
@@ -942,55 +908,7 @@ cdbdisp_snatchPGresults(CdbDispatchResult *dispatchResult,
 	 * Empty our PGresult array.
 	 */
 	resetPQExpBuffer(buf);
-	dispatchResult->errindex = -1;
 	dispatchResult->okindex = -1;
 
 	return nresults;
-}
-
-struct HTAB *
-PQprocessAoTupCounts(struct PartitionNode *parts, struct HTAB *ht,
-					 void *aotupcounts, int naotupcounts)
-{
-	PQaoRelTupCount *ao = (PQaoRelTupCount *) aotupcounts;
-
-	if (naotupcounts)
-	{
-		int	j;
-
-		for (j = 0; j < naotupcounts; j++)
-		{
-			if (OidIsValid(ao->aorelid))
-			{
-				bool found;
-				PQaoRelTupCount *entry;
-
-				if (!ht)
-				{
-					HASHCTL	ctl;
-
-					/*
-					 * reasonable assumption?
-					 */
-					long num_buckets = list_length(all_partition_relids(parts));
-					num_buckets /= num_partition_levels(parts);
-
-					ctl.keysize = sizeof(Oid);
-					ctl.entrysize = sizeof(*entry);
-					ht = hash_create("AO hash map", num_buckets, &ctl, HASH_ELEM);
-				}
-
-				entry = hash_search(ht, &(ao->aorelid), HASH_ENTER, &found);
-
-				if (found)
-					entry->tupcount += ao->tupcount;
-				else
-					entry->tupcount = ao->tupcount;
-
-			}
-			ao++;
-		}
-	}
-
-	return ht;
 }

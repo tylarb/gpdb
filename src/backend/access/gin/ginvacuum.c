@@ -4,7 +4,7 @@
  *	  delete & vacuum routines for the postgres GIN
  *
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -15,6 +15,7 @@
 #include "postgres.h"
 
 #include "access/gin_private.h"
+#include "access/xloginsert.h"
 #include "commands/vacuum.h"
 #include "miscadmin.h"
 #include "postmaster/autovacuum.h"
@@ -88,10 +89,6 @@ xlogVacuumPage(Relation index, Buffer buffer)
 {
 	Page		page = BufferGetPage(buffer);
 	XLogRecPtr	recptr;
-	XLogRecData rdata[3];
-	ginxlogVacuumPage xlrec;
-	uint16		lower;
-	uint16		upper;
 
 	/* This is only used for entry tree leaf pages. */
 	Assert(!GinPageIsData(page));
@@ -100,57 +97,14 @@ xlogVacuumPage(Relation index, Buffer buffer)
 	if (!RelationNeedsWAL(index))
 		return;
 
-	xlrec.node = index->rd_node;
-	xlrec.blkno = BufferGetBlockNumber(buffer);
+	/*
+	 * Always create a full image, we don't track the changes on the page at
+	 * any more fine-grained level. This could obviously be improved...
+	 */
+	XLogBeginInsert();
+	XLogRegisterBuffer(0, buffer, REGBUF_FORCE_IMAGE | REGBUF_STANDARD);
 
-	/* Assume we can omit data between pd_lower and pd_upper */
-	lower = ((PageHeader) page)->pd_lower;
-	upper = ((PageHeader) page)->pd_upper;
-
-	Assert(lower < BLCKSZ);
-	Assert(upper < BLCKSZ);
-
-	if (lower >= SizeOfPageHeaderData &&
-		upper > lower &&
-		upper <= BLCKSZ)
-	{
-		xlrec.hole_offset = lower;
-		xlrec.hole_length = upper - lower;
-	}
-	else
-	{
-		/* No "hole" to compress out */
-		xlrec.hole_offset = 0;
-		xlrec.hole_length = 0;
-	}
-
-	rdata[0].data = (char *) &xlrec;
-	rdata[0].len = sizeof(ginxlogVacuumPage);
-	rdata[0].buffer = InvalidBuffer;
-	rdata[0].next = &rdata[1];
-
-	if (xlrec.hole_length == 0)
-	{
-		rdata[1].data = (char *) page;
-		rdata[1].len = BLCKSZ;
-		rdata[1].buffer = InvalidBuffer;
-		rdata[1].next = NULL;
-	}
-	else
-	{
-		/* must skip the hole */
-		rdata[1].data = (char *) page;
-		rdata[1].len = xlrec.hole_offset;
-		rdata[1].buffer = InvalidBuffer;
-		rdata[1].next = &rdata[2];
-
-		rdata[2].data = (char *) page + (xlrec.hole_offset + xlrec.hole_length);
-		rdata[2].len = BLCKSZ - (xlrec.hole_offset + xlrec.hole_length);
-		rdata[2].buffer = InvalidBuffer;
-		rdata[2].next = NULL;
-	}
-
-	recptr = XLogInsert(RM_GIN_ID, XLOG_GIN_VACUUM_PAGE, rdata);
+	recptr = XLogInsert(RM_GIN_ID, XLOG_GIN_VACUUM_PAGE);
 	PageSetLSN(page, recptr);
 }
 
@@ -291,48 +245,27 @@ ginDeletePage(GinVacuumState *gvs, BlockNumber deleteBlkno, BlockNumber leftBlkn
 	if (RelationNeedsWAL(gvs->index))
 	{
 		XLogRecPtr	recptr;
-		XLogRecData rdata[4];
 		ginxlogDeletePage data;
 
-		data.node = gvs->index->rd_node;
-		data.blkno = deleteBlkno;
-		data.parentBlkno = parentBlkno;
+		/*
+		 * We can't pass REGBUF_STANDARD for the deleted page, because we
+		 * didn't set pd_lower on pre-9.4 versions. The page might've been
+		 * binary-upgraded from an older version, and hence not have pd_lower
+		 * set correctly. Ditto for the left page, but removing the item from
+		 * the parent updated its pd_lower, so we know that's OK at this
+		 * point.
+		 */
+		XLogBeginInsert();
+		XLogRegisterBuffer(0, dBuffer, 0);
+		XLogRegisterBuffer(1, pBuffer, REGBUF_STANDARD);
+		XLogRegisterBuffer(2, lBuffer, 0);
+
 		data.parentOffset = myoff;
-		data.leftBlkno = leftBlkno;
 		data.rightLink = GinPageGetOpaque(page)->rightlink;
 
-		/*
-		 * We can't pass buffer_std = TRUE, because we didn't set pd_lower on
-		 * pre-9.4 versions. The page might've been binary-upgraded from an
-		 * older version, and hence not have pd_lower set correctly. Ditto for
-		 * the left page, but removing the item from the parent updated its
-		 * pd_lower, so we know that's OK at this point.
-		 */
-		rdata[0].buffer = dBuffer;
-		rdata[0].buffer_std = FALSE;
-		rdata[0].data = NULL;
-		rdata[0].len = 0;
-		rdata[0].next = rdata + 1;
+		XLogRegisterData((char *) &data, sizeof(ginxlogDeletePage));
 
-		rdata[1].buffer = pBuffer;
-		rdata[1].buffer_std = TRUE;
-		rdata[1].data = NULL;
-		rdata[1].len = 0;
-		rdata[1].next = rdata + 2;
-
-		rdata[2].buffer = lBuffer;
-		rdata[2].buffer_std = FALSE;
-		rdata[2].data = NULL;
-		rdata[2].len = 0;
-		rdata[2].next = rdata + 3;
-
-		rdata[3].buffer = InvalidBuffer;
-		rdata[3].buffer_std = FALSE;
-		rdata[3].len = sizeof(ginxlogDeletePage);
-		rdata[3].data = (char *) &data;
-		rdata[3].next = NULL;
-
-		recptr = XLogInsert(RM_GIN_ID, XLOG_GIN_DELETE_PAGE, rdata);
+		recptr = XLogInsert(RM_GIN_ID, XLOG_GIN_DELETE_PAGE);
 		PageSetLSN(page, recptr);
 		PageSetLSN(parentPage, recptr);
 		PageSetLSN(BufferGetPage(lBuffer), recptr);
@@ -499,27 +432,32 @@ ginVacuumEntryPage(GinVacuumState *gvs, Buffer buffer, BlockNumber *roots, uint3
 		else if (GinGetNPosting(itup) > 0)
 		{
 			int			nitems;
-			ItemPointer uncompressed;
+			ItemPointer items_orig;
+			bool		free_items_orig;
+			ItemPointer items;
 
-			/*
-			 * Vacuum posting list with proper function for compressed and
-			 * uncompressed format.
-			 */
+			/* Get list of item pointers from the tuple. */
 			if (GinItupIsCompressed(itup))
-				uncompressed = ginPostingListDecode((GinPostingList *) GinGetPosting(itup), &nitems);
+			{
+				items_orig = ginPostingListDecode((GinPostingList *) GinGetPosting(itup), &nitems);
+				free_items_orig = true;
+			}
 			else
 			{
-				uncompressed = (ItemPointer) GinGetPosting(itup);
+				items_orig = (ItemPointer) GinGetPosting(itup);
 				nitems = GinGetNPosting(itup);
+				free_items_orig = false;
 			}
 
-			uncompressed = ginVacuumItemPointers(gvs, uncompressed, nitems,
-												 &nitems);
-			if (uncompressed)
+			/* Remove any items from the list that need to be vacuumed. */
+			items = ginVacuumItemPointers(gvs, items_orig, nitems, &nitems);
+
+			if (free_items_orig)
+				pfree(items_orig);
+
+			/* If any item pointers were removed, recreate the tuple. */
+			if (items)
 			{
-				/*
-				 * Some ItemPointers were deleted, recreate tuple.
-				 */
 				OffsetNumber attnum;
 				Datum		key;
 				GinNullCategory category;
@@ -528,7 +466,7 @@ ginVacuumEntryPage(GinVacuumState *gvs, Buffer buffer, BlockNumber *roots, uint3
 
 				if (nitems > 0)
 				{
-					plist = ginCompressPostingList(uncompressed, nitems, GinMaxItemSize, NULL);
+					plist = ginCompressPostingList(items, nitems, GinMaxItemSize, NULL);
 					plistsize = SizeOfGinPostingList(plist);
 				}
 				else
@@ -567,6 +505,7 @@ ginVacuumEntryPage(GinVacuumState *gvs, Buffer buffer, BlockNumber *roots, uint3
 						 RelationGetRelationName(gvs->index));
 
 				pfree(itup);
+				pfree(items);
 			}
 		}
 	}
@@ -574,13 +513,10 @@ ginVacuumEntryPage(GinVacuumState *gvs, Buffer buffer, BlockNumber *roots, uint3
 	return (tmppage == origpage) ? NULL : tmppage;
 }
 
-Datum
-ginbulkdelete(PG_FUNCTION_ARGS)
+IndexBulkDeleteResult *
+ginbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
+			  IndexBulkDeleteCallback callback, void *callback_state)
 {
-	IndexVacuumInfo *info = (IndexVacuumInfo *) PG_GETARG_POINTER(0);
-	IndexBulkDeleteResult *stats = (IndexBulkDeleteResult *) PG_GETARG_POINTER(1);
-	IndexBulkDeleteCallback callback = (IndexBulkDeleteCallback) PG_GETARG_POINTER(2);
-	void	   *callback_state = (void *) PG_GETARG_POINTER(3);
 	Relation	index = info->index;
 	BlockNumber blkno = GIN_ROOT_BLKNO;
 	GinVacuumState gvs;
@@ -604,8 +540,12 @@ ginbulkdelete(PG_FUNCTION_ARGS)
 	{
 		/* Yes, so initialize stats to zeroes */
 		stats = (IndexBulkDeleteResult *) palloc0(sizeof(IndexBulkDeleteResult));
-		/* and cleanup any pending inserts */
-		ginInsertCleanup(&gvs.ginstate, true, stats);
+
+		/*
+		 * and cleanup any pending inserts
+		 */
+		ginInsertCleanup(&gvs.ginstate, !IsAutoVacuumWorkerProcess(),
+						 false, stats);
 	}
 
 	/* we'll re-count the tuples each time */
@@ -695,14 +635,12 @@ ginbulkdelete(PG_FUNCTION_ARGS)
 
 	MemoryContextDelete(gvs.tmpCxt);
 
-	PG_RETURN_POINTER(gvs.result);
+	return gvs.result;
 }
 
-Datum
-ginvacuumcleanup(PG_FUNCTION_ARGS)
+IndexBulkDeleteResult *
+ginvacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
 {
-	IndexVacuumInfo *info = (IndexVacuumInfo *) PG_GETARG_POINTER(0);
-	IndexBulkDeleteResult *stats = (IndexBulkDeleteResult *) PG_GETARG_POINTER(1);
 	Relation	index = info->index;
 	bool		needLock;
 	BlockNumber npages,
@@ -720,9 +658,9 @@ ginvacuumcleanup(PG_FUNCTION_ARGS)
 		if (IsAutoVacuumWorkerProcess())
 		{
 			initGinState(&ginstate, index);
-			ginInsertCleanup(&ginstate, true, stats);
+			ginInsertCleanup(&ginstate, false, true, stats);
 		}
-		PG_RETURN_POINTER(stats);
+		return stats;
 	}
 
 	/*
@@ -733,7 +671,8 @@ ginvacuumcleanup(PG_FUNCTION_ARGS)
 	{
 		stats = (IndexBulkDeleteResult *) palloc0(sizeof(IndexBulkDeleteResult));
 		initGinState(&ginstate, index);
-		ginInsertCleanup(&ginstate, true, stats);
+		ginInsertCleanup(&ginstate, !IsAutoVacuumWorkerProcess(),
+						 false, stats);
 	}
 
 	memset(&idxStat, 0, sizeof(idxStat));
@@ -771,7 +710,7 @@ ginvacuumcleanup(PG_FUNCTION_ARGS)
 		LockBuffer(buffer, GIN_SHARE);
 		page = (Page) BufferGetPage(buffer);
 
-		if (GinPageIsDeleted(page))
+		if (PageIsNew(page) || GinPageIsDeleted(page))
 		{
 			Assert(blkno != GIN_ROOT_BLKNO);
 			RecordFreeIndexPage(index, blkno);
@@ -807,5 +746,5 @@ ginvacuumcleanup(PG_FUNCTION_ARGS)
 	if (needLock)
 		UnlockRelationForExtension(index, ExclusiveLock);
 
-	PG_RETURN_POINTER(stats);
+	return stats;
 }

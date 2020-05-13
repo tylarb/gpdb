@@ -5,7 +5,7 @@
  *
  * Portions Copyright (c) 2005-2008, Greenplum inc
  * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -45,11 +45,13 @@
 /* Returns true if doing null-fill on inner relation */
 #define HJ_FILL_INNER(hjstate)	((hjstate)->hj_NullOuterTupleSlot != NULL)
 
+extern bool Test_print_prefetch_joinqual;
+
 static TupleTableSlot *ExecHashJoinOuterGetTuple(PlanState *outerNode,
 						  HashJoinState *hjstate,
 						  uint32 *hashvalue);
 static TupleTableSlot *ExecHashJoinGetSavedTuple(HashJoinState *hjstate,
-						  ExecWorkFile *file,
+						  BufFile *file,
 						  uint32 *hashvalue,
 						  TupleTableSlot *tupleSlot);
 static bool ExecHashJoinNewBatch(HashJoinState *hjstate);
@@ -59,6 +61,7 @@ static void ReleaseHashTable(HashJoinState *node);
 
 static void SpillCurrentBatch(HashJoinState *node);
 static bool ExecHashJoinReloadHashTable(HashJoinState *hjstate);
+static void ExecEagerFreeHashJoin(HashJoinState *node);
 
 /* ----------------------------------------------------------------
  *		ExecHashJoin
@@ -69,8 +72,8 @@ static bool ExecHashJoinReloadHashTable(HashJoinState *hjstate);
  *			  the other one is "outer".
  * ----------------------------------------------------------------
  */
-TupleTableSlot *				/* return: a tuple or NULL */
-ExecHashJoin(HashJoinState *node)
+static TupleTableSlot *				/* return: a tuple or NULL */
+ExecHashJoin_guts(HashJoinState *node)
 {
 	EState	   *estate;
 	PlanState  *outerNode;
@@ -118,70 +121,70 @@ ExecHashJoin(HashJoinState *node)
 				 */
 				Assert(hashtable == NULL);
 
-			  /*
-			   * MPP-4165: My fix for MPP-3300 was correct in that we avoided
-			   * the *deadlock* but had very unexpected (and painful)
-			   * performance characteristics: we basically de-pipeline and
-			   * de-parallelize execution of any query which has motion below
-			   * us.
-			   *
-			   * So now prefetch_inner is set (see createplan.c) if we have *any* motion
-			   * below us. If we don't have any motion, it doesn't matter.
-			   *
-			   * See motion_sanity_walker() for details on how a deadlock may occur.
-			   */
-			  if (!node->prefetch_inner)
-			  {
 				/*
-				 * If the outer relation is completely empty, and it's not
-				 * right/full join, we can quit without building the hash
-				 * table.  However, for an inner join it is only a win to
-				 * check this when the outer relation's startup cost is less
-				 * than the projected cost of building the hash table.
-				 * Otherwise it's best to build the hash table first and see
-				 * if the inner relation is empty.  (When it's a left join, we
-				 * should always make this check, since we aren't going to be
-				 * able to skip the join on the strength of an empty inner
-				 * relation anyway.)
+				 * MPP-4165: My fix for MPP-3300 was correct in that we avoided
+				 * the *deadlock* but had very unexpected (and painful)
+				 * performance characteristics: we basically de-pipeline and
+				 * de-parallelize execution of any query which has motion below
+				 * us.
 				 *
-				 * If we are rescanning the join, we make use of information
-				 * gained on the previous scan: don't bother to try the
-				 * prefetch if the previous scan found the outer relation
-				 * nonempty. This is not 100% reliable since with new
-				 * parameters the outer relation might yield different
-				 * results, but it's a good heuristic.
+				 * So now prefetch_inner is set (see createplan.c) if we have *any* motion
+				 * below us. If we don't have any motion, it doesn't matter.
 				 *
-				 * The only way to make the check is to try to fetch a tuple
-				 * from the outer plan node.  If we succeed, we have to stash
-				 * it away for later consumption by ExecHashJoinOuterGetTuple.
+				 * See motion_sanity_walker() for details on how a deadlock may occur.
 				 */
-				if (HJ_FILL_INNER(node))
+				if (!node->prefetch_inner)
 				{
-					/* no chance to not build the hash table */
-					node->hj_FirstOuterTupleSlot = NULL;
-				}
-				else if (HJ_FILL_OUTER(node) ||
+					/*
+					 * If the outer relation is completely empty, and it's not
+					 * right/full join, we can quit without building the hash
+					 * table.  However, for an inner join it is only a win to
+					 * check this when the outer relation's startup cost is less
+					 * than the projected cost of building the hash table.
+					 * Otherwise it's best to build the hash table first and see
+					 * if the inner relation is empty.  (When it's a left join, we
+					 * should always make this check, since we aren't going to be
+					 * able to skip the join on the strength of an empty inner
+					 * relation anyway.)
+					 *
+					 * If we are rescanning the join, we make use of information
+					 * gained on the previous scan: don't bother to try the
+					 * prefetch if the previous scan found the outer relation
+					 * nonempty. This is not 100% reliable since with new
+					 * parameters the outer relation might yield different
+					 * results, but it's a good heuristic.
+					 *
+					 * The only way to make the check is to try to fetch a tuple
+					 * from the outer plan node.  If we succeed, we have to stash
+					 * it away for later consumption by ExecHashJoinOuterGetTuple.
+					 */
+					if (HJ_FILL_INNER(node))
+					{
+						/* no chance to not build the hash table */
+						node->hj_FirstOuterTupleSlot = NULL;
+					}
+					else if (HJ_FILL_OUTER(node) ||
 						 (outerNode->plan->startup_cost < hashNode->ps.plan->total_cost &&
 						  !node->hj_OuterNotEmpty))
-				{
-					node->hj_FirstOuterTupleSlot = ExecProcNode(outerNode);
-					if (TupIsNull(node->hj_FirstOuterTupleSlot))
 					{
-						node->hj_OuterNotEmpty = false;
-						return NULL;
+						node->hj_FirstOuterTupleSlot = ExecProcNode(outerNode);
+						if (TupIsNull(node->hj_FirstOuterTupleSlot))
+						{
+							node->hj_OuterNotEmpty = false;
+							return NULL;
+						}
+						else
+							node->hj_OuterNotEmpty = true;
 					}
 					else
-						node->hj_OuterNotEmpty = true;
+						node->hj_FirstOuterTupleSlot = NULL;
 				}
 				else
+				{
+					/* see MPP-989 comment above, for now we assume that we have
+					* at least one row on the outer. */
 					node->hj_FirstOuterTupleSlot = NULL;
-			  }
-			  else
-			  {
-				  /* see MPP-989 comment above, for now we assume that we have
-				   * at least one row on the outer. */
-				  node->hj_FirstOuterTupleSlot = NULL;
-			  }
+				}
 
 				/*
 				 * create the hash table
@@ -223,19 +226,7 @@ ExecHashJoin(HashJoinState *node)
 				 * If LASJ_NOTIN and a null was found on the inner side, then clean out.
 				 */
 				if (node->js.jointype == JOIN_LASJ_NOTIN && hashNode->hs_hashkeys_null)
-				{
-					/*
-					 * CDB: We'll read no more from outer subtree. To keep sibling QEs
-					 * from being starved, tell source QEs not to clog up the pipeline
-					 * with our never-to-be-consumed data.
-					 */
-					ExecSquelchNode(outerNode);
-					/* end of join */
-
-					ExecEagerFreeHashJoin(node);
-
 					return NULL;
-				}
 
 				/*
 				 * If the inner relation is completely empty, and we're not
@@ -243,18 +234,17 @@ ExecHashJoin(HashJoinState *node)
 				 * outer relation.
 				 */
 				if (hashtable->totalTuples == 0 && !HJ_FILL_OUTER(node))
-				{
-					/*
-					 * CDB: We'll read no more from outer subtree. To keep sibling QEs
-					 * from being starved, tell source QEs not to clog up the pipeline
-					 * with our never-to-be-consumed data.
-					 */
-					ExecSquelchNode(outerNode);
-					/* end of join */
-
-					ExecEagerFreeHashJoin(node);
-
 					return NULL;
+
+				/*
+				 * Prefetch JoinQual to prevent motion hazard.
+				 *
+				 * See ExecPrefetchJoinQual() for details.
+				 */
+				if (node->prefetch_joinqual)
+				{
+					ExecPrefetchJoinQual(&node->js);
+					node->prefetch_joinqual = false;
 				}
 
 				/*
@@ -288,9 +278,7 @@ ExecHashJoin(HashJoinState *node)
 				{
 					hashtable->curbatch = 0;
 					if (!ExecHashJoinReloadHashTable(node))
-					{
 						return NULL;
-					}
 				}
 
 				/*
@@ -339,7 +327,7 @@ ExecHashJoin(HashJoinState *node)
 					 * Save it in the corresponding outer-batch file.
 					 */
 					Assert(batchno > hashtable->curbatch);
-					ExecHashJoinSaveTuple(&node->js.ps, ExecFetchSlotMemTuple(outerTupleSlot, false),
+					ExecHashJoinSaveTuple(&node->js.ps, ExecFetchSlotMemTuple(outerTupleSlot),
 										  hashvalue,
 										  hashtable,
 										  &hashtable->outerBatchFile[batchno],
@@ -506,12 +494,8 @@ ExecHashJoin(HashJoinState *node)
 				 * Try to advance to next batch.  Done if there are no more.
 				 */
 				if (!ExecHashJoinNewBatch(node))
-				{
-					if (!node->reuse_hashtable)
-						ExecEagerFreeHashJoin(node);
-
 					return NULL;	/* end of join */
-				}
+
 				node->hj_JoinState = HJ_NEED_NEW_OUTER;
 				break;
 
@@ -521,6 +505,28 @@ ExecHashJoin(HashJoinState *node)
 		}
 	}
 }
+
+TupleTableSlot *
+ExecHashJoin(HashJoinState *node)
+{
+	TupleTableSlot *result;
+
+	result = ExecHashJoin_guts(node);
+
+	if (TupIsNull(result) && !node->reuse_hashtable)
+	{
+		/*
+		 * CDB: We'll read no more from inner subtree. To keep our
+		 * sibling QEs from being starved, tell source QEs not to
+		 * clog up the pipeline with our never-to-be-consumed
+		 * data.
+		 */
+		ExecSquelchNode((PlanState *) node);
+	}
+
+	return result;
+}
+
 
 /* ----------------------------------------------------------------
  *		ExecInitHashJoin
@@ -599,6 +605,12 @@ ExecInitHashJoin(HashJoin *node, EState *estate, int eflags)
 	 * the fix to MPP-989)
 	 */
 	hjstate->prefetch_inner = node->join.prefetch_inner;
+	hjstate->prefetch_joinqual = node->join.prefetch_joinqual;
+
+	if (Test_print_prefetch_joinqual && hjstate->prefetch_joinqual)
+		elog(NOTICE,
+			 "prefetch join qual in slice %d of plannode %d",
+			 currentSliceId, ((Plan *) node)->plan_node_id);
 
 	/*
 	 * initialize child nodes
@@ -769,8 +781,6 @@ ExecEndHashJoin(HashJoinState *node)
 	 */
 	ExecEndNode(outerPlanState(node));
 	ExecEndNode(innerPlanState(node));
-
-	EndPlanStateGpmonPkt(&node->js.ps);
 }
 
 /*
@@ -846,7 +856,7 @@ ExecHashJoinOuterGetTuple(PlanState *outerNode,
 	}
 	else if (curbatch < hashtable->nbatch)
 	{
-		ExecWorkFile    *file = hashtable->outerBatchFile[curbatch];
+		BufFile	   *file = hashtable->outerBatchFile[curbatch];
 
 		/*
 		 * In outer-join cases, we could get here even though the batch file
@@ -876,8 +886,6 @@ ExecHashJoinOuterGetTuple(PlanState *outerNode,
 #ifdef HJDEBUG
 		elog(gp_workfile_caching_loglevel, "HashJoin built table with %.1f tuples for batch %d", hashtable->totalTuples, curbatch);
 #endif
-
-		CheckSendPlanStateGpmonPkt(&hjstate->js.ps);
 	}
 
 	/* End of this batch */
@@ -897,7 +905,7 @@ ExecHashJoinNewBatch(HashJoinState *hjstate)
 	int			nbatch;
 	int			curbatch;
 
-	SIMPLE_FAULT_INJECTOR(FaultExecHashJoinNewBatch);
+	SIMPLE_FAULT_INJECTOR("exec_hashjoin_new_batch");
 
 	HashState  *hashState = (HashState *) innerPlanState(hjstate);
 
@@ -917,8 +925,22 @@ ExecHashJoinNewBatch(HashJoinState *hjstate)
 		 * away to free disk space.
 		 */
 		if (hashtable->outerBatchFile[curbatch])
-			workfile_mgr_close_file(hashtable->work_set, hashtable->outerBatchFile[curbatch]);
+			BufFileClose(hashtable->outerBatchFile[curbatch]);
 		hashtable->outerBatchFile[curbatch] = NULL;
+	}
+	else	/* we just finished the first batch */
+	{
+		/*
+		 * Reset some of the skew optimization state variables, since we no
+		 * longer need to consider skew tuples after the first batch. The
+		 * memory context reset we are about to do will release the skew
+		 * hashtable itself.
+		 */
+		hashtable->skewEnabled = false;
+		hashtable->skewBucket = NULL;
+		hashtable->skewBucketNums = NULL;
+		hashtable->nSkewBuckets = 0;
+		hashtable->spaceUsedSkew = 0;
 	}
 
 	/*
@@ -939,21 +961,6 @@ ExecHashJoinNewBatch(HashJoinState *hjstate)
 	{
 		SpillCurrentBatch(hjstate);
 	}
-	else	/* we just finished the first batch */
-	{
-		/*
-		 * Reset some of the skew optimization state variables, since we no
-		 * longer need to consider skew tuples after the first batch. The
-		 * memory context reset we are about to do will release the skew
-		 * hashtable itself.
-		 */
-		hashtable->skewEnabled = false;
-		hashtable->skewBucket = NULL;
-		hashtable->skewBucketNums = NULL;
-		hashtable->nSkewBuckets = 0;
-		hashtable->spaceUsedSkew = 0;
-	}
-
 	/*
 	 * We can always skip over any batches that are completely empty on both
 	 * sides.  We can sometimes skip over batches that are empty on only one
@@ -1021,10 +1028,10 @@ ExecHashJoinNewBatch(HashJoinState *hjstate)
 		/* We can ignore this batch. */
 		/* Release associated temp files right away. */
 		if (hashtable->innerBatchFile[curbatch] && !hjstate->reuse_hashtable)
-			workfile_mgr_close_file(hashtable->work_set, hashtable->innerBatchFile[curbatch]);
+			BufFileClose(hashtable->innerBatchFile[curbatch]);
 		hashtable->innerBatchFile[curbatch] = NULL;
 		if (hashtable->outerBatchFile[curbatch])
-			workfile_mgr_close_file(hashtable->work_set, hashtable->outerBatchFile[curbatch]);
+			BufFileClose(hashtable->outerBatchFile[curbatch]);
 		hashtable->outerBatchFile[curbatch] = NULL;
 
 		curbatch++;
@@ -1048,7 +1055,7 @@ ExecHashJoinNewBatch(HashJoinState *hjstate)
 	 */
 	if (hashtable->outerBatchFile[curbatch] != NULL)
 	{
-		if (!ExecWorkFile_Rewind(hashtable->outerBatchFile[curbatch]))
+		if (BufFileSeek(hashtable->outerBatchFile[curbatch], 0, 0, SEEK_SET) != 0)
 			ereport(ERROR,
 					(errcode_for_file_access(),
 					 errmsg("could not access temporary file")));
@@ -1070,17 +1077,16 @@ ExecHashJoinNewBatch(HashJoinState *hjstate)
  */
 void
 ExecHashJoinSaveTuple(PlanState *ps, MemTuple tuple, uint32 hashvalue,
-					  HashJoinTable hashtable, ExecWorkFile **fileptr,
+					  HashJoinTable hashtable, BufFile **fileptr,
 					  MemoryContext bfCxt)
 {
-	ExecWorkFile *file = *fileptr;
+	BufFile	   *file = *fileptr;
 
 	if (hashtable->work_set == NULL)
 	{
 		/*
 		 * First time spilling.
 		 */
-		hashtable->hjstate->workfiles_created = true;
 		if (hashtable->hjstate->js.ps.instrument)
 		{
 			hashtable->hjstate->js.ps.instrument->workfileCreated = true;
@@ -1089,9 +1095,7 @@ ExecHashJoinSaveTuple(PlanState *ps, MemTuple tuple, uint32 hashvalue,
 		MemoryContext oldcxt;
 
 		oldcxt = MemoryContextSwitchTo(bfCxt);
-		hashtable->work_set = workfile_mgr_create_set(gp_workfile_type_hashjoin,
-				true, /* can_be_reused */
-				&hashtable->hjstate->js.ps);
+		hashtable->work_set = workfile_mgr_create_set("HashJoin", NULL);
 		MemoryContextSwitchTo(oldcxt);
 	}
 
@@ -1103,29 +1107,29 @@ ExecHashJoinSaveTuple(PlanState *ps, MemTuple tuple, uint32 hashvalue,
 
 		/* First write to this batch file, so create it */
 		Assert(hashtable->work_set != NULL);
-		file = workfile_mgr_create_file(hashtable->work_set);
+		file = BufFileCreateTempInSet(hashtable->work_set, false /* interXact */);
+		BufFilePledgeSequential(file);	/* allow compression */
 		*fileptr = file;
 
-		elog(gp_workfile_caching_loglevel, "create batch file %s with gp_workfile_compress_algorithm=%d",
-			 ExecWorkFile_GetFileName(file),
-			 hashtable->work_set->metadata.bfz_compress_type);
+		elog(gp_workfile_caching_loglevel, "create batch file %s",
+			 BufFileGetFilename(file));
 
 		MemoryContextSwitchTo(oldcxt);
 	}
 
-	if (!ExecWorkFile_Write(file, (void *) &hashvalue, sizeof(uint32)))
+	if (BufFileWrite(file, (void *) &hashvalue, sizeof(uint32)) != sizeof(uint32))
 	{
-		workfile_mgr_report_error();
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not write to temporary file: %m")));
 	}
 
-	if (!ExecWorkFile_Write(file, (void *) tuple, memtuple_get_size(tuple)))
+	int		tupsize	= memtuple_get_size(tuple);
+	if (BufFileWrite(file, (void *) tuple, tupsize) != tupsize)
 	{
-		workfile_mgr_report_error();
-	}
-
-	if (ps)
-	{
-		CheckSendPlanStateGpmonPkt(ps);
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not write to temporary file: %m")));
 	}
 }
 
@@ -1138,7 +1142,7 @@ ExecHashJoinSaveTuple(PlanState *ps, MemTuple tuple, uint32 hashvalue,
  */
 static TupleTableSlot *
 ExecHashJoinGetSavedTuple(HashJoinState *hjstate,
-						  ExecWorkFile *file,
+						  BufFile *file,
 						  uint32 *hashvalue,
 						  TupleTableSlot *tupleSlot)
 {
@@ -1147,11 +1151,18 @@ ExecHashJoinGetSavedTuple(HashJoinState *hjstate,
 	MemTuple	tuple;
 
 	/*
+	 * We check for interrupts here because this is typically taken as an
+	 * alternative code path to an ExecProcNode() call, which would include
+	 * such a check.
+	 */
+	CHECK_FOR_INTERRUPTS();
+
+	/*
 	 * Since both the hash value and the MinimalTuple length word are uint32,
 	 * we can read them both in one BufFileRead() call without any type
 	 * cheating.
 	 */
-	nread = ExecWorkFile_Read(file, (void *) header, sizeof(header));
+	nread = BufFileRead(file, (void *) header, sizeof(header));
 	if (nread != sizeof(header))				/* end of file */
 	{
 		ExecClearTuple(tupleSlot);
@@ -1162,9 +1173,9 @@ ExecHashJoinGetSavedTuple(HashJoinState *hjstate,
 	tuple = (MemTuple) palloc(memtuple_size_from_uint32(header[1]));
 	memtuple_set_mtlen(tuple, header[1]);
 
-	nread = ExecWorkFile_Read(file,
-							  (void *) ((char *) tuple + sizeof(uint32)),
-							  memtuple_size_from_uint32(header[1]) - sizeof(uint32));
+	nread = BufFileRead(file,
+						(void *) ((char *) tuple + sizeof(uint32)),
+						memtuple_size_from_uint32(header[1]) - sizeof(uint32));
 	
 	if (nread != memtuple_size_from_uint32(header[1]) - sizeof(uint32))
 		ereport(ERROR,
@@ -1326,7 +1337,7 @@ isNotDistinctJoin(List *qualList)
 	return false;
 }
 
-void
+static void
 ExecEagerFreeHashJoin(HashJoinState *node)
 {
 	if (node->hj_HashTable != NULL && !node->hj_HashTable->eagerlyReleased)
@@ -1334,6 +1345,15 @@ ExecEagerFreeHashJoin(HashJoinState *node)
 		ReleaseHashTable(node);
 	}
 }
+
+void
+ExecSquelchHashJoin(HashJoinState *node)
+{
+	ExecEagerFreeHashJoin(node);
+	ExecSquelchNode(outerPlanState(node));
+	ExecSquelchNode(innerPlanState(node));
+}
+
 
 /*
  * In our hybrid hash join we either spill when we increase number of batches
@@ -1389,9 +1409,7 @@ ExecHashJoinReloadHashTable(HashJoinState *hjstate)
 	if (hashtable->innerBatchFile[curbatch] != NULL)
 	{
 		/* Rewind batch file */
-		bool		result = ExecWorkFile_Rewind(hashtable->innerBatchFile[curbatch]);
-
-		if (!result)
+		if (BufFileSeek(hashtable->innerBatchFile[curbatch], 0, 0, SEEK_SET) != 0)
 		{
 			ereport(ERROR, (errcode_for_file_access(),
 							errmsg("could not access temporary file")));
@@ -1427,10 +1445,10 @@ ExecHashJoinReloadHashTable(HashJoinState *hjstate)
 		{
 			Assert(hashtable->stats);
 			hashtable->stats->batchstats[curbatch].innerfilesize =
-				ExecWorkFile_Tell64(hashtable->innerBatchFile[curbatch]);
+				BufFileGetSize(hashtable->innerBatchFile[curbatch]);
 		}
 
-		SIMPLE_FAULT_INJECTOR(WorkfileHashJoinFailure);
+		SIMPLE_FAULT_INJECTOR("workfile_hashjoin_failure");
 
 		/*
 		 * If we want to re-use the hash table after a re-scan, don't
@@ -1442,12 +1460,13 @@ ExecHashJoinReloadHashTable(HashJoinState *hjstate)
 		 * XXX: Currently, we actually always close the file, and recreate it
 		 * afterwards, even if there are no changes. That's because the workfile
 		 * API doesn't support appending to a file that's already been read from.
+		 * FIXME: could fix that now
 		 */
 #if 0
 		if (!hjstate->reuse_hashtable || nmoved > 0 || hashtable->nbatch != orignbatch)
 #endif
 		{
-			workfile_mgr_close_file(hashtable->work_set, hashtable->innerBatchFile[curbatch]);
+			BufFileClose(hashtable->innerBatchFile[curbatch]);
 			hashtable->innerBatchFile[curbatch] = NULL;
 		}
 	}

@@ -7,7 +7,7 @@
  * accessed via the extended FE/BE query protocol.
  *
  *
- * Copyright (c) 2002-2014, PostgreSQL Global Development Group
+ * Copyright (c) 2002-2016, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/backend/commands/prepare.c
@@ -17,11 +17,9 @@
 #include "postgres.h"
 
 #include "access/xact.h"
-#include "catalog/gp_policy.h"
 #include "catalog/pg_type.h"
 #include "commands/createas.h"
 #include "commands/prepare.h"
-#include "funcapi.h"
 #include "miscadmin.h"
 #include "nodes/nodeFuncs.h"
 #include "parser/analyze.h"
@@ -35,6 +33,7 @@
 #include "utils/builtins.h"
 #include "utils/snapmgr.h"
 #include "utils/timestamp.h"
+
 
 /*
  * The hash table in which prepared queries are stored. This is
@@ -404,16 +403,16 @@ EvaluateParams(PreparedStatement *pstmt, List *params,
 	/* Prepare the expressions for execution */
 	exprstates = (List *) ExecPrepareExpr((Expr *) params, estate);
 
-	/* sizeof(ParamListInfoData) includes the first array element */
 	paramLI = (ParamListInfo)
-		palloc(sizeof(ParamListInfoData) +
-			   (num_params - 1) * sizeof(ParamExternData));
+		palloc(offsetof(ParamListInfoData, params) +
+			   num_params * sizeof(ParamExternData));
 	/* we have static list of params, so no hooks needed */
 	paramLI->paramFetch = NULL;
 	paramLI->paramFetchArg = NULL;
 	paramLI->parserSetup = NULL;
 	paramLI->parserSetupArg = NULL;
 	paramLI->numParams = num_params;
+	paramLI->paramMask = NULL;
 
 	i = 0;
 	foreach(l, exprstates)

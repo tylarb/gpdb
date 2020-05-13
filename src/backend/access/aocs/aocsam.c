@@ -22,11 +22,6 @@
 #include "access/appendonlywriter.h"
 #include "access/heapam.h"
 #include "access/hio.h"
-#include "access/multixact.h"
-#include "access/transam.h"
-#include "access/tuptoaster.h"
-#include "access/valid.h"
-#include "access/xact.h"
 #include "catalog/catalog.h"
 #include "catalog/gp_fastsequence.h"
 #include "catalog/namespace.h"
@@ -42,7 +37,6 @@
 #include "fmgr.h"
 #include "miscadmin.h"
 #include "pgstat.h"
-#include "storage/freespace.h"
 #include "storage/procarray.h"
 #include "storage/smgr.h"
 #include "utils/datumstream.h"
@@ -168,7 +162,8 @@ open_ds_write(Relation rel, DatumStreamWrite **ds, TupleDesc relationTupleDesc,
 										blksz,
 										attr,
 										RelationGetRelationName(rel),
-										/* title */ titleBuf.data);
+										/* title */ titleBuf.data,
+										RelationNeedsWAL(rel));
 
 	}
 }
@@ -298,10 +293,20 @@ open_next_scan_seg(AOCSScanDesc scan)
 			 */
 			if (scan->num_proj_atts > 0)
 			{
-				AOCSVPInfoEntry *e = getAOCSVPEntry(curSegInfo, scan->proj_atts[0]);
-
-				if (e->eof == 0 || curSegInfo->state == AOSEG_STATE_AWAITING_DROP)
+				/*
+				 * subtle: we must check for AWAITING_DROP before calling getAOCSVPEntry().
+				 * ALTER TABLE ADD COLUMN does not update vpinfos on AWAITING_DROP segments.
+				 */
+				if (curSegInfo->state == AOSEG_STATE_AWAITING_DROP)
 					emptySeg = true;
+				else
+				{
+					AOCSVPInfoEntry *e;
+
+					e = getAOCSVPEntry(curSegInfo, scan->proj_atts[0]);
+					if (e->eof == 0)
+						emptySeg = true;
+				}
 			}
 
 			if (!emptySeg)
@@ -400,8 +405,8 @@ aocs_beginrangescan(Relation relation,
 
 	for (i = 0; i < segfile_count; i++)
 	{
-		seginfo[	i] = GetAOCSFileSegInfo(relation, appendOnlyMetaDataSnapshot,
-											segfile_no_arr[i]);
+		seginfo[i] = GetAOCSFileSegInfo(relation, appendOnlyMetaDataSnapshot,
+										segfile_no_arr[i], false);
 	}
 	return aocs_beginscan_internal(relation,
 								   seginfo,
@@ -618,7 +623,7 @@ static void upgrade_datum_fetch(AOCSFetchDesc fetch, int attno, Datum values[],
 					   values, isnull, formatversion);
 }
 
-void
+bool
 aocs_getnext(AOCSScanDesc scan, ScanDirection direction, TupleTableSlot *slot)
 {
 	int			ncol;
@@ -649,7 +654,7 @@ ReadNext:
 				/* No more seg, we are at the end */
 				ExecClearTuple(slot);
 				scan->cur_seg = -1;
-				return;
+				return false;
 			}
 			scan->cur_seg_row = 0;
 		}
@@ -704,17 +709,14 @@ ReadNext:
 			}
 		}
 
-		AOTupleIdInit_Init(&aoTupleId);
-		AOTupleIdInit_segmentFileNum(&aoTupleId, curseginfo->segno);
-
 		scan->cur_seg_row++;
 		if (rowNum == INT64CONST(-1))
 		{
-			AOTupleIdInit_rowNum(&aoTupleId, scan->cur_seg_row);
+			AOTupleIdInit(&aoTupleId, curseginfo->segno, scan->cur_seg_row);
 		}
 		else
 		{
-			AOTupleIdInit_rowNum(&aoTupleId, rowNum);
+			AOTupleIdInit(&aoTupleId, curseginfo->segno, rowNum);
 		}
 
 		if (!isSnapshotAny && !AppendOnlyVisimap_IsVisible(&scan->visibilityMap, &aoTupleId))
@@ -726,11 +728,11 @@ ReadNext:
 
 		TupSetVirtualTupleNValid(slot, ncol);
 		slot_set_ctid(slot, &(scan->cdb_fake_ctid));
-		return;
+		return true;
 	}
 
 	Assert(!"Never here");
-	return;
+	return false;
 }
 
 
@@ -752,41 +754,21 @@ OpenAOCSDatumStreams(AOCSInsertDesc desc)
 
 	desc->ds = (DatumStreamWrite **) palloc0(sizeof(DatumStreamWrite *) * nvp);
 
-	/*
-	 * In order to append to this file segment entry we must first acquire the
-	 * relation Append-Only segment file (transaction-scope) lock (tag
-	 * LOCKTAG_RELATION_APPENDONLY_SEGMENT_FILE) in order to guarantee
-	 * stability of the pg_aoseg information on this segment file and
-	 * exclusive right to append data to the segment file.
-	 *
-	 * NOTE: This is a transaction scope lock that must be held until commit /
-	 * abort.
-	 */
-	LockRelationAppendOnlySegmentFile(&desc->aoi_rel->rd_node,
-									  desc->cur_segno,
-									  AccessExclusiveLock,
-									   /* dontWait */ false);
-
 	open_ds_write(desc->aoi_rel, desc->ds, tupdesc,
 				  desc->aoi_rel->rd_appendonly->checksum);
 
 	/* Now open seg info file and get eof mark. */
 	seginfo = GetAOCSFileSegInfo(desc->aoi_rel,
 								 desc->appendOnlyMetaDataSnapshot,
-								 desc->cur_segno);
-
-	if (seginfo == NULL)
-	{
-		InsertInitialAOCSFileSegInfo(desc->aoi_rel, desc->cur_segno, nvp);
-		seginfo = NewAOCSFileSegInfo(desc->cur_segno, nvp);
-	}
-
+								 desc->cur_segno,
+								 true);
 	desc->fsInfo = seginfo;
 
 	/* Never insert into a segment that is awaiting a drop */
-	elogif(desc->fsInfo->state == AOSEG_STATE_AWAITING_DROP, ERROR,
-		   "cannot insert into segno (%d) for AO relid %d that is in state AOSEG_STATE_AWAITING_DROP",
-		   desc->cur_segno, RelationGetRelid(desc->aoi_rel));
+	if (desc->fsInfo->state == AOSEG_STATE_AWAITING_DROP)
+		elog(ERROR,
+			 "cannot insert into segno (%d) for AO relid %d that is in state AOSEG_STATE_AWAITING_DROP",
+			 desc->cur_segno, RelationGetRelid(desc->aoi_rel));
 
 	desc->rowCount = seginfo->total_tupcount;
 
@@ -905,7 +887,7 @@ aocs_insert_values(AOCSInsertDesc idesc, Datum *d, bool *null, AOTupleId *aoTupl
 
 #ifdef FAULT_INJECTOR
 	FaultInjector_InjectFaultIfSet(
-								   AppendOnlyInsert,
+								   "appendonly_insert",
 								   DDLNotSpecified,
 								   "",	/* databaseName */
 								   RelationGetRelationName(idesc->aoi_rel));	/* tableName */
@@ -977,9 +959,7 @@ aocs_insert_values(AOCSInsertDesc idesc, Datum *d, bool *null, AOTupleId *aoTupl
 
 	Assert(idesc->numSequences >= 0);
 
-	AOTupleIdInit_Init(aoTupleId);
-	AOTupleIdInit_segmentFileNum(aoTupleId, idesc->cur_segno);
-	AOTupleIdInit_rowNum(aoTupleId, idesc->lastSequence);
+	AOTupleIdInit(aoTupleId, idesc->cur_segno, idesc->lastSequence);
 
 	/*
 	 * If the allocated fast sequence numbers are used up, we request for a
@@ -1161,9 +1141,6 @@ openFetchSegmentFile(AOCSFetchDesc aocsFetchDesc,
 		segmentFileNum = fsInfo->segno;
 		if (openSegmentFileNum == segmentFileNum)
 		{
-			AOCSVPInfoEntry *entry = getAOCSVPEntry(fsInfo, colNo);
-
-			logicalEof = entry->eof;
 			break;
 		}
 		i++;
@@ -1172,9 +1149,17 @@ openFetchSegmentFile(AOCSFetchDesc aocsFetchDesc,
 	/*
 	 * Don't try to open a segment file when its EOF is 0, since the file may
 	 * not exist. See MPP-8280. Also skip the segment file if it is awaiting a
-	 * drop
+	 * drop.
+	 *
+	 * Check for awaiting-drop first, before accessing the vpinfo, because
+	 * vpinfo might not be valid on awaiting-drop segment after adding a column.
 	 */
-	if (logicalEof == 0 || fsInfo->state == AOSEG_STATE_AWAITING_DROP)
+	if (fsInfo->state == AOSEG_STATE_AWAITING_DROP)
+		return false;
+
+	AOCSVPInfoEntry *entry = getAOCSVPEntry(fsInfo, colNo);
+	logicalEof = entry->eof;
+	if (logicalEof == 0)
 		return false;
 
 	open_datumstreamread_segfile(aocsFetchDesc->basepath, aocsFetchDesc->relation->rd_node,
@@ -1608,7 +1593,7 @@ aocs_update(AOCSUpdateDesc desc, TupleTableSlot *slot,
 
 #ifdef FAULT_INJECTOR
 	FaultInjector_InjectFaultIfSet(
-								   AppendOnlyUpdate,
+								   "appendonly_update",
 								   DDLNotSpecified,
 								   "", //databaseName
 								   RelationGetRelationName(desc->insertDesc->aoi_rel));
@@ -1709,7 +1694,7 @@ aocs_delete(AOCSDeleteDesc aoDeleteDesc,
 
 #ifdef FAULT_INJECTOR
 	FaultInjector_InjectFaultIfSet(
-								   AppendOnlyDelete,
+								   "appendonly_delete",
 								   DDLNotSpecified,
 								   "",	/* databaseName */
 								   RelationGetRelationName(aoDeleteDesc->aod_rel)); /* tableName */
@@ -1834,7 +1819,8 @@ aocs_addcol_init(Relation rel,
 		blksz = opts[iattr]->blocksize;
 		desc->dsw[i] = create_datumstreamwrite(ct, clvl, rel->rd_appendonly->checksum, 0, blksz /* safeFSWriteSize */ ,
 											   attr, RelationGetRelationName(rel),
-											   titleBuf.data);
+											   titleBuf.data,
+											   RelationNeedsWAL(rel));
 	}
 	return desc;
 }

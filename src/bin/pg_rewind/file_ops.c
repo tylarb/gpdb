@@ -8,7 +8,7 @@
  * do nothing if it's enabled. You should avoid accessing the target files
  * directly but if you do, make sure you honor the --dry-run mode!
  *
- * Portions Copyright (c) 2013-2015, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2013-2016, PostgreSQL Global Development Group
  *
  *-------------------------------------------------------------------------
  */
@@ -34,7 +34,7 @@ static void create_target_dir(const char *path);
 static void remove_target_dir(const char *path);
 static void create_target_symlink(const char *path, const char *link);
 static void remove_target_symlink(const char *path);
-
+static void create_target_tablespace_layout(const char *path, const char *link);
 /*
  * Open a target file for writing. If 'trunc' is true and the file already
  * exists, it will be truncated.
@@ -134,6 +134,7 @@ remove_target(file_entry_t *entry)
 			break;
 
 		case FILE_TYPE_REGULAR:
+		case FILE_TYPE_FIFO:
 			remove_target_file(entry->path, false);
 			break;
 
@@ -155,12 +156,20 @@ create_target(file_entry_t *entry)
 			break;
 
 		case FILE_TYPE_SYMLINK:
-			create_target_symlink(entry->path, entry->link_target);
+			if(entry->is_gp_tablespace)
+				create_target_tablespace_layout(entry->path, entry->link_target);
+			else
+				create_target_symlink(entry->path, entry->link_target);
 			break;
 
 		case FILE_TYPE_REGULAR:
 			/* can't happen. Regular files are created with open_target_file. */
 			pg_fatal("invalid action (CREATE) for regular file\n");
+			break;
+
+		case FILE_TYPE_FIFO:
+			/* Only pgsql_tmp files are FIFO and they are ignored from source target. */
+			pg_fatal("invalid action (CREATE) for fifo file\n");
 			break;
 	}
 }
@@ -266,6 +275,33 @@ remove_target_symlink(const char *path)
 		pg_fatal("could not remove symbolic link \"%s\": %s\n",
 				 dstpath, strerror(errno));
 }
+
+/* Create symlink for tablespace, create tablespace target dir */
+static void
+create_target_tablespace_layout(const char *path, const char *link)
+{
+	char		dstpath[MAXPGPATH];
+	char		*newlink;
+
+	if (dry_run)
+		return;
+
+	/* Append the target dbid to the symlink target. */
+	newlink = psprintf("%s/%d", link, dbid_target);
+
+	snprintf(dstpath, sizeof(dstpath), "%s/%s", datadir_target, path);
+	if (symlink(newlink, dstpath) != 0)
+		pg_fatal("could not create symbolic link at \"%s\": %s\n",
+				 dstpath, strerror(errno));
+
+	/* We need to create the directory at the symlink target. */
+	if (mkdir(newlink, S_IRWXU) != 0)
+		pg_fatal("could not create directory \"%s\": %s\n",
+				 dstpath, strerror(errno));
+
+	pfree(newlink);
+}
+
 
 
 /*

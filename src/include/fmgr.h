@@ -8,7 +8,7 @@
  * or call fmgr-callable functions.
  *
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/fmgr.h
@@ -301,6 +301,7 @@ extern struct varlena *pg_detoast_datum_packed(struct varlena * datum);
 #define PG_RETURN_INT32(x)	 return Int32GetDatum(x)
 #define PG_RETURN_UINT32(x)  return UInt32GetDatum(x)
 #define PG_RETURN_INT16(x)	 return Int16GetDatum(x)
+#define PG_RETURN_UINT16(x)  return UInt16GetDatum(x)
 #define PG_RETURN_CHAR(x)	 return CharGetDatum(x)
 #define PG_RETURN_BOOL(x)	 return BoolGetDatum(x)
 #define PG_RETURN_OID(x)	 return ObjectIdGetDatum(x)
@@ -348,11 +349,18 @@ typedef const Pg_finfo_record *(*PGFInfoFunction) (void);
 
 /*
  *	Macro to build an info function associated with the given function name.
- *	Win32 loadable functions usually link with 'dlltool --export-all', but it
- *	doesn't hurt to add PGDLLIMPORT in case they don't.
+ *
+ *	As a convenience, also provide an "extern" declaration for the given
+ *	function name, so that writers of C functions need not write that too.
+ *
+ *	On Windows, the function and info function must be exported.  Our normal
+ *	build processes take care of that via .DEF files or --export-all-symbols.
+ *	Module authors using a different build process might need to manually
+ *	declare the function PGDLLEXPORT.  We do that automatically here for the
+ *	info function, since authors shouldn't need to be explicitly aware of it.
  */
 #define PG_FUNCTION_INFO_V1(funcname) \
-Datum funcname(PG_FUNCTION_ARGS); \
+extern Datum funcname(PG_FUNCTION_ARGS); \
 extern PGDLLEXPORT const Pg_finfo_record * CppConcat(pg_finfo_,funcname)(void); \
 const Pg_finfo_record * \
 CppConcat(pg_finfo_,funcname) (void) \
@@ -536,9 +544,9 @@ extern Datum FunctionCall9Coll(FmgrInfo *flinfo, Oid collation,
 
 /* These are for invocation of a function identified by OID with a
  * directly-computed parameter list.  Note that neither arguments nor result
- * are allowed to be NULL.  These are essentially FunctionLookup() followed
- * by FunctionCallN().  If the same function is to be invoked repeatedly,
- * do the FunctionLookup() once and then use FunctionCallN().
+ * are allowed to be NULL.  These are essentially fmgr_info() followed by
+ * FunctionCallN().  If the same function is to be invoked repeatedly, do the
+ * fmgr_info() once and then use FunctionCallN().
  */
 extern Datum OidFunctionCall0Coll(Oid functionId, Oid collation);
 extern Datum OidFunctionCall1Coll(Oid functionId, Oid collation,
@@ -673,6 +681,9 @@ extern PGFunction load_external_function(char *filename, char *funcname,
 extern PGFunction lookup_external_function(void *filehandle, char *funcname);
 extern void load_file(const char *filename, bool restricted);
 extern void **find_rendezvous_variable(const char *varName);
+extern Size EstimateLibraryStateSpace(void);
+extern void SerializeLibraryState(Size maxsize, char *start_address);
+extern void RestoreLibraryState(char *start_address);
 
 /*
  * Support for aggregate functions

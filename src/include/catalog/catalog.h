@@ -4,7 +4,7 @@
  *	  prototypes for functions in backend/catalog/catalog.c
  *
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/catalog/catalog.h
@@ -25,13 +25,21 @@
 
 #define OIDCHARS		10		/* max chars printed by %u */
 /*
- * In PostgreSQL, this is called just TABLESPACE_VERSION_DIRECTORY. But in 
- * GPDB, you should use tablespace_version_directory() function instead.
+ * In PostgreSQL, this is called just TABLESPACE_VERSION_DIRECTORY..
  * This constant has been renamed so that we catch and know to modify all
  * upstream uses of TABLESPACE_VERSION_DIRECTORY.
  */
 #define GP_TABLESPACE_VERSION_DIRECTORY	"GPDB_" GP_MAJORVERSION "_" \
 									CppAsString2(CATALOG_VERSION_NO)
+
+/*
+ * This file is used to store internal configuration information specific to a
+ * server that's not same between primary and mirror pair. For example it
+ * stores gp_dbid, which is different for primary and mirror pair, even if
+ * contentid is same for them. This file is not copied over during
+ * pg_basebackup and pg_rewind to mirror from primary.
+ */
+#define GP_INTERNAL_AUTO_CONF_FILE_NAME "internal.auto.conf"
 
 extern bool IsSystemRelation(Relation relation);
 extern bool IsToastRelation(Relation relation);

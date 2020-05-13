@@ -3,7 +3,7 @@
  * postgres.c
  *	  POSTGRES C Backend Interface
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -22,7 +22,6 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <signal.h>
-#include <time.h>
 #include <unistd.h>
 #include <sys/socket.h>
 #ifdef HAVE_SYS_SELECT_H
@@ -39,7 +38,7 @@
 
 #include <pthread.h>
 
-#include "access/distributedlog.h"
+#include "access/parallel.h"
 #include "access/printtup.h"
 #include "access/xact.h"
 #include "catalog/oid_dispatch.h"
@@ -79,7 +78,6 @@
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/ps_status.h"
-#include "utils/datum.h"
 #include "utils/snapmgr.h"
 #include "utils/timeout.h"
 #include "utils/timestamp.h"
@@ -97,8 +95,6 @@
 #include "access/twophase.h"
 #include "postmaster/backoff.h"
 #include "utils/resource_manager.h"
-#include "pgstat.h"
-#include "executor/nodeFunctionscan.h"
 
 #include "utils/session_state.h"
 #include "utils/vmem_tracker.h"
@@ -166,13 +162,6 @@ char	   *register_stack_base_ptr = NULL;
 #endif
 
 /*
- * Flag to mark SIGHUP. Whenever the main loop comes around it
- * will reread the configuration file. (Better than doing the
- * reading in the signal handler, ey?)
- */
-static volatile sig_atomic_t got_SIGHUP = false;
-
-/*
  * Flag to keep track of whether we have started a transaction.
  * For extended query protocol this has to be remembered across messages.
  */
@@ -205,12 +194,9 @@ static CachedPlanSource *unnamed_stmt_psrc = NULL;
 
 /* assorted command-line switches */
 static const char *userDoption = NULL;	/* -D switch */
-
 static bool EchoQuery = false;	/* -E switch */
+static bool UseSemiNewlineNewline = false;		/* -j switch */
 
-static bool DoingPqReading = false; /* in the middle of recv call of secure_read */
-
-extern pthread_t main_tid;
 #ifndef _WIN32
 pthread_t main_tid = (pthread_t)0;
 #else
@@ -220,16 +206,6 @@ pthread_t main_tid = {0,0};
 /* if we're in the middle of dying, let our threads exit with some dignity */
 static volatile sig_atomic_t in_quickdie = false;
 
-/*
- * people who want to use EOF should #define DONTUSENEWLINE in
- * tcop/tcopdebug.h
- */
-#ifndef TCOP_DONTUSENEWLINE
-static int	UseNewLine = 1;		/* Use newlines query delimiters (the default) */
-#else
-static int	UseNewLine = 0;		/* Use EOF as query delimiters */
-#endif   /* TCOP_DONTUSENEWLINE */
-
 /* whether or not, and why, we were canceled by conflict with recovery */
 static bool RecoveryConflictPending = false;
 static bool RecoveryConflictRetryable = true;
@@ -237,11 +213,6 @@ static ProcSignalReason RecoveryConflictReason;
 
 static DtxContextInfo TempDtxContextInfo = DtxContextInfo_StaticInit;
 
-extern void CheckForQDMirroringWork(void);
-
-extern void CheckForResetSession(void);
-
-extern bool ResourceScheduler;
 
 /* ----------------------------------------------------------------
  *		decls for routines only used in this file
@@ -264,7 +235,6 @@ static bool IsTransactionExitStmt(Node *parsetree);
 static bool IsTransactionExitStmtList(List *parseTrees);
 static bool IsTransactionStmtList(List *parseTrees);
 static void drop_unnamed_stmt(void);
-static void SigHupHandler(SIGNAL_ARGS);
 static void log_disconnections(int code, Datum arg);
 static bool CheckDebugDtmActionSqlCommandTag(const char *sqlCommandTag);
 static bool CheckDebugDtmActionProtocol(DtxProtocolCommand dtxProtocolCommand,
@@ -325,8 +295,6 @@ static int
 InteractiveBackend(StringInfo inBuf)
 {
 	int			c;				/* character read from getc() */
-	bool		end = false;	/* end-of-input flag */
-	bool		backslashSeen = false;	/* have we seen a \ ? */
 
 	/*
 	 * display a prompt and obtain input from the user
@@ -336,55 +304,56 @@ InteractiveBackend(StringInfo inBuf)
 
 	resetStringInfo(inBuf);
 
-	if (UseNewLine)
+	/*
+	 * Read characters until EOF or the appropriate delimiter is seen.
+	 */
+	while ((c = interactive_getc()) != EOF)
 	{
-		/*
-		 * if we are using \n as a delimiter, then read characters until the
-		 * \n.
-		 */
-		while ((c = interactive_getc()) != EOF)
+		if (c == '\n')
 		{
-			if (c == '\n')
+			if (UseSemiNewlineNewline)
 			{
-				if (backslashSeen)
+				/*
+				 * In -j mode, semicolon followed by two newlines ends the
+				 * command; otherwise treat newline as regular character.
+				 */
+				if (inBuf->len > 1 &&
+					inBuf->data[inBuf->len - 1] == '\n' &&
+					inBuf->data[inBuf->len - 2] == ';')
+				{
+					/* might as well drop the second newline */
+					break;
+				}
+			}
+			else
+			{
+				/*
+				 * In plain mode, newline ends the command unless preceded by
+				 * backslash.
+				 */
+				if (inBuf->len > 0 &&
+					inBuf->data[inBuf->len - 1] == '\\')
 				{
 					/* discard backslash from inBuf */
 					inBuf->data[--inBuf->len] = '\0';
-					backslashSeen = false;
+					/* discard newline too */
 					continue;
 				}
 				else
 				{
-					/* keep the newline character */
+					/* keep the newline character, but end the command */
 					appendStringInfoChar(inBuf, '\n');
 					break;
 				}
 			}
-			else if (c == '\\')
-				backslashSeen = true;
-			else
-				backslashSeen = false;
-
-			appendStringInfoChar(inBuf, (char) c);
 		}
 
-		if (c == EOF)
-			end = true;
-	}
-	else
-	{
-		/*
-		 * otherwise read characters until EOF.
-		 */
-		while ((c = interactive_getc()) != EOF)
-			appendStringInfoChar(inBuf, (char) c);
-
-		/* No input before EOF signal means time to quit. */
-		if (inBuf->len == 0)
-			end = true;
+		/* Not newline, or newline treated as regular character */
+		appendStringInfoChar(inBuf, (char) c);
 	}
 
-	if (end)
+	/* No input before EOF signal means time to quit. */
+	if (c == EOF && inBuf->len == 0)
 		return EOF;
 
 	/*
@@ -408,17 +377,29 @@ InteractiveBackend(StringInfo inBuf)
  * interactive_getc -- collect one character from stdin
  *
  * Even though we are not reading from a "client" process, we still want to
- * respond to signals, particularly SIGTERM/SIGQUIT.  Hence we must use
- * prepare_for_client_read and client_read_ended.
+ * respond to signals, particularly SIGTERM/SIGQUIT.
  */
 static int
 interactive_getc(void)
 {
 	int			c;
 
-	prepare_for_client_read();
+	/*
+	 * This will not process catchup interrupts or notifications while
+	 * reading. But those can't really be relevant for a standalone backend
+	 * anyway. To properly handle SIGTERM there's a hack in die() that
+	 * directly processes interrupts at this stage...
+	 */
+	CHECK_FOR_INTERRUPTS();
+
+	enable_client_wait_timeout_interrupt();
+
 	c = getc(stdin);
-	client_read_ended();
+
+	disable_client_wait_timeout_interrupt();
+
+	ProcessClientReadInterrupt(true);
+
 	return c;
 }
 
@@ -438,6 +419,8 @@ SocketBackend(StringInfo inBuf)
 	/*
 	 * Get message type code from the frontend.
 	 */
+	HOLD_CANCEL_INTERRUPTS();
+	pq_startmsgread();
 	qtype = pq_getbyte();
 
 	if (qtype == EOF)			/* frontend disconnected */
@@ -507,7 +490,7 @@ SocketBackend(StringInfo inBuf)
 			if( PG_PROTOCOL_MAJOR(FrontendProtocol) < 3 )
 					ereport(COMMERROR,
 							(errcode(ERRCODE_PROTOCOL_VIOLATION),
-							 errmsg("Greenplum Database dispatch unsupported for old FrontendProtocols.")));
+							 errmsg("dispatch unsupported for old FrontendProtocols")));
 
 
 			break;
@@ -520,17 +503,36 @@ SocketBackend(StringInfo inBuf)
 			if( PG_PROTOCOL_MAJOR(FrontendProtocol) < 3 )
 					ereport(COMMERROR,
 							(errcode(ERRCODE_PROTOCOL_VIOLATION),
-							 errmsg("Greenplum Database dispatch unsupported for old FrontendProtocols.")));
+							 errmsg("dispatch unsupported for old FrontendProtocols")));
 
 
-			break;
-		case 'G':				/* Greenplum Gang Management */
-			doing_extended_query_message = false;
 			break;
 
 		case 'F':				/* fastpath function call */
-			/* we let fastpath.c cope with old-style input of this */
 			doing_extended_query_message = false;
+			if (PG_PROTOCOL_MAJOR(FrontendProtocol) < 3)
+			{
+				if (GetOldFunctionMessage(inBuf))
+				{
+					if (IsTransactionState())
+						ereport(COMMERROR,
+								(errcode(ERRCODE_CONNECTION_FAILURE),
+								 errmsg("unexpected EOF on client connection with an open transaction")));
+					else
+					{
+						/*
+						 * Can't send DEBUG log messages to client at this
+						 * point. Since we're disconnecting right away, we
+						 * don't need to restore whereToSendOutput.
+						 */
+						whereToSendOutput = DestNone;
+						ereport(DEBUG1,
+								(errcode(ERRCODE_CONNECTION_DOES_NOT_EXIST),
+							 errmsg("unexpected EOF on client connection")));
+					}
+					return EOF;
+				}
+			}
 			break;
 
 		case 'X':				/* terminate */
@@ -575,10 +577,6 @@ SocketBackend(StringInfo inBuf)
 						 errmsg("invalid frontend message type %d", qtype)));
 			break;
 
-		case 'W':   /* Greenplum Database command for transmitting listener port. */
-
-			break;
-
 		default:
 
 			/*
@@ -602,6 +600,9 @@ SocketBackend(StringInfo inBuf)
 		if (pq_getmessage(inBuf, 0))
 			return EOF;			/* suitable message already logged */
 	}
+	else
+		pq_endmsgread();
+	RESUME_CANCEL_INTERRUPTS();
 
 	return qtype;
 }
@@ -618,7 +619,7 @@ ReadCommand(StringInfo inBuf)
 {
 	int			result;
 
-	SIMPLE_FAULT_INJECTOR(BeforeReadCommand);
+	SIMPLE_FAULT_INJECTOR("before_read_command");
 
 	if (whereToSendOutput == DestRemote)
 		result = SocketBackend(inBuf);
@@ -628,119 +629,78 @@ ReadCommand(StringInfo inBuf)
 }
 
 /*
- * prepare_for_client_read -- set up to possibly block on client input
+ * ProcessClientReadInterrupt() - Process interrupts specific to client reads
  *
- * This must be called immediately before any low-level read from the
- * client connection.  It is necessary to do it at a sufficiently low level
- * that there won't be any other operations except the read kernel call
- * itself between this call and the subsequent client_read_ended() call.
- * In particular there mustn't be use of malloc() or other potentially
- * non-reentrant libc functions.  This restriction makes it safe for us
- * to allow interrupt service routines to execute nontrivial code while
- * we are waiting for input.
+ * This is called just after low-level reads. That might be after the read
+ * finished successfully, or it was interrupted via interrupt.
  *
- * When waiting in the main loop, we can process any interrupt immediately
- * in the signal handler. In any other read from the client, like in a COPY
- * FROM STDIN, we can't safely process a query cancel signal, because we might
- * be in the middle of sending a message to the client, and jumping out would
- * violate the protocol. Or rather, pqcomm.c would detect it and refuse to
- * send any more messages to the client. But handling a SIGTERM is OK, because
- * we're terminating the backend and don't need to send any more messages
- * anyway. That means that we might not be able to send an error message to
- * the client, but that seems better than waiting indefinitely, in case the
- * client is not responding.
+ * Must preserve errno!
  */
 void
-prepare_for_client_read(void)
+ProcessClientReadInterrupt(bool blocked)
 {
+	int			save_errno = errno;
+
 	if (DoingCommandRead)
 	{
-		/* Enable immediate processing of asynchronous signals */
-		EnableNotifyInterrupt();
-		EnableCatchupInterrupt();
-		EnableClientWaitTimeoutInterrupt();
+		/* Check for general interrupts that arrived while reading */
+		CHECK_FOR_INTERRUPTS();
 
-		/* Allow cancel/die interrupts to be processed while waiting */
-		ImmediateInterruptOK = true;
+		/* Process sinval catchup interrupts that happened while reading */
+		if (catchupInterruptPending)
+			ProcessCatchupInterrupt();
 
-		/* And don't forget to detect one that already arrived */
+		/* Process sinval catchup interrupts that happened while reading */
+		if (notifyInterruptPending)
+			ProcessNotifyInterrupt();
+	}
+	else if (ProcDiePending && blocked)
+	{
+		/*
+		 * We're dying. It's safe (and sane) to handle that now.
+		 */
 		CHECK_FOR_INTERRUPTS();
 	}
-	else
-	{
-		DoingPqReading = true;
-		/* Allow die interrupts to be processed while waiting */
-		ImmediateDieOK = true;
 
-		/* Process the ones that already arrived */
-		if (ProcDiePending)
-		{
-			CHECK_FOR_INTERRUPTS();
-		}
-	}
+	errno = save_errno;
 }
 
 /*
- * client_read_ended -- get out of the client-input state
+ * ProcessClientWriteInterrupt() - Process interrupts specific to client writes
  *
- * This is called just after low-level reads.  It must preserve errno!
+ * This is called just after low-level writes. That might be after the read
+ * finished successfully, or it was interrupted via interrupt. 'blocked' tells
+ * us whether the
+ *
+ * Must preserve errno!
  */
 void
-client_read_ended(void)
+ProcessClientWriteInterrupt(bool blocked)
 {
-	if (DoingCommandRead)
+	int			save_errno = errno;
+
+	/*
+	 * We only want to process the interrupt here if socket writes are
+	 * blocking to increase the chance to get an error message to the client.
+	 * If we're not blocked there'll soon be a CHECK_FOR_INTERRUPTS(). But if
+	 * we're blocked we'll never get out of that situation if the client has
+	 * died.
+	 */
+	if (ProcDiePending && blocked)
 	{
-		int			save_errno = errno;
+		/*
+		 * We're dying. It's safe (and sane) to handle that now. But we don't
+		 * want to send the client the error message as that a) would possibly
+		 * block again b) would possibly lead to sending an error message to
+		 * the client, while we already started to send something else.
+		 */
+		if (whereToSendOutput == DestRemote)
+			whereToSendOutput = DestNone;
 
-		ImmediateInterruptOK = false;
-
-		DisableNotifyInterrupt();
-		DisableCatchupInterrupt();
-		DisableClientWaitTimeoutInterrupt();
-
-		errno = save_errno;
+		CHECK_FOR_INTERRUPTS();
 	}
-	else
-	{
-		ImmediateDieOK = false;
-		DoingPqReading = false;
-	}
-}
 
-/*
- * prepare_for_client_write -- set up to possibly block on client output
- *
- * Like prepare_for_client_read, but for writing.
- *
- * NOTE: this routine may be called in dispatch thread;
- */
-void
-prepare_for_client_write(void)
-{
-	/* Only enable this on main thread */
-	if (pthread_equal(main_tid, pthread_self()))
-	{
-		/* Allow die interrupts to be processed while waiting */
-		ImmediateDieOK = true;
-
-		/* And don't forget to detect one that already arrived */
-		if (ProcDiePending)
-			CHECK_FOR_INTERRUPTS();
-	}
-}
-
-/*
- * client_read_ended -- get out of the client-output state
- *
- * This is called just after low-level writes.
- */
-void
-client_write_ended(void)
-{
-	if (pthread_equal(main_tid, pthread_self()))
-	{
-		ImmediateDieOK = false;
-	}
+	errno = save_errno;
 }
 
 /*
@@ -1002,7 +962,7 @@ pg_plan_queries(List *querytrees, int cursorOptions, ParamListInfo boundParams)
 
 	foreach(query_list, querytrees)
 	{
-		Query	   *query = (Query *) lfirst(query_list);
+		Query	   *query = castNode(Query, lfirst(query_list));
 		Node	   *stmt;
 
 		if (query->commandType == CMD_UTILITY)
@@ -1029,7 +989,6 @@ pg_plan_queries(List *querytrees, int cursorOptions, ParamListInfo boundParams)
  * query_string -- optional query text (C string).
  * serializedQuerytree[len]  -- Query node or (NULL,0) if plan provided.
  * serializedPlantree[len] -- PlannedStmt node, or (NULL,0) if query provided.
- * serializedParams[len] -- optional parameters
  * serializedQueryDispatchDesc[len] -- QueryDispatchDesc node, or (NULL,0) if query provided.
  *
  * Caller may supply either a Query (representing utility command) or
@@ -1039,7 +998,6 @@ static void
 exec_mpp_query(const char *query_string,
 			   const char * serializedQuerytree, int serializedQuerytreelen,
 			   const char * serializedPlantree, int serializedPlantreelen,
-			   const char * serializedParams, int serializedParamslen,
 			   const char * serializedQueryDispatchDesc, int serializedQueryDispatchDesclen)
 {
 	CommandDest dest = whereToSendOutput;
@@ -1052,7 +1010,7 @@ exec_mpp_query(const char *query_string,
 	QueryDispatchDesc *ddesc = NULL;
 	CmdType		commandType = CMD_UNKNOWN;
 	SliceTable *sliceTable = NULL;
-	Slice      *slice = NULL;
+	ExecSlice  *slice = NULL;
 	ParamListInfo paramLI = NULL;
 
 	Assert(Gp_role == GP_ROLE_EXECUTE);
@@ -1136,24 +1094,24 @@ exec_mpp_query(const char *query_string,
 
 		if (sliceTable)
 		{
-			ListCell *lc;
+			int			i;
 
 			if (!IsA(sliceTable, SliceTable) ||
 				sliceTable->localSlice < 0 ||
-				sliceTable->localSlice >= list_length(sliceTable->slices))
+				sliceTable->localSlice >= sliceTable->numSlices)
 				elog(ERROR, "MPPEXEC: received invalid slice table: %d", sliceTable->localSlice);
 
 			/* Identify slice to execute */
-			foreach(lc, sliceTable->slices)
+			for (i = 0; i < sliceTable->numSlices; i++)
 			{
-				slice = (Slice *)lfirst(lc);
+				slice = &sliceTable->slices[i];
+
 				if (bms_is_member(qe_identifier, slice->processesMap))
 					break;
 			}
-
+			if (i == sliceTable->numSlices)
+				elog(ERROR, "could not find QE identifier in process map");
 			sliceTable->localSlice = slice->sliceIndex;
-
-			Assert(IsA(slice, Slice));
 
 			/* Set global sliceid variable for elog. */
 			currentSliceId = sliceTable->localSlice;
@@ -1224,10 +1182,11 @@ exec_mpp_query(const char *query_string,
 	}
 
 	/*
-	 * Get (possibly 0) parameters.
+	 * Get (possibly 0) PARAM_EXTERN parameters. (PARAM_EXEC parameter
+	 * will be handled later, in InitPlan()).
 	 */
-	if (serializedParams != NULL && serializedParamslen > 0)
-		paramLI = deserializeParamListInfo(serializedParams, serializedParamslen);
+	if (ddesc && ddesc->paramInfo)
+		paramLI = deserializeExternParams(ddesc->paramInfo);
 	else
 		paramLI = NULL;
 
@@ -1459,21 +1418,18 @@ CheckDebugDtmActionProtocol(DtxProtocolCommand dtxProtocolCommand,
 
 static void
 exec_mpp_dtx_protocol_command(DtxProtocolCommand dtxProtocolCommand,
-							  int flags, const char *loggingStr,
-							  const char *gid, DistributedTransactionId gxid,
+							  const char *loggingStr,
+							  const char *gid,
 							  DtxContextInfo *contextInfo)
 {
 	CommandDest dest = whereToSendOutput;
 	const char *commandTag = loggingStr;
 
 	if (log_statement == LOGSTMT_ALL)
-	{
-		elog(LOG,"DTM protocol command '%s' for gid = %s",
-			 loggingStr, gid);
-	}
+		elog(LOG,"DTM protocol command '%s' for gid = %s", loggingStr, gid);
 
-	elog((Debug_print_full_dtm ? LOG : DEBUG5),"exec_mpp_dtx_protocol_command received the dtxProtocolCommand = %d (%s) gid = %s (gxid = %u, flags = 0x%x)",
-		 dtxProtocolCommand, loggingStr, gid, gxid, flags);
+	elog((Debug_print_full_dtm ? LOG : DEBUG5),"exec_mpp_dtx_protocol_command received the dtxProtocolCommand = %d (%s) gid = %s",
+		 dtxProtocolCommand, loggingStr, gid);
 
 	set_ps_display(commandTag, false);
 
@@ -1507,7 +1463,7 @@ exec_mpp_dtx_protocol_command(DtxProtocolCommand dtxProtocolCommand,
 
 	BeginCommand(commandTag, dest);
 
-	performDtxProtocolCommand(dtxProtocolCommand, flags, loggingStr, gid, gxid, contextInfo);
+	performDtxProtocolCommand(dtxProtocolCommand, gid, contextInfo);
 
 	elog((Debug_print_full_dtm ? LOG : DEBUG5),"exec_mpp_dtx_protocol_command calling EndCommand for dtxProtocolCommand = %d (%s) gid = %s",
 		 dtxProtocolCommand, loggingStr, gid);
@@ -1520,6 +1476,16 @@ exec_mpp_dtx_protocol_command(DtxProtocolCommand dtxProtocolCommand,
 				 errmsg("Raise error for debug_dtm_action = %d, debug_dtm_action_protocol = %s",
 						Debug_dtm_action, DtxProtocolCommandToString(dtxProtocolCommand))));
 	}
+
+	/*
+	 * GPDB: There is a corner case that we need to delay connection
+	 * termination to here. see SyncRepWaitForLSN() for details.
+	 * */
+	if (ProcDiePending)
+		ereport(FATAL,
+				(errcode(ERRCODE_ADMIN_SHUTDOWN),
+				errmsg("Terminating the connection (DTM protocol command '%s' "
+					   "for gid=%s", loggingStr, gid)));
 
 	EndCommand(commandTag, dest);
 }
@@ -1540,6 +1506,36 @@ CheckDebugDtmActionSqlCommandTag(const char *sqlCommandTag)
 		(result ? "true" : "false"));
 
 	return result;
+}
+
+static void
+restore_guc_to_QE(void )
+{
+	Assert(Gp_role == GP_ROLE_DISPATCH && gp_guc_restore_list);
+	ListCell *lc;
+
+	start_xact_command();
+
+	foreach(lc, gp_guc_restore_list)
+	{
+		struct config_generic* gconfig = (struct config_generic *)lfirst(lc);
+		PG_TRY();
+		{
+			DispatchSyncPGVariable(gconfig);
+		}
+		PG_CATCH();
+		{
+			/* if some guc can not restore successful
+			 * we can not keep alive gang anymore.
+			 */
+			DisconnectAndDestroyAllGangs(false);
+		}
+		PG_END_TRY();
+	}
+
+	finish_xact_command();
+	list_free(gp_guc_restore_list);
+	gp_guc_restore_list = NIL;
 }
 
 /*
@@ -1721,7 +1717,8 @@ exec_simple_query(const char *query_string)
 		querytree_list = pg_analyze_and_rewrite(parsetree, query_string,
 												NULL, 0);
 
-		plantree_list = pg_plan_queries(querytree_list, 0, NULL);
+		plantree_list = pg_plan_queries(querytree_list,
+										CURSOR_OPT_PARALLEL_OK, NULL);
 
 		/* Done with the snapshot used for parsing/planning */
 		if (snapshot_set)
@@ -1995,6 +1992,21 @@ exec_parse_message(const char *query_string,	/* string to execute */
 
 		raw_parse_tree = (Node *) linitial(parsetree_list);
 
+		if (IsA(raw_parse_tree, SelectStmt))
+		{
+			/*
+			 * For extended query protocol, we cannot optimize to avoid
+			 * ExclusiveLock in case of select-for-update and similar queries.
+			 * If the subsequent 'E' message requests only a specific number
+			 * of rows to be fetched, the command must be executed like a
+			 * cursor and LockRows plan node cannot be executed within a
+			 * reader gang (cursors in Greenplum must be executed by a reader gang).
+			 * For details please refer the mailing list:
+			 * https://groups.google.com/a/greenplum.org/forum/#!msg/gpdb-dev/ugsZca1qLXU/CtUmzEa7CAAJ
+			 */
+			((SelectStmt *)raw_parse_tree)->disableLockingOptimization = true;
+		}
+
 		/*
 		 * Get the command name for possible use in status display.
 		 */
@@ -2100,7 +2112,7 @@ exec_parse_message(const char *query_string,	/* string to execute */
 					   numParams,
 					   NULL,
 					   NULL,
-					   0,		/* default cursor options */
+					   CURSOR_OPT_PARALLEL_OK,	/* allow parallel mode */
 					   true);	/* fixed result */
 
 	/* If we got a cancel signal during analysis, quit */
@@ -2333,15 +2345,15 @@ exec_bind_message(StringInfo input_message)
 	{
 		int			paramno;
 
-		/* sizeof(ParamListInfoData) includes the first array element */
-		params = (ParamListInfo) palloc(sizeof(ParamListInfoData) +
-								  (numParams - 1) * sizeof(ParamExternData));
+		params = (ParamListInfo) palloc(offsetof(ParamListInfoData, params) +
+										numParams * sizeof(ParamExternData));
 		/* we have static list of params, so no hooks needed */
 		params->paramFetch = NULL;
 		params->paramFetchArg = NULL;
 		params->parserSetup = NULL;
 		params->parserSetupArg = NULL;
 		params->numParams = numParams;
+		params->paramMask = NULL;
 
 		for (paramno = 0; paramno < numParams; paramno++)
 		{
@@ -2797,7 +2809,7 @@ exec_execute_message(const char *portal_name, int64 max_rows)
  * check_log_statement
  *		Determine whether command should be logged because of log_statement
  *
- * parsetree_list can be either raw grammar output or a list of planned
+ * stmt_list can be either raw grammar output or a list of planned
  * statements
  */
 static bool
@@ -3357,24 +3369,19 @@ quickdie_impl()
 		whereToSendOutput = DestNone;
 
 	/*
-	 * We DO NOT want to run proc_exit() callbacks -- we're here because
-	 * shared memory may be corrupted, so we don't want to try to clean up our
-	 * transaction.  Just nail the windows shut and get out of town.  Now that
-	 * there's an atexit callback to prevent third-party code from breaking
-	 * things by calling exit() directly, we have to reset the callbacks
-	 * explicitly to make this work as intended.
-	 */
-	on_exit_reset();
-
-	/*
-	 * Note we do exit(2) not exit(0).  This is to force the postmaster into a
-	 * system reset cycle if some idiot DBA sends a manual SIGQUIT to a random
+	 * We DO NOT want to run proc_exit() or atexit() callbacks -- we're here
+	 * because shared memory may be corrupted, so we don't want to try to
+	 * clean up our transaction.  Just nail the windows shut and get out of
+	 * town.  The callbacks wouldn't be safe to run from a signal handler,
+	 * anyway.
+	 *
+	 * Note we do _exit(2) not _exit(0).  This is to force the postmaster into
+	 * a system reset cycle if someone sends a manual SIGQUIT to a random
 	 * backend.  This is necessary precisely because we don't clean up our
 	 * shared memory state.  (The "dead man switch" mechanism in pmsignal.c
 	 * should ensure the postmaster sees this as a crash, too, but no harm in
 	 * being doubly sure.)
 	 */
-
 	_exit(2);
 }
 
@@ -3392,53 +3399,19 @@ die(SIGNAL_ARGS)
 	{
 		InterruptPending = true;
 		ProcDiePending = true;
-		TermSignalReceived = true;
-
-		/* although we don't strictly need to set this to true since the
-		 * ProcDiePending will occur first.  We set this anyway since the
-		 * MPP dispatch code is triggered only off of QueryCancelPending
-		 * and not any of the others.
-		 */
-		QueryCancelPending = true;
-
-		if (cancel_pending_hook)
-			(*cancel_pending_hook)();
-
-		/*
-		 * If it's safe to interrupt, and we're waiting for input or a lock,
-		 * service the interrupt immediately
-		 */
-		if ((ImmediateInterruptOK || ImmediateDieOK) &&
-			InterruptHoldoffCount == 0 && CritSectionCount == 0)
-		{
-			if (ImmediateDieOK && !DoingPqReading)
-			{
-				/*
-				 * Getting here indicates that we have been interrupted during a
-				 * data message is under sending to client, so close the connection
-				 * immediately, since sending any more bytes may cause self dead
-				 * lock(though we can handle this using pq_send_mutex_lock() now, it
-				 * is better to avoid the unnecessary cost).
-				 */
-				close(MyProcPort->sock);
-				whereToSendOutput = DestNone;
-			}
-
-			/* bump holdoff count to make ProcessInterrupts() a no-op */
-			/* until we are done getting ready for it */
-			InterruptHoldoffCount++;
-			LockErrorCleanup(); /* prevent CheckDeadLock from running */
-			DisableNotifyInterrupt();
-			DisableCatchupInterrupt();
-			DisableClientWaitTimeoutInterrupt();
-			InterruptHoldoffCount--;
-			ProcessInterrupts(__FILE__, __LINE__);
-		}
 	}
 
 	/* If we're still here, waken anything waiting on the process latch */
-	if (MyProc)
-		SetLatch(&MyProc->procLatch);
+	SetLatch(MyLatch);
+
+	/*
+	 * If we're in single user mode, we want to quit immediately - we can't
+	 * rely on latches as they wouldn't work when stdin/stdout is a file.
+	 * Rather ugly, but it's unlikely to be worthwhile to invest much more
+	 * effort just for the benefit of single user mode.
+	 */
+	if (DoingCommandRead && whereToSendOutput != DestRemote)
+		ProcessInterrupts(__FILE__, __LINE__);
 
 	errno = save_errno;
 }
@@ -3463,28 +3436,10 @@ StatementCancelHandler(SIGNAL_ARGS)
 
 		if (cancel_pending_hook)
 			(*cancel_pending_hook)();
-
-		/*
-		 * If it's safe to interrupt, and we're waiting for input or a lock,
-		 * service the interrupt immediately
-		 */
-		if (ImmediateInterruptOK && InterruptHoldoffCount == 0 &&
-			CritSectionCount == 0)
-		{
-			/* bump holdoff count to make ProcessInterrupts() a no-op */
-			/* until we are done getting ready for it */
-			InterruptHoldoffCount++;
-			LockErrorCleanup(); /* prevent CheckDeadLock from running */
-			DisableNotifyInterrupt();
-			DisableCatchupInterrupt();
-			InterruptHoldoffCount--;
-			ProcessInterrupts(__FILE__, __LINE__);
-		}
 	}
 
 	/* If we're still here, waken anything waiting on the process latch */
-	if (MyProc)
-		SetLatch(&MyProc->procLatch);
+	SetLatch(MyLatch);
 
 	errno = save_errno;
 }
@@ -3552,15 +3507,20 @@ FloatExceptionHandler(SIGNAL_ARGS)
 					   "invalid operation, such as division by zero.")));
 }
 
-/* SIGHUP: set flag to re-read config file at next convenient time */
-static void
-SigHupHandler(SIGNAL_ARGS)
+/*
+ * SIGHUP: set flag to re-read config file at next convenient time.
+ *
+ * Sets the ConfigReloadPending flag, which should be checked at convenient
+ * places inside main loops. (Better than doing the reading in the signal
+ * handler, ey?)
+ */
+void
+PostgresSigHupHandler(SIGNAL_ARGS)
 {
 	int			save_errno = errno;
 
-	got_SIGHUP = true;
-	if (MyProc)
-		SetLatch(&MyProc->procLatch);
+	ConfigReloadPending = true;
+	SetLatch(MyLatch);
 
 	errno = save_errno;
 }
@@ -3593,6 +3553,7 @@ RecoveryConflictInterrupt(ProcSignalReason reason)
 					return;
 
 				/* Intentional drop through to check wait for pin */
+				/* fallthrough */
 
 			case PROCSIG_RECOVERY_CONFLICT_BUFFERPIN:
 
@@ -3606,6 +3567,7 @@ RecoveryConflictInterrupt(ProcSignalReason reason)
 				MyProc->recoveryConflictPending = true;
 
 				/* Intentional drop through to error handling */
+				/* fallthrough */
 
 			case PROCSIG_RECOVERY_CONFLICT_LOCK:
 			case PROCSIG_RECOVERY_CONFLICT_TABLESPACE:
@@ -3650,6 +3612,7 @@ RecoveryConflictInterrupt(ProcSignalReason reason)
 				}
 
 				/* Intentional drop through to session cancel */
+				/* fallthrough */
 
 			case PROCSIG_RECOVERY_CONFLICT_DATABASE:
 				RecoveryConflictPending = true;
@@ -3672,34 +3635,14 @@ RecoveryConflictInterrupt(ProcSignalReason reason)
 		 */
 		if (reason == PROCSIG_RECOVERY_CONFLICT_DATABASE)
 			RecoveryConflictRetryable = false;
-
-		/*
-		 * If it's safe to interrupt, and we're waiting for input or a lock,
-		 * service the interrupt immediately
-		 */
-		if (ImmediateInterruptOK && InterruptHoldoffCount == 0 &&
-			CritSectionCount == 0)
-		{
-			/* bump holdoff count to make ProcessInterrupts() a no-op */
-			/* until we are done getting ready for it */
-			InterruptHoldoffCount++;
-			LockErrorCleanup(); /* prevent CheckDeadLock from running */
-			DisableNotifyInterrupt();
-			DisableCatchupInterrupt();
-			InterruptHoldoffCount--;
-			ProcessInterrupts(__FILE__, __LINE__);
-		}
 	}
 
 	/*
 	 * Set the process latch. This function essentially emulates signal
 	 * handlers like die() and StatementCancelHandler() and it seems prudent
-	 * to behave similarly as they do. Alternatively all plain backend code
-	 * waiting on that latch, expecting to get interrupted by query cancels et
-	 * al., would also need to set set_latch_on_sigusr1.
+	 * to behave similarly as they do.
 	 */
-	if (MyProc)
-		SetLatch(&MyProc->procLatch);
+	SetLatch(MyLatch);
 
 	errno = save_errno;
 }
@@ -3717,28 +3660,27 @@ RecoveryConflictInterrupt(ProcSignalReason reason)
 void
 ProcessInterrupts(const char* filename, int lineno)
 {
-	/* OK to accept interrupt now? */
+	/* OK to accept any interrupts now? */
 	if (InterruptHoldoffCount != 0 || CritSectionCount != 0)
 		return;
-
 	InterruptPending = false;
+
 	if (ProcDiePending)
 	{
 		ProcDiePending = false;
 		QueryCancelPending = false;		/* ProcDie trumps QueryCancel */
-		ImmediateInterruptOK = false;	/* not idle anymore */
-		ImmediateDieOK = false;		/* prevent re-entry */
-		DisableNotifyInterrupt();
-		DisableCatchupInterrupt();
-		DisableClientWaitTimeoutInterrupt();
+		LockErrorCleanup();
 		/* As in quickdie, don't risk sending to client during auth */
 		if (ClientAuthInProgress && whereToSendOutput == DestRemote)
 			whereToSendOutput = DestNone;
-		if (IsAutoVacuumWorkerProcess())
+		if (ClientAuthInProgress)
+			ereport(FATAL,
+					(errcode(ERRCODE_QUERY_CANCELED),
+					 errmsg("canceling authentication due to timeout")));
+		else if (IsAutoVacuumWorkerProcess())
 			ereport(FATAL,
 					(errcode(ERRCODE_ADMIN_SHUTDOWN),
-					 errmsg("terminating autovacuum process due to administrator command"),
-					 errSendAlert(false)));
+					 errmsg("terminating autovacuum process due to administrator command")));
 		else if (RecoveryConflictPending && RecoveryConflictRetryable)
 		{
 			pgstat_report_recovery_conflict(RecoveryConflictReason);
@@ -3778,85 +3720,106 @@ ProcessInterrupts(const char* filename, int lineno)
 	if (ClientConnectionLost)
 	{
 		QueryCancelPending = false;		/* lost connection trumps QueryCancel */
-		ImmediateInterruptOK = false;	/* not idle anymore */
-		DisableNotifyInterrupt();
-		DisableCatchupInterrupt();
-		DisableClientWaitTimeoutInterrupt();
+		LockErrorCleanup();
 		/* don't send to client, we already know the connection to be dead. */
 		whereToSendOutput = DestNone;
 		ereport(FATAL,
 				(errcode(ERRCODE_CONNECTION_FAILURE),
 				 errmsg("connection to client lost")));
 	}
+
+	/*
+	 * If a recovery conflict happens while we are waiting for input from the
+	 * client, the client is presumably just sitting idle in a transaction,
+	 * preventing recovery from making progress.  Terminate the connection to
+	 * dislodge it.
+	 */
+	if (RecoveryConflictPending && DoingCommandRead)
+	{
+		QueryCancelPending = false;		/* this trumps QueryCancel */
+		RecoveryConflictPending = false;
+		LockErrorCleanup();
+		pgstat_report_recovery_conflict(RecoveryConflictReason);
+		ereport(FATAL,
+				(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+			  errmsg("terminating connection due to conflict with recovery"),
+				 errdetail_recovery_conflict(),
+				 errhint("In a moment you should be able to reconnect to the"
+						 " database and repeat your command.")));
+	}
+
 	if (QueryCancelPending)
 	{
+		bool		lock_timeout_occurred;
+		bool		stmt_timeout_occurred;
+
 		elog(LOG,"Process interrupt for 'query cancel pending' (%s:%d)", filename, lineno);
 
-		QueryCancelPending = false;
-		if (ClientAuthInProgress)
+		/*
+		 * Don't allow query cancel interrupts while reading input from the
+		 * client, because we might lose sync in the FE/BE protocol.  (Die
+		 * interrupts are OK, because we won't read any further messages from
+		 * the client in that case.)
+		 */
+		if (QueryCancelHoldoffCount != 0)
 		{
-			ImmediateInterruptOK = false;		/* not idle anymore */
-			DisableNotifyInterrupt();
-			DisableCatchupInterrupt();
-			/* As in quickdie, don't risk sending to client during auth */
-			if (whereToSendOutput == DestRemote)
-				whereToSendOutput = DestNone;
-			ereport(ERROR,
-					(errcode(ERRCODE_QUERY_CANCELED),
-					 errmsg("canceling authentication due to timeout")));
+			/*
+			 * Re-arm InterruptPending so that we process the cancel request
+			 * as soon as we're done reading the message.
+			 */
+			InterruptPending = true;
+			return;
 		}
+
+		QueryCancelPending = false;
 
 		/*
 		 * If LOCK_TIMEOUT and STATEMENT_TIMEOUT indicators are both set, we
-		 * prefer to report the former; but be sure to clear both.
+		 * need to clear both, so always fetch both.
 		 */
-		if (get_timeout_indicator(LOCK_TIMEOUT, true))
+		lock_timeout_occurred = get_timeout_indicator(LOCK_TIMEOUT, true);
+		stmt_timeout_occurred = get_timeout_indicator(STATEMENT_TIMEOUT, true);
+
+		/*
+		 * If both were set, we want to report whichever timeout completed
+		 * earlier; this ensures consistent behavior if the machine is slow
+		 * enough that the second timeout triggers before we get here.  A tie
+		 * is arbitrarily broken in favor of reporting a lock timeout.
+		 */
+		if (lock_timeout_occurred && stmt_timeout_occurred &&
+			get_timeout_finish_time(STATEMENT_TIMEOUT) < get_timeout_finish_time(LOCK_TIMEOUT))
+			lock_timeout_occurred = false;		/* report stmt timeout */
+
+		if (lock_timeout_occurred)
 		{
-			ImmediateInterruptOK = false;		/* not idle anymore */
-			(void) get_timeout_indicator(STATEMENT_TIMEOUT, true);
-			DisableNotifyInterrupt();
-			DisableCatchupInterrupt();
+			LockErrorCleanup();
 			ereport(ERROR,
 					(errcode(ERRCODE_LOCK_NOT_AVAILABLE),
 					 errmsg("canceling statement due to lock timeout")));
 		}
-		if (get_timeout_indicator(STATEMENT_TIMEOUT, true))
+		if (stmt_timeout_occurred)
 		{
-			ImmediateInterruptOK = false;		/* not idle anymore */
-			DisableNotifyInterrupt();
-			DisableCatchupInterrupt();
+			LockErrorCleanup();
 			ereport(ERROR,
 					(errcode(ERRCODE_QUERY_CANCELED),
 					 errmsg("canceling statement due to statement timeout")));
 		}
 		if (IsAutoVacuumWorkerProcess())
 		{
-			ImmediateInterruptOK = false;		/* not idle anymore */
-			DisableNotifyInterrupt();
-			DisableCatchupInterrupt();
+			LockErrorCleanup();
 			ereport(ERROR,
 					(errcode(ERRCODE_QUERY_CANCELED),
 					 errmsg("canceling autovacuum task")));
 		}
 		if (RecoveryConflictPending)
 		{
-			ImmediateInterruptOK = false;		/* not idle anymore */
 			RecoveryConflictPending = false;
-			DisableNotifyInterrupt();
-			DisableCatchupInterrupt();
+			LockErrorCleanup();
 			pgstat_report_recovery_conflict(RecoveryConflictReason);
-			if (DoingCommandRead)
-				ereport(FATAL,
-						(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
-						 errmsg("terminating connection due to conflict with recovery"),
-						 errdetail_recovery_conflict(),
-				 errhint("In a moment you should be able to reconnect to the"
-						 " database and repeat your command.")));
-			else
-				ereport(ERROR,
-						(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+			ereport(ERROR,
+					(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
 				 errmsg("canceling statement due to conflict with recovery"),
-						 errdetail_recovery_conflict()));
+					 errdetail_recovery_conflict()));
 		}
 
 		/*
@@ -3866,9 +3829,7 @@ ProcessInterrupts(const char* filename, int lineno)
 		 */
 		if (!DoingCommandRead)
 		{
-			ImmediateInterruptOK = false;		/* not idle anymore */
-			DisableNotifyInterrupt();
-			DisableCatchupInterrupt();
+			LockErrorCleanup();
 
 			if (Gp_role == GP_ROLE_EXECUTE)
 				ereport(ERROR,
@@ -3890,107 +3851,55 @@ ProcessInterrupts(const char* filename, int lineno)
 						 errmsg("canceling statement due to user request")));
 		}
 	}
-	/* If we get here, do nothing (probably, QueryCancelPending was reset) */
-}
 
-/*
- * Set up the thread signal mask, we don't want to run our signal handlers
- * in our threads (gang-create, dispatch or interconnect threads)
- */
-void
-gp_set_thread_sigmasks(void)
-{
-#ifndef WIN32
-	sigset_t sigs;
-
-	if (pthread_equal(main_tid, pthread_self()))
+	if (IdleInTransactionSessionTimeoutPending)
 	{
-		elog(LOG, "thread_mask called from main thread!");
-		return;
+		/* Has the timeout setting changed since last we looked? */
+		if (IdleInTransactionSessionTimeout > 0)
+			ereport(FATAL,
+					(errcode(ERRCODE_IDLE_IN_TRANSACTION_SESSION_TIMEOUT),
+					 errmsg("terminating connection due to idle-in-transaction timeout")));
+		else
+			IdleInTransactionSessionTimeoutPending = false;
+
 	}
 
-	sigemptyset(&sigs);
-
-	/* make our thread ignore these signals (which should allow that
-	 * they be delivered to the main thread) */
-	sigaddset(&sigs, SIGHUP);
-	sigaddset(&sigs, SIGINT);
-	sigaddset(&sigs, SIGTERM);
-	sigaddset(&sigs, SIGALRM);
-	sigaddset(&sigs, SIGUSR1);
-	sigaddset(&sigs, SIGUSR2);
-
-	pthread_sigmask(SIG_BLOCK, &sigs, NULL);
-#endif
-
-	return;
+	if (ParallelMessagePending)
+		HandleParallelMessages();
 }
 
 /*
  * IA64-specific code to fetch the AR.BSP register for stack depth checks.
  *
- * We currently support gcc, icc, and HP-UX inline assembly here.
- */
-#if defined(__ia64__) || defined(__ia64)
-
-#if defined(__hpux) && !defined(__GNUC__) && !defined __INTEL_COMPILER
-#include <ia64/sys/inline.h>
-#define ia64_get_bsp() ((char *) (_Asm_mov_from_ar(_AREG_BSP, _NO_FENCE)))
-#else
-
-#ifdef __INTEL_COMPILER
-#include <asm/ia64regs.h>
-#endif
-
-static __inline__ char *
-ia64_get_bsp(void)
-{
-	char	   *ret;
-
-#ifndef __INTEL_COMPILER
-	/* the ;; is a "stop", seems to be required before fetching BSP */
-	__asm__ __volatile__(
-		";;\n"
-		"	mov	%0=ar.bsp	\n"
-:		"=r"(ret));
-#else
-  ret = (char *) __getReg(_IA64_REG_AR_BSP);
-#endif
-  return ret;
-}
-#endif
-#endif /* IA64 */
-
-/*
- * IA64-specific code to fetch the AR.BSP register for stack depth checks.
+ * We currently support gcc, icc, and HP-UX's native compiler here.
  *
- * We currently support gcc, icc, and HP-UX inline assembly here.
+ * Note: while icc accepts gcc asm blocks on x86[_64], this is not true on
+ * ia64 (at least not in icc versions before 12.x).  So we have to carry a
+ * separate implementation for it.
  */
 #if defined(__ia64__) || defined(__ia64)
 
-#if defined(__hpux) && !defined(__GNUC__) && !defined __INTEL_COMPILER
+#if defined(__hpux) && !defined(__GNUC__) && !defined(__INTEL_COMPILER)
+/* Assume it's HP-UX native compiler */
 #include <ia64/sys/inline.h>
 #define ia64_get_bsp() ((char *) (_Asm_mov_from_ar(_AREG_BSP, _NO_FENCE)))
-#else
-
-#ifdef __INTEL_COMPILER
+#elif defined(__INTEL_COMPILER)
+/* icc */
 #include <asm/ia64regs.h>
-#endif
-
+#define ia64_get_bsp() ((char *) __getReg(_IA64_REG_AR_BSP))
+#else
+/* gcc */
 static __inline__ char *
 ia64_get_bsp(void)
 {
 	char	   *ret;
 
-#ifndef __INTEL_COMPILER
 	/* the ;; is a "stop", seems to be required before fetching BSP */
 	__asm__		__volatile__(
 										 ";;\n"
 										 "	mov	%0=ar.bsp	\n"
 							 :			 "=r"(ret));
-#else
-	ret = (char *) __getReg(_IA64_REG_AR_BSP);
-#endif
+
 	return ret;
 }
 #endif
@@ -4045,15 +3954,32 @@ restore_stack_base(pg_stack_base_t base)
 }
 
 /*
- * check_stack_depth: check for excessively deep recursion
+ * check_stack_depth/stack_is_too_deep: check for excessively deep recursion
  *
  * This should be called someplace in any recursive routine that might possibly
  * recurse deep enough to overflow the stack.  Most Unixen treat stack
  * overflow as an unrecoverable SIGSEGV, so we want to error out ourselves
  * before hitting the hardware limit.
+ *
+ * check_stack_depth() just throws an error summarily.  stack_is_too_deep()
+ * can be used by code that wants to handle the error condition itself.
  */
 void
 check_stack_depth(void)
+{
+	if (stack_is_too_deep())
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_STATEMENT_TOO_COMPLEX),
+				 errmsg("stack depth limit exceeded"),
+				 errhint("Increase the configuration parameter \"max_stack_depth\" (currently %dkB), "
+			  "after ensuring the platform's stack depth limit is adequate.",
+						 max_stack_depth)));
+	}
+}
+
+bool
+stack_is_too_deep(void)
 {
 	char		stack_top_loc;
 	long		stack_depth;
@@ -4079,14 +4005,7 @@ check_stack_depth(void)
 	 */
 	if (stack_depth > max_stack_depth_bytes &&
 		stack_base_ptr != NULL)
-	{
-		ereport(ERROR,
-				(errcode(ERRCODE_STATEMENT_TOO_COMPLEX),
-				 errmsg("stack depth limit exceeded"),
-				 errhint("Increase the configuration parameter \"max_stack_depth\" (currently %dkB), "
-			  "after ensuring the platform's stack depth limit is adequate.",
-						 max_stack_depth)));
-	}
+		return true;
 
 	/*
 	 * On IA64 there is a separate "register" stack that requires its own
@@ -4101,15 +4020,10 @@ check_stack_depth(void)
 
 	if (stack_depth > max_stack_depth_bytes &&
 		register_stack_base_ptr != NULL)
-	{
-		ereport(ERROR,
-				(errcode(ERRCODE_STATEMENT_TOO_COMPLEX),
-				 errmsg("stack depth limit exceeded"),
-				 errhint("Increase the configuration parameter \"max_stack_depth\" (currently %dkB), "
-			  "after ensuring the platform's stack depth limit is adequate.",
-						 max_stack_depth)));
-	}
+		return true;
 #endif   /* IA64 */
+
+	return false;
 }
 
 /* GUC check hook for max_stack_depth */
@@ -4248,7 +4162,7 @@ get_stats_option_name(const char *arg)
  * argv[0] is ignored in either case (it's assumed to be the program name).
  *
  * ctx is PGC_POSTMASTER for secure options, PGC_BACKEND for insecure options
- * coming from the client, or PGC_SUSET for insecure options coming from
+ * coming from the client, or PGC_SU_BACKEND for insecure options coming from
  * a superuser client.
  *
  * If a database name is present in the command line arguments, it's
@@ -4295,14 +4209,10 @@ process_postgres_switches(int argc, char *argv[], GucContext ctx,
 	 * postmaster/postmaster.c (the option sets should not conflict) and with
 	 * the common help() function in main/main.c.
 	 */
-	while ((flag = getopt(argc, argv, "A:B:bc:C:D:d:EeFf:h:ijk:m:lN:nOo:Pp:r:S:sTt:Uv:W:y:-:")) != -1)
+	while ((flag = getopt(argc, argv, "B:bc:C:D:d:EeFf:h:ijk:lMm:N:nOo:Pp:r:S:sTt:v:W:-:")) != -1)
 	{
 		switch (flag)
 		{
-			case 'A':
-				SetConfigOption("debug_assertions", optarg, ctx, gucsource);
-				break;
-
 			case 'B':
 				SetConfigOption("shared_buffers", optarg, ctx, gucsource);
 				break;
@@ -4354,7 +4264,7 @@ process_postgres_switches(int argc, char *argv[], GucContext ctx,
 
 			case 'j':
 				if (secure)
-					UseNewLine = 0;
+					UseSemiNewlineNewline = true;
 				break;
 
 			case 'k':
@@ -4363,6 +4273,17 @@ process_postgres_switches(int argc, char *argv[], GucContext ctx,
 
 			case 'l':
 				SetConfigOption("ssl", "true", ctx, gucsource);
+				break;
+
+			case 'M':
+				/* Undocumented flag used for mutating a directory that was a copy of a
+				 * master data directory and needs to now be a segment directory. Only
+				 * use on the first time the segment is started, and only use in
+				 * utility mode, as changes will be destructive, and will assume that
+				 * the segment has never participated in a distributed
+				 * transaction.*/
+				if (secure)
+					ConvertMasterDataDirToSegment = true;
 				break;
 
 			case 'm':
@@ -4430,18 +4351,6 @@ process_postgres_switches(int argc, char *argv[], GucContext ctx,
 					break;
 				}
 
-			case 'U':
-				/*
-				 * In upgrade mode, we indicate we're in upgrade mode and
-				 * 1. allow DML on persistent table & catalog table
-				 * 2. alter DDL on catalog table (NOTE: upgrade_mode must set beforehand)
-				 * 3. TODO: disable the 4.1 xlog format (stick with the old)
-				 */
-				SetConfigOption("upgrade_mode",                         "true", ctx, gucsource);
-				SetConfigOption("allow_segment_DML",  		            "true", ctx, gucsource);
-				SetConfigOption("allow_system_table_mods",              "true",  ctx, gucsource);
-				break;
-
 			case 'v':
 
 				/*
@@ -4457,22 +4366,6 @@ process_postgres_switches(int argc, char *argv[], GucContext ctx,
 
 			case 'W':
 				SetConfigOption("post_auth_delay", optarg, ctx, gucsource);
-				break;
-
-			case 'y':
-
-				/*
-				 * y - special flag passed if backend was forked by a
-				 * postmaster.
-				 */
-				if (secure)
-				{
-					*dbname = strdup(optarg);
-
-					secure = false;		/* subsequent switches are NOT secure */
-					ctx = PGC_BACKEND;
-					gucsource = PGC_S_CLIENT;
-				}
 				break;
 
 			case 'c':
@@ -4547,16 +4440,17 @@ process_postgres_switches(int argc, char *argv[], GucContext ctx,
 }
 
 /*
- * Throw an error if we're a FTS handler process.
+ * Throw an error if we're a GPDB specific message handler process.
  *
- * This is used to forbid anything else than simple query protocol messages
- * in a FTS handler process.  'firstchar' specifies what kind of a forbidden
- * message was received, and is used to construct the error message.
+ * This is used to forbid anything else than simple query protocol messages in
+ * a GPDB specific message handler process (e.g. FTS or fault message
+ * handlers).  'firstchar' specifies what kind of a forbidden message was
+ * received, and is used to construct the error message.
  */
 static void
-check_forbidden_in_fts_handler(char firstchar)
+check_forbidden_in_gpdb_handlers(char firstchar)
 {
-	if (am_ftshandler)
+	if (am_ftshandler || IsFaultHandler)
 	{
 		switch (firstchar)
 		{
@@ -4567,7 +4461,7 @@ check_forbidden_in_fts_handler(char firstchar)
 			default:
 				ereport(ERROR,
 						(errcode(ERRCODE_PROTOCOL_VIOLATION),
-						 errmsg("protocol '%c' is not supported in a FTS connection",
+						 errmsg("protocol '%c' is not supported in a GPDB message handler connection",
 								firstchar)));
 		}
 	}
@@ -4594,8 +4488,7 @@ PostgresMain(int argc, char *argv[],
 	StringInfoData input_message;
 	sigjmp_buf	local_sigjmp_buf;
 	volatile bool send_ready_for_query = true;
-
-	MemoryAccountIdType postgresMainMemoryAccountId = MEMORY_OWNER_TYPE_Undefined;
+	bool		disable_idle_in_transaction_timeout = false;
 
 	/*
 	 * CDB: Catch program error signals.
@@ -4604,43 +4497,17 @@ PostgresMain(int argc, char *argv[],
 	 */
 	main_tid = pthread_self();
 
-	/*
-	 * Initialize globals (already done if under postmaster, but not if
-	 * standalone).
-	 */
+	/* Initialize startup process environment if necessary. */
 	if (!IsUnderPostmaster)
-	{
-		MyProcPid = getpid();
-
-		MyStartTime = time(NULL);
-	}
+		InitStandaloneProcess(argv[0]);
 
 #ifndef WIN32
 	PostmasterPriority = getpriority(PRIO_PROCESS, 0);
 #endif
 
-	/*
-	 * Do not save the return value in any oldMemoryAccount variable.
-	 * In that case, we risk switching to a stale memoryAccount that is no
-	 * longer valid. This is because we reset the memory accounts frequently.
-	 */
-	postgresMainMemoryAccountId = MemoryAccounting_CreateAccount(0, MEMORY_OWNER_TYPE_MainEntry);
-	MemoryAccounting_SwitchAccount(postgresMainMemoryAccountId);
-
 	set_ps_display("startup", false);
 
 	SetProcessingMode(InitProcessing);
-
-	/* Compute paths, if we didn't inherit them from postmaster */
-	if (my_exec_path[0] == '\0')
-	{
-		if (find_my_exec(argv[0], my_exec_path) < 0)
-			elog(FATAL, "%s: could not locate my own executable path",
-				 argv[0]);
-	}
-
-	if (pkglib_path[0] == '\0')
-		get_pkglib_path(my_exec_path, pkglib_path);
 
 	/*
 	 * Set default values for command-line options.
@@ -4680,11 +4547,6 @@ PostgresMain(int argc, char *argv[],
 	}
 
 	/*
-	 * You might expect to see a setsid() call here, but it's not needed,
-	 * because if we are under a postmaster then BackendInitialize() did it.
-	 */
-
-	/*
 	 * Set up signal handlers and masks.
 	 *
 	 * Note that postmaster blocked all signals before forking child process,
@@ -4702,8 +4564,8 @@ PostgresMain(int argc, char *argv[],
 		WalSndSignals();
 	else
 	{
-		pqsignal(SIGHUP, SigHupHandler);		/* set flag to read config
-												 * file */
+		pqsignal(SIGHUP, PostgresSigHupHandler);		/* set flag to read config
+														 * file */
 		pqsignal(SIGINT, StatementCancelHandler);		/* cancel current query */
 		pqsignal(SIGTERM, die); /* cancel current query and exit */
 
@@ -4799,22 +4661,13 @@ PostgresMain(int argc, char *argv[],
 	PG_SETMASK(&UnBlockSig);
 
 	/*
-	 * We need to allow SIGINT, etc during the initial transaction.
-	 * Also, currently if this is the Master with standby support
-	 * we need to allow SIGUSR1 for performing sync replication (used by latch).
-	 */
-	PG_SETMASK(&UnBlockSig);
-
-	/*
 	 * General initialization.
 	 *
 	 * NOTE: if you are tempted to add code in this vicinity, consider putting
 	 * it inside InitPostgres() instead.  In particular, anything that
 	 * involves database access should be there, not here.
 	 */
-	ereport(DEBUG3,
-			(errmsg_internal("InitPostgres")));
-	InitPostgres(dbname, InvalidOid, username, NULL);
+	InitPostgres(dbname, InvalidOid, username, InvalidOid, NULL);
 
 	/*
 	 * If the PostmasterContext is still around, recycle the space; we don't
@@ -4875,10 +4728,10 @@ PostgresMain(int argc, char *argv[],
 	}
 
 	/* Also send GPDB QE-backend startup info (motion listener, version). */
-	if (!am_ftshandler && Gp_role == GP_ROLE_EXECUTE)
+	if (!(am_ftshandler || IsFaultHandler) && Gp_role == GP_ROLE_EXECUTE)
 	{
 #ifdef FAULT_INJECTOR
-		if (SIMPLE_FAULT_INJECTOR(SendQEDetailsInitBackend) != FaultInjectorTypeSkip)
+		if (SIMPLE_FAULT_INJECTOR("send_qe_details_init_backend") != FaultInjectorTypeSkip)
 #endif
 			sendQEDetails();
 	}
@@ -4952,14 +4805,8 @@ PostgresMain(int argc, char *argv[],
 		QueryCancelPending = false;		/* second to avoid race condition */
 		QueryFinishPending = false;
 
-		/*
-		 * Turn off these interrupts too.  This is only needed here and not in
-		 * other exception-catching places since these interrupts are only
-		 * enabled while we wait for client input.
-		 */
+		/* Not reading from the client anymore. */
 		DoingCommandRead = false;
-		DisableNotifyInterrupt();
-		DisableCatchupInterrupt();
 		DisableClientWaitTimeoutInterrupt();
 
 		/* Make sure libpq is in a good state */
@@ -5021,6 +4868,19 @@ PostgresMain(int argc, char *argv[],
 		/* Inform Vmem tracker that the current process has finished cleanup */
 		RunawayCleaner_RunawayCleanupDoneForProcess(false /* ignoredCleanup */);
 
+		/*
+		 * If an error occurred while we were reading a message from the
+		 * client, we have potentially lost track of where the previous
+		 * message ends and the next one begins.  Even though we have
+		 * otherwise recovered from the error, we cannot safely read any more
+		 * messages from the client, so there isn't much we can do with the
+		 * connection anymore.
+		 */
+		if (pq_is_reading_msg())
+			ereport(FATAL,
+					(errcode(ERRCODE_PROTOCOL_VIOLATION),
+					 errmsg("terminating connection because protocol synchronization was lost")));
+
 		/* Now we can allow interrupts again */
 		RESUME_INTERRUPTS();
 	}
@@ -5052,25 +4912,6 @@ PostgresMain(int argc, char *argv[],
 		VmemTracker_ResetMaxVmemReserved();
 		VmemTracker_ResetWaiver();
 
-		/* Reset memory accounting */
-
-		/*
-		 * We finished processing the last query and currently we are not under
-		 * any transaction. So reset memory accounting. Note: any memory
-		 * allocated before resetting will go into the rollover memory account,
-		 * allocated under top memory context.
-		 */
-		MemoryAccounting_Reset();
-
-		postgresMainMemoryAccountId = MemoryAccounting_CreateAccount(0, MEMORY_OWNER_TYPE_MainEntry);
-		/*
-		 * Don't attempt to save previous memory account. This will be invalid by the time we attempt to restore.
-		 * This is why we are not using our START_MEMORY_ACCOUNT and END_MEMORY_ACCOUNT macros
-		 */
-		MemoryAccounting_SwitchAccount(postgresMainMemoryAccountId);
-
-		/* End of memory accounting setup */
-
 		initStringInfo(&input_message);
 
         /* Reset elog globals */
@@ -5084,6 +4925,12 @@ PostgresMain(int argc, char *argv[],
 		 * queries
 		 */
 		IdleTracker_DeactivateProcess();
+
+		/*
+		 * Also consider releasing our catalog snapshot if any, so that it's
+		 * not preventing advance of global xmin while we wait for the client.
+		 */
+		InvalidateCatalogSnapshotConditionally();
 
 		/*
 		 * (1) If we've reached idle state, tell the frontend we're ready for
@@ -5104,11 +4951,27 @@ PostgresMain(int argc, char *argv[],
 			{
 				set_ps_display("idle in transaction (aborted)", false);
 				pgstat_report_activity(STATE_IDLEINTRANSACTION_ABORTED, NULL);
+
+				/* Start the idle-in-transaction timer */
+				if (IdleInTransactionSessionTimeout > 0)
+				{
+					disable_idle_in_transaction_timeout = true;
+					enable_timeout_after(IDLE_IN_TRANSACTION_SESSION_TIMEOUT,
+										 IdleInTransactionSessionTimeout);
+				}
 			}
 			else if (IsTransactionOrTransactionBlock())
 			{
 				set_ps_display("idle in transaction", false);
 				pgstat_report_activity(STATE_IDLEINTRANSACTION, NULL);
+
+				/* Start the idle-in-transaction timer */
+				if (IdleInTransactionSessionTimeout > 0)
+				{
+					disable_idle_in_transaction_timeout = true;
+					enable_timeout_after(IDLE_IN_TRANSACTION_SESSION_TIMEOUT,
+										 IdleInTransactionSessionTimeout);
+				}
 			}
 			else
 			{
@@ -5131,11 +4994,6 @@ PostgresMain(int argc, char *argv[],
 		 * STDIN doing the same thing.)
 		 */
 		DoingCommandRead = true;
-
-#ifdef USE_TEST_UTILS
-		/* reset time slice */
-		TimeSliceReset();
-#endif /* USE_TEST_UTILS */
 
 		/*
 		 * (2b) Check for temp table delete reset session work.
@@ -5167,30 +5025,51 @@ PostgresMain(int argc, char *argv[],
 
 		/*
 		 * (4) disable async signal conditions again.
+		 *
+		 * Query cancel is supposed to be a no-op when there is no query in
+		 * progress, so if a query cancel arrived while we were idle, just
+		 * reset QueryCancelPending. ProcessInterrupts() has that effect when
+		 * it's called when DoingCommandRead is set, so check for interrupts
+		 * before resetting DoingCommandRead.
 		 */
+		CHECK_FOR_INTERRUPTS();
 		DoingCommandRead = false;
 
 		/*
-		 * (5) check for any other interesting events that happened while we
+		 * (5) turn off the idle-in-transaction timeout
+		 */
+		if (disable_idle_in_transaction_timeout)
+		{
+			disable_timeout(IDLE_IN_TRANSACTION_SESSION_TIMEOUT, false);
+			disable_idle_in_transaction_timeout = false;
+		}
+
+		/*
+		 * (6) check for any other interesting events that happened while we
 		 * slept.
 		 */
-		if (got_SIGHUP)
+		if (ConfigReloadPending)
 		{
-			got_SIGHUP = false;
+			ConfigReloadPending = false;
 			ProcessConfigFile(PGC_SIGHUP);
 		}
 
 		/*
-		 * (6) process the command.  But ignore it if we're skipping till
+		 * (7) process the command.  But ignore it if we're skipping till
 		 * Sync.
 		 */
 		if (ignore_till_sync && firstchar != EOF)
 			continue;
 
+		/* last txn abort, try to synchronize guc to cached QE */
+		if(Gp_role == GP_ROLE_DISPATCH && gp_guc_restore_list)
+			restore_guc_to_QE();
+
+
 		ereport((Debug_print_full_dtm ? LOG : DEBUG5),
 				(errmsg_internal("First char: '%c'; gp_role = '%s'.", firstchar, role_to_string(Gp_role))));
 
-		check_forbidden_in_fts_handler(firstchar);
+		check_forbidden_in_gpdb_handlers(firstchar);
 
 		switch (firstchar)
 		{
@@ -5211,6 +5090,8 @@ PostgresMain(int argc, char *argv[],
 						exec_replication_command(query_string);
 					else if (am_ftshandler)
 						HandleFtsMessage(query_string);
+					else if (IsFaultHandler)
+						HandleFaultMessage(query_string);
 					else
 						exec_simple_query(query_string);
 
@@ -5231,7 +5112,6 @@ PostgresMain(int argc, char *argv[],
 					const char *serializedDtxContextInfo = NULL;
 					const char *serializedQuerytree = NULL;
 					const char *serializedPlantree = NULL;
-					const char *serializedParams = NULL;
 					const char *serializedQueryDispatchDesc = NULL;
 					const char *resgroupInfoBuf = NULL;
 
@@ -5239,21 +5119,24 @@ PostgresMain(int argc, char *argv[],
 					int serializedDtxContextInfolen = 0;
 					int serializedQuerytreelen = 0;
 					int serializedPlantreelen = 0;
-					int serializedParamslen = 0;
 					int serializedQueryDispatchDesclen = 0;
 					int resgroupInfoLen = 0;
-					int rootIdx;
 					TimestampTz statementStart;
 					Oid suid;
 					Oid ouid;
 					Oid cuid;
 
-					int unusedFlags;
-
 					if (Gp_role != GP_ROLE_EXECUTE)
 						ereport(ERROR,
 								(errcode(ERRCODE_PROTOCOL_VIOLATION),
 								 errmsg("MPP protocol messages are only supported in QD - QE connections")));
+					/*
+					 * QD performs the function body check, hence QE doesn't
+					 * need to do the check again. Turn off the check in QE
+					 * process as an optimization. Also, helps eliminate the
+					 * need for having this GUC in-sync between QD and QE.
+					 */
+					check_function_bodies=false;
 
 					/* Set statement_timestamp() */
  					SetCurrentStatementStartTimestamp();
@@ -5268,13 +5151,10 @@ PostgresMain(int argc, char *argv[],
 					ouid = pq_getmsgint(&input_message, 4);
 					cuid = pq_getmsgint(&input_message, 4);
 
-					rootIdx = pq_getmsgint(&input_message, 4);
-
 					statementStart = pq_getmsgint64(&input_message);
 					query_string_len = pq_getmsgint(&input_message, 4);
 					serializedQuerytreelen = pq_getmsgint(&input_message, 4);
 					serializedPlantreelen = pq_getmsgint(&input_message, 4);
-					serializedParamslen = pq_getmsgint(&input_message, 4);
 					serializedQueryDispatchDesclen = pq_getmsgint(&input_message, 4);
 					serializedDtxContextInfolen = pq_getmsgint(&input_message, 4);
 
@@ -5286,9 +5166,6 @@ PostgresMain(int argc, char *argv[],
 
 					DtxContextInfo_Deserialize(serializedDtxContextInfo, serializedDtxContextInfolen, &TempDtxContextInfo);
 
-					/* get the transaction options */
-					unusedFlags = pq_getmsgint(&input_message, 4);
-
 					/* get the query string and kick off processing. */
 					if (query_string_len > 0)
 						query_string = pq_getmsgbytes(&input_message,query_string_len);
@@ -5298,9 +5175,6 @@ PostgresMain(int argc, char *argv[],
 
 					if (serializedPlantreelen > 0)
 						serializedPlantree = pq_getmsgbytes(&input_message,serializedPlantreelen);
-
-					if (serializedParamslen > 0)
-						serializedParams = pq_getmsgbytes(&input_message,serializedParamslen);
 
 					if (serializedQueryDispatchDesclen > 0)
 						serializedQueryDispatchDesc = pq_getmsgbytes(&input_message,serializedQueryDispatchDesclen);
@@ -5369,7 +5243,6 @@ PostgresMain(int argc, char *argv[],
 						exec_mpp_query(query_string,
 									   serializedQuerytree, serializedQuerytreelen,
 									   serializedPlantree, serializedPlantreelen,
-									   serializedParams, serializedParamslen,
 									   serializedQueryDispatchDesc, serializedQueryDispatchDesclen);
 
 					SetUserIdAndContext(GetOuterUserId(), false);
@@ -5381,17 +5254,10 @@ PostgresMain(int argc, char *argv[],
             case 'T': /* MPP dispatched dtx protocol command from QD */
 				{
 					DtxProtocolCommand dtxProtocolCommand;
-
-					int flags;
-
 					int loggingStrLen;
 					const char *loggingStr;
-
 					int gidLen;
 					const char *gid;
-
-					DistributedTransactionId gxid;
-
 					int serializedDtxContextInfolen;
 					const char *serializedDtxContextInfo;
 
@@ -5405,9 +5271,6 @@ PostgresMain(int argc, char *argv[],
 					/* get the transaction protocol command # */
 					dtxProtocolCommand = (DtxProtocolCommand) pq_getmsgint(&input_message, 4);
 
-					/* get the flags */
-					flags = pq_getmsgint(&input_message, 4);
-
 					/* get the logging string length */
 					loggingStrLen = pq_getmsgint(&input_message, 4);
 
@@ -5419,9 +5282,6 @@ PostgresMain(int argc, char *argv[],
 
 					/* get the logging string */
 					gid = pq_getmsgbytes(&input_message,gidLen);
-
-					/* get the distributed transaction id */
-					gxid = (DistributedTransactionId) pq_getmsgint(&input_message, 4);
 
 					serializedDtxContextInfolen = pq_getmsgint(&input_message, 4);
 
@@ -5435,7 +5295,7 @@ PostgresMain(int argc, char *argv[],
 
 					pq_getmsgend(&input_message);
 
-					exec_mpp_dtx_protocol_command(dtxProtocolCommand, flags, loggingStr, gid, gxid, &TempDtxContextInfo);
+					exec_mpp_dtx_protocol_command(dtxProtocolCommand, loggingStr, gid, &TempDtxContextInfo);
 
 					send_ready_for_query = true;
             	}
@@ -5493,8 +5353,6 @@ PostgresMain(int argc, char *argv[],
 
 					forbidden_in_wal_sender(firstchar);
 
-					forbidden_in_wal_sender(firstchar);
-
 					/* Set statement_timestamp() */
 					SetCurrentStatementStartTimestamp();
 
@@ -5537,19 +5395,7 @@ PostgresMain(int argc, char *argv[],
 				/* switch back to message context */
 				MemoryContextSwitchTo(MessageContext);
 
-				if (HandleFunctionRequest(&input_message) == EOF)
-				{
-					/*
-					 * lost frontend connection during F message input
-					 *
-					 * Reset whereToSendOutput to prevent ereport from
-					 * attempting to send any more messages to client.
-					 */
-					if (whereToSendOutput == DestRemote)
-						whereToSendOutput = DestNone;
-
-					proc_exit(0);
-				}
+				HandleFunctionRequest(&input_message);
 
 				/* commit the function-invocation transaction */
 				finish_xact_command();
@@ -5670,6 +5516,7 @@ PostgresMain(int argc, char *argv[],
 				 * scenarios.
 				 */
 				proc_exit(0);
+				break;
 
 			case 'd':			/* copy data */
 			case 'c':			/* copy done */
@@ -5713,6 +5560,7 @@ forbidden_in_wal_sender(char firstchar)
 					 errmsg("extended query protocol not supported in a replication connection")));
 	}
 }
+
 
 /*
  * Obtain platform stack depth limit (in bytes)
@@ -5858,7 +5706,7 @@ ShowUsage(const char *title)
  * on_proc_exit handler to log end of session
  */
 static void
-log_disconnections(int code, Datum arg __attribute__((unused)))
+log_disconnections(int code, Datum arg pg_attribute_unused())
 {
 	Port	   *port = MyProcPort;
 	long		secs;
@@ -5884,4 +5732,26 @@ log_disconnections(int code, Datum arg __attribute__((unused)))
 					hours, minutes, seconds, msecs,
 					port->user_name, port->database_name, port->remote_host,
 				  port->remote_port[0] ? " port=" : "", port->remote_port)));
+}
+
+/*
+ * GPDB: Enable the IdleGangTimeoutHandler to disconnect and destroy idle
+ * cdbgang processes.
+ */
+void
+enable_client_wait_timeout_interrupt(void)
+{
+	if (DoingCommandRead)
+		EnableClientWaitTimeoutInterrupt();
+}
+
+/*
+ * GPDB: Disable the IdleGangTimeoutHandler to prevent disconnecting and
+ * destroying idle cdbgang processes.
+ */
+void
+disable_client_wait_timeout_interrupt(void)
+{
+	if (DoingCommandRead)
+		DisableClientWaitTimeoutInterrupt();
 }

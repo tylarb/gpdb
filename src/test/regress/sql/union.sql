@@ -213,8 +213,8 @@ CREATE INDEX t1c_ab_idx on t1c ((a || b));
 set enable_seqscan = on;
 set enable_indexonlyscan = off;
 
---- GPDB_94_MERGE_FIXME: GPDB would choose seqscan rather than indexscan for t1.
---- This is a side-effect of disabling pull-up for simple union all in GPDB.
+-- NOTE: GPDB planner chooses a seqscan rather than indexscan for t1.
+-- This is a side-effect of disabling pull-up for simple union all in GPDB.
 explain (costs off)
   SELECT * FROM
   (SELECT a || b AS ab FROM t1
@@ -231,6 +231,22 @@ explain (costs off)
 reset enable_seqscan;
 reset enable_indexscan;
 reset enable_bitmapscan;
+
+-- This simpler variant of the above test has been observed to fail differently
+
+create table events (event_id int primary key);
+create table other_events (event_id int primary key);
+create table events_child () inherits (events);
+
+explain (costs off)
+select event_id
+ from (select event_id from events
+       union all
+       select event_id from other_events) ss
+ order by event_id;
+
+drop table events_child, events, other_events;
+
 reset enable_indexonlyscan;
 
 -- Test constraint exclusion of UNION ALL subqueries

@@ -15,7 +15,7 @@
 
 #include "postgres.h"
 
-#include "nodes/execnodes.h"	/* Slice, SliceTable */
+#include "nodes/execnodes.h"	/* ExecSlice, SliceTable */
 #include "miscadmin.h"
 #include "libpq/libpq-be.h"
 #include "libpq/ip.h"
@@ -26,23 +26,10 @@
 #include "cdb/cdbvars.h"
 #include "cdb/cdbdisp.h"
 
-#include <limits.h>
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <sys/time.h>
 #include <netinet/in.h>
-
-#ifdef WIN32
-#define WIN32_LEAN_AND_MEAN
-#ifndef _WIN32_WINNT
-#define _WIN32_WINNT 0x0600
-#endif
-#include <winsock2.h>
-#define SHUT_RDWR SD_BOTH
-#define SHUT_RD SD_RECEIVE
-#define SHUT_WR SD_SEND
-
-#endif
 
 /*
   #define AMS_VERBOSE_LOGGING
@@ -83,11 +70,6 @@ static void cleanup_interconnect_handle(interconnect_handle_t *h);
 static interconnect_handle_t *allocate_interconnect_handle(void);
 static void destroy_interconnect_handle(interconnect_handle_t *h);
 static interconnect_handle_t *find_interconnect_handle(ChunkTransportState *icContext);
-
-#ifdef AMS_VERBOSE_LOGGING
-static void dumpEntryConnections(int elevel, ChunkTransportStateEntry *pEntry);
-static void print_connection(ChunkTransportState *transportStates, int fd, const char *msg);
-#endif
 
 static void
 logChunkParseDetails(MotionConn *conn)
@@ -140,10 +122,11 @@ RecvTupleChunk(MotionConn *conn, ChunkTransportState *transportStates)
 		{
 			logChunkParseDetails(conn);
 
-			ereport(ERROR, (errcode(ERRCODE_GP_INTERCONNECTION_ERROR),
-							errmsg("Interconnect error parsing message: insufficient data received."),
-							errdetail("conn->msgSize %d bytesProcessed %d < chunk-header %d",
-									  conn->msgSize, bytesProcessed, TUPLE_CHUNK_HEADER_SIZE)));
+			ereport(ERROR,
+					(errcode(ERRCODE_GP_INTERCONNECTION_ERROR),
+					 errmsg("interconnect error parsing message: insufficient data received"),
+					 errdetail("conn->msgSize %d bytesProcessed %d < chunk-header %d",
+							   conn->msgSize, bytesProcessed, TUPLE_CHUNK_HEADER_SIZE)));
 		}
 
 		tcSize = TUPLE_CHUNK_HEADER_SIZE + (*(uint16 *) (conn->msgPos + bytesProcessed));
@@ -167,11 +150,13 @@ RecvTupleChunk(MotionConn *conn, ChunkTransportState *transportStates)
 
 			logChunkParseDetails(conn);
 
-			ereport(ERROR, (errcode(ERRCODE_GP_INTERCONNECTION_ERROR),
-							errmsg("Interconnect error parsing message"),
-							errdetail("tcSize %d > max %d header %d processed %d/%d from %p",
-									  tcSize, Gp_max_packet_size,
-									  TUPLE_CHUNK_HEADER_SIZE, bytesProcessed, conn->msgSize, conn->msgPos)));
+			ereport(ERROR,
+					(errcode(ERRCODE_GP_INTERCONNECTION_ERROR),
+					 errmsg("interconnect error parsing message"),
+					 errdetail("tcSize %d > max %d header %d processed %d/%d from %p",
+							   tcSize, Gp_max_packet_size,
+							   TUPLE_CHUNK_HEADER_SIZE, bytesProcessed,
+							   conn->msgSize, conn->msgPos)));
 		}
 
 
@@ -191,9 +176,11 @@ RecvTupleChunk(MotionConn *conn, ChunkTransportState *transportStates)
 
 				logChunkParseDetails(conn);
 
-				ereport(ERROR, (errcode(ERRCODE_GP_INTERCONNECTION_ERROR),
-								errmsg("Interconnect error parsing message"),
-								errdetail("tcSize %d >= conn->msgSize %d", tcSize, conn->msgSize)));
+				ereport(ERROR,
+						(errcode(ERRCODE_GP_INTERCONNECTION_ERROR),
+						 errmsg("interconnect error parsing message"),
+						 errdetail("tcSize %d >= conn->msgSize %d",
+								   tcSize, conn->msgSize)));
 			}
 		}
 		Assert(tcSize < conn->msgSize);
@@ -202,12 +189,13 @@ RecvTupleChunk(MotionConn *conn, ChunkTransportState *transportStates)
 		 * We store the data inplace, and handle any necessary copying later
 		 * on
 		 */
-		tcItem = (TupleChunkListItem) palloc0(sizeof(TupleChunkListItemData));
+		tcItem = (TupleChunkListItem) palloc(sizeof(TupleChunkListItemData));
 
+		tcItem->p_next = NULL;
 		tcItem->chunk_length = tcSize;
 		tcItem->inplace = (char *) (conn->msgPos + bytesProcessed);
 
-		bytesProcessed += TYPEALIGN(TUPLE_CHUNK_ALIGN, tcSize);
+		bytesProcessed += tcSize;
 
 		if (firstTcItem == NULL)
 		{
@@ -332,6 +320,8 @@ SendTupleChunkToAMS(MotionLayerState *mlStates,
 		else
 		{
 			/* handle pt-to-pt message. Primary */
+			Assert(targetRoute >= 0);
+			Assert(targetRoute < pEntry->numConns);
 			conn = pEntry->conns + targetRoute;
 			/* only send to interested connections */
 			if (conn->stillActive)
@@ -529,11 +519,11 @@ SetupInterconnect(EState *estate)
 
 	if (estate->interconnect_context)
 	{
-		elog(FATAL, "SetupInterconnect: already initialized.");
+		elog(ERROR, "SetupInterconnect: already initialized.");
 	}
 	else if (!estate->es_sliceTable)
 	{
-		elog(FATAL, "SetupInterconnect: no slice table ?");
+		elog(ERROR, "SetupInterconnect: no slice table ?");
 	}
 
 	h = allocate_interconnect_handle();
@@ -546,31 +536,11 @@ SetupInterconnect(EState *estate)
 	else if (Gp_interconnect_type == INTERCONNECT_TYPE_TCP)
 		SetupTCPInterconnect(estate);
 	else
-		Assert("unsupported expected interconnect type");
+		elog(ERROR, "unsupported expected interconnect type");
 
 	MemoryContextSwitchTo(oldContext);
 
 	h->interconnect_context = estate->interconnect_context;
-}
-
-/*
- * Move this out to separate stack frame, so that we don't have to mark
- * tons of stuff volatile in TeardownInterconnect().
- */
-void
-forceEosToPeers(ChunkTransportState *transportStates,
-				int motNodeID)
-{
-	if (!transportStates)
-	{
-		elog(FATAL, "no transport-states.");
-	}
-
-	transportStates->teardownActive = true;
-
-	transportStates->SendEos(transportStates, motNodeID, get_eos_tuplechunklist());
-
-	transportStates->teardownActive = false;
 }
 
 /* TeardownInterconnect() function is used to cleanup interconnect resources that
@@ -579,18 +549,17 @@ forceEosToPeers(ChunkTransportState *transportStates,
  * even if SetupInterconnect did not complete correctly.
  */
 void
-TeardownInterconnect(ChunkTransportState *transportStates,
-					 bool forceEOS, bool hasError)
+TeardownInterconnect(ChunkTransportState *transportStates, bool hasErrors)
 {
 	interconnect_handle_t *h = find_interconnect_handle(transportStates);
 
 	if (Gp_interconnect_type == INTERCONNECT_TYPE_UDPIFC)
 	{
-		TeardownUDPIFCInterconnect(transportStates, forceEOS);
+		TeardownUDPIFCInterconnect(transportStates, hasErrors);
 	}
 	else if (Gp_interconnect_type == INTERCONNECT_TYPE_TCP)
 	{
-		TeardownTCPInterconnect(transportStates, forceEOS, hasError);
+		TeardownTCPInterconnect(transportStates, hasErrors);
 	}
 
 	if (h != NULL)
@@ -609,7 +578,7 @@ TeardownInterconnect(ChunkTransportState *transportStates,
  *
  *	 motNodeID - motion node ID for this ChunkTransportState.
  *
- *	 numPrimaryConns  - number of primary connections for this motion node.
+ *	 numConns  - number of primary connections for this motion node.
  *               All are incoming if this is a receiving motion node.
  *               All are outgoing if this is a sending motion node.
  *
@@ -620,20 +589,16 @@ TeardownInterconnect(ChunkTransportState *transportStates,
  */
 ChunkTransportStateEntry *
 createChunkTransportState(ChunkTransportState *transportStates,
-						  Slice *sendSlice,
-						  Slice *recvSlice,
-						  int numPrimaryConns)
+						  ExecSlice *sendSlice,
+						  ExecSlice *recvSlice,
+						  int numConns)
 {
 	ChunkTransportStateEntry *pEntry;
 	int			motNodeID;
 	int			i;
 
-	Assert(recvSlice &&
-		   IsA(recvSlice, Slice) &&
-		   recvSlice->sliceIndex >= 0);
-	Assert(sendSlice &&
-		   IsA(sendSlice, Slice) &&
-		   sendSlice->sliceIndex > 0);
+	Assert(recvSlice->sliceIndex >= 0);
+	Assert(sendSlice->sliceIndex > 0);
 
 	motNodeID = sendSlice->sliceIndex;
 	if (motNodeID > transportStates->size)
@@ -652,16 +617,19 @@ createChunkTransportState(ChunkTransportState *transportStates,
 
 	if (pEntry->valid)
 	{
-		ereport(ERROR, (errcode(ERRCODE_GP_INTERCONNECTION_ERROR),
-						errmsg("Interconnect Error: A HTAB entry for motion node %d already exists.", motNodeID),
-						errdetail("conns %p numConns %d first sock %d", pEntry->conns, pEntry->numConns, pEntry->conns[0].sockfd)));
+		ereport(ERROR,
+				(errcode(ERRCODE_GP_INTERCONNECTION_ERROR),
+				 errmsg("interconnect error: A HTAB entry for motion node %d already exists",
+						motNodeID),
+				 errdetail("conns %p numConns %d first sock %d",
+						   pEntry->conns, pEntry->numConns,
+						   pEntry->conns[0].sockfd)));
 	}
 
 	pEntry->valid = true;
 
 	pEntry->motNodeId = motNodeID;
-	pEntry->numConns = numPrimaryConns;
-	pEntry->numPrimaryConns = numPrimaryConns;
+	pEntry->numConns = numConns;
 	pEntry->scanStart = 0;
 	pEntry->sendSlice = sendSlice;
 	pEntry->recvSlice = recvSlice;
@@ -709,15 +677,19 @@ removeChunkTransportState(ChunkTransportState *transportStates,
 
 	if (motNodeID > transportStates->size)
 	{
-		ereport(ERROR, (errcode(ERRCODE_GP_INTERCONNECTION_ERROR),
-						errmsg("Interconnect Error: Unexpected Motion Node Id: %d. During remove. (size %d)",
-							   motNodeID, transportStates->size)));
+		ereport(ERROR,
+				(errcode(ERRCODE_GP_INTERCONNECTION_ERROR),
+				 errmsg("interconnect error: Unexpected Motion Node Id: %d",
+						motNodeID),
+				 errdetail("During remove. (size %d)", transportStates->size)));
 	}
 	else if (!transportStates->states[motNodeID - 1].valid)
 	{
-		ereport(ERROR, (errcode(ERRCODE_GP_INTERCONNECTION_ERROR),
-						errmsg("Interconnect Error: Unexpected Motion Node Id: %d. During remove. State not valid",
-							   motNodeID)));
+		ereport(ERROR,
+				(errcode(ERRCODE_GP_INTERCONNECTION_ERROR),
+				 errmsg("interconnect error: Unexpected Motion Node Id: %d",
+						motNodeID),
+				 errdetail("During remove. State not valid")));
 	}
 	else
 	{
@@ -728,59 +700,6 @@ removeChunkTransportState(ChunkTransportState *transportStates,
 	MPP_FD_ZERO(&pEntry->readSet);
 
 	return pEntry;
-}
-
-#ifdef AMS_VERBOSE_LOGGING
-void
-dumpEntryConnections(int elevel, ChunkTransportStateEntry *pEntry)
-{
-	int			i;
-	MotionConn *conn;
-
-	for (i = 0; i < pEntry->numConns; i++)
-	{
-		conn = &pEntry->conns[i];
-		if (conn->sockfd == -1 &&
-			conn->state == mcsNull)
-			elog(elevel, "... motNodeId=%d conns[%d]:         not connected",
-				 pEntry->motNodeId, i);
-		else
-			elog(elevel, "... motNodeId=%d conns[%d]:  "
-				 "%s%d pid=%d sockfd=%d remote=%s local=%s",
-				 pEntry->motNodeId, i,
-				 (i < pEntry->numPrimaryConns) ? "seg" : "mir",
-				 conn->remoteContentId,
-				 conn->cdbProc ? conn->cdbProc->pid : 0,
-				 conn->sockfd,
-				 conn->remoteHostAndPort,
-				 conn->localHostAndPort);
-	}
-}
-#endif
-
-/*
- * Set the listener address associated with the slice to
- * the master address that is established through libpq
- * connection. This guarantees that the outgoing connections
- * will connect to an address that is reachable in the event
- * when the master can not be reached by segments through
- * the network interface recorded in the catalog.
- */
-void
-adjustMasterRouting(Slice *recvSlice)
-{
-	ListCell   *lc = NULL;
-
-	foreach(lc, recvSlice->primaryProcesses)
-	{
-		CdbProcess *cdbProc = (CdbProcess *) lfirst(lc);
-
-		if (cdbProc)
-		{
-			if (cdbProc->listenerAddr == NULL)
-				cdbProc->listenerAddr = pstrdup(MyProcPort->remote_host);
-		}
-	}
 }
 
 /*
@@ -886,7 +805,7 @@ cleanup_interconnect_handle(interconnect_handle_t *h)
 		destroy_interconnect_handle(h);
 		return;
 	}
-	TeardownInterconnect(h->interconnect_context, true /* force EOS */, true);
+	TeardownInterconnect(h->interconnect_context, true);
 }
 
 static void
@@ -915,4 +834,38 @@ interconnect_abort_callback(ResourceReleasePhase phase,
 			cleanup_interconnect_handle(curr);
 		}
 	}
+}
+
+/*
+ * format_sockaddr
+ *			Format a sockaddr to a human readable string
+ *
+ * This function must be kept threadsafe, elog/ereport/palloc etc are not
+ * allowed within this function.
+ */
+char *
+format_sockaddr(struct sockaddr_storage *sa, char *buf, size_t len)
+{
+	int			ret;
+	char		remote_host[NI_MAXHOST];
+	char		remote_port[NI_MAXSERV];
+
+	ret = pg_getnameinfo_all(sa, sizeof(struct sockaddr_storage),
+							 remote_host, sizeof(remote_host),
+							 remote_port, sizeof(remote_port),
+							 NI_NUMERICHOST | NI_NUMERICSERV);
+
+	if (ret != 0)
+		snprintf(buf, len, "?host?:?port?");
+	else
+	{
+#ifdef HAVE_IPV6
+		if (sa->ss_family == AF_INET6)
+			snprintf(buf, len, "[%s]:%s", remote_host, remote_port);
+		else
+#endif
+			snprintf(buf, len, "%s:%s", remote_host, remote_port);
+	}
+
+	return buf;
 }

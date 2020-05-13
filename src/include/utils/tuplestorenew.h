@@ -25,9 +25,8 @@ typedef struct NTupleStore NTupleStore;
 void ntuplestore_setinstrument(NTupleStore* ts, struct Instrumentation *ins);
 
 /* Tuple store method */
-extern NTupleStore *ntuplestore_create(int64 maxBytes);
-extern NTupleStore *ntuplestore_create_readerwriter(const char* filename, int64 maxBytes, bool isWriter);
-extern NTupleStore *ntuplestore_create_workset(workfile_set *workSet, int64 maxBytes);
+extern NTupleStore *ntuplestore_create(int64 maxBytes, char *operation_name);
+extern NTupleStore *ntuplestore_create_readerwriter(const char* filename, int64 maxBytes, bool isWriter, bool useWorkFile);
 extern bool ntuplestore_is_readerwriter_reader(NTupleStore* nts);
 extern void ntuplestore_flush(NTupleStore *ts);
 extern void ntuplestore_destroy(NTupleStore *ts);
@@ -52,7 +51,6 @@ extern bool ntuplestore_acc_advance(NTupleStoreAccessor *tsa, int n);
  * to make sure trim does not trim too far ahead
  */
 extern bool ntuplestore_acc_current_tupleslot(NTupleStoreAccessor *tsa, TupleTableSlot *slot);
-extern bool ntuplestore_acc_current_data(NTupleStoreAccessor *tsa, void **data, int *len);
 
 /* Tell/seek position of accessor. */
 
@@ -67,5 +65,6 @@ extern bool ntuplestore_acc_seek_first(NTupleStoreAccessor *tsa);
 extern bool ntuplestore_acc_seek_last(NTupleStoreAccessor *tsa);
 extern void ntuplestore_acc_seek_bof(NTupleStoreAccessor *tsa);
 extern void ntuplestore_acc_seek_eof(NTupleStoreAccessor *tsa);
+extern void ntuplestore_set_is_temp_file(NTupleStore *ts, bool isTempFile);
 
 #endif /* TUPSTORE_NEW_H */

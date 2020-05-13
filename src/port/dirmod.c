@@ -3,7 +3,7 @@
  * dirmod.c
  *	  directory handling functions
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *	This includes replacement versions of functions that work on
@@ -143,7 +143,7 @@ typedef struct
 	WORD		SubstituteNameLength;
 	WORD		PrintNameOffset;
 	WORD		PrintNameLength;
-	WCHAR		PathBuffer[1];
+	WCHAR		PathBuffer[FLEXIBLE_ARRAY_MEMBER];
 } REPARSE_JUNCTION_DATA_BUFFER;
 
 #define REPARSE_JUNCTION_DATA_BUFFER_HEADER_SIZE   \
@@ -160,7 +160,7 @@ pgsymlink(const char *oldpath, const char *newpath)
 {
 	HANDLE		dirhandle;
 	DWORD		len;
-	char		buffer[MAX_PATH * sizeof(WCHAR) + sizeof(REPARSE_JUNCTION_DATA_BUFFER)];
+	char		buffer[MAX_PATH * sizeof(WCHAR) + offsetof(REPARSE_JUNCTION_DATA_BUFFER, PathBuffer)];
 	char		nativeTarget[MAX_PATH];
 	char	   *p = nativeTarget;
 	REPARSE_JUNCTION_DATA_BUFFER *reparseBuf = (REPARSE_JUNCTION_DATA_BUFFER *) buffer;
@@ -174,10 +174,10 @@ pgsymlink(const char *oldpath, const char *newpath)
 		return -1;
 
 	/* make sure we have an unparsed native win32 path */
-	if (memcmp("\\??\\", oldpath, 4))
-		sprintf(nativeTarget, "\\??\\%s", oldpath);
+	if (memcmp("\\??\\", oldpath, 4) != 0)
+		snprintf(nativeTarget, sizeof(nativeTarget), "\\??\\%s", oldpath);
 	else
-		strcpy(nativeTarget, oldpath);
+		strlcpy(nativeTarget, oldpath, sizeof(nativeTarget));
 
 	while ((p = strchr(p, '/')) != NULL)
 		*p++ = '\\';
@@ -206,7 +206,9 @@ pgsymlink(const char *oldpath, const char *newpath)
 		LPSTR		msg;
 
 		errno = 0;
-		FormatMessage(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM,
+		FormatMessage(FORMAT_MESSAGE_ALLOCATE_BUFFER |
+					  FORMAT_MESSAGE_IGNORE_INSERTS |
+					  FORMAT_MESSAGE_FROM_SYSTEM,
 					  NULL, GetLastError(),
 					  MAKELANGID(LANG_ENGLISH, SUBLANG_DEFAULT),
 					  (LPSTR) &msg, 0, NULL);
@@ -239,7 +241,7 @@ pgreadlink(const char *path, char *buf, size_t size)
 {
 	DWORD		attr;
 	HANDLE		h;
-	char		buffer[MAX_PATH * sizeof(WCHAR) + sizeof(REPARSE_JUNCTION_DATA_BUFFER)];
+	char		buffer[MAX_PATH * sizeof(WCHAR) + offsetof(REPARSE_JUNCTION_DATA_BUFFER, PathBuffer)];
 	REPARSE_JUNCTION_DATA_BUFFER *reparseBuf = (REPARSE_JUNCTION_DATA_BUFFER *) buffer;
 	DWORD		len;
 	int			r;
@@ -281,7 +283,9 @@ pgreadlink(const char *path, char *buf, size_t size)
 		LPSTR		msg;
 
 		errno = 0;
-		FormatMessage(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM,
+		FormatMessage(FORMAT_MESSAGE_ALLOCATE_BUFFER |
+					  FORMAT_MESSAGE_IGNORE_INSERTS |
+					  FORMAT_MESSAGE_FROM_SYSTEM,
 					  NULL, GetLastError(),
 					  MAKELANGID(LANG_ENGLISH, SUBLANG_DEFAULT),
 					  (LPSTR) &msg, 0, NULL);

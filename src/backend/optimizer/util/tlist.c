@@ -5,7 +5,7 @@
  *
  * Portions Copyright (c) 2007-2008, Greenplum inc
  * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -117,13 +117,12 @@ tlist_member_ignore_relabel(Node *node, List *targetlist)
 /*
  * tlist_member_match_var
  *	  Same as above, except that we match the provided Var on the basis
- *	  of varno/varattno/varlevelsup only, rather than using full equal().
+ *	  of varno/varattno/varlevelsup/vartype only, rather than full equal().
  *
  * This is needed in some cases where we can't be sure of an exact typmod
- * match.  It's probably a good idea to check the vartype anyway, but
- * we leave it to the caller to apply any suitable sanity checks.
+ * match.  For safety, though, we insist on vartype match.
  */
-TargetEntry *
+static TargetEntry *
 tlist_member_match_var(Var *var, List *targetlist)
 {
 	ListCell   *temp;
@@ -137,38 +136,11 @@ tlist_member_match_var(Var *var, List *targetlist)
 			continue;
 		if (var->varno == tlvar->varno &&
 			var->varattno == tlvar->varattno &&
-			var->varlevelsup == tlvar->varlevelsup)
+			var->varlevelsup == tlvar->varlevelsup &&
+			var->vartype == tlvar->vartype)
 			return tlentry;
 	}
 	return NULL;
-}
-
-/*
- * flatten_tlist
- *	  Create a target list that only contains unique variables.
- *
- * Aggrefs and PlaceHolderVars in the input are treated according to
- * aggbehavior and phbehavior, for which see pull_var_clause().
- *
- * 'tlist' is the current target list
- *
- * Returns the "flattened" new target list.
- *
- * The result is entirely new structure sharing no nodes with the original.
- * Copying the Var nodes is probably overkill, but be safe for now.
- */
-List *
-flatten_tlist(List *tlist, PVCAggregateBehavior aggbehavior,
-			  PVCPlaceHolderBehavior phbehavior)
-{
-	List	   *vlist = pull_var_clause((Node *) tlist,
-										aggbehavior,
-										phbehavior);
-	List	   *new_tlist;
-
-	new_tlist = add_to_flat_tlist(NIL, vlist);
-	list_free(vlist);
-	return new_tlist;
 }
 
 /*
@@ -233,6 +205,27 @@ get_tlist_exprs(List *tlist, bool includeJunk)
 		result = lappend(result, tle->expr);
 	}
 	return result;
+}
+
+
+/*
+ * count_nonjunk_tlist_entries
+ *		What it says ...
+ */
+int
+count_nonjunk_tlist_entries(List *tlist)
+{
+	int			len = 0;
+	ListCell   *l;
+
+	foreach(l, tlist)
+	{
+		TargetEntry *tle = (TargetEntry *) lfirst(l);
+
+		if (!tle->resjunk)
+			len++;
+	}
+	return len;
 }
 
 
@@ -344,6 +337,34 @@ tlist_same_collations(List *tlist, List *colCollations, bool junkOK)
 	return true;
 }
 
+/*
+ * apply_tlist_labeling
+ *		Apply the TargetEntry labeling attributes of src_tlist to dest_tlist
+ *
+ * This is useful for reattaching column names etc to a plan's final output
+ * targetlist.
+ */
+void
+apply_tlist_labeling(List *dest_tlist, List *src_tlist)
+{
+	ListCell   *ld,
+			   *ls;
+
+	Assert(list_length(dest_tlist) == list_length(src_tlist));
+	forboth(ld, dest_tlist, ls, src_tlist)
+	{
+		TargetEntry *dest_tle = (TargetEntry *) lfirst(ld);
+		TargetEntry *src_tle = (TargetEntry *) lfirst(ls);
+
+		Assert(dest_tle->resno == src_tle->resno);
+		dest_tle->resname = src_tle->resname;
+		dest_tle->ressortgroupref = src_tle->ressortgroupref;
+		dest_tle->resorigtbl = src_tle->resorigtbl;
+		dest_tle->resorigcol = src_tle->resorigcol;
+		dest_tle->resjunk = src_tle->resjunk;
+	}
+}
+
 
 /*
  * get_sortgroupref_tle
@@ -363,13 +384,7 @@ get_sortgroupref_tle(Index sortref, List *targetList)
 			return tle;
 	}
 
-	/*
-	 * XXX: we probably should catch this earlier, but we have a
-	 * few queries in the regression suite that hit this.
-	 */
-	ereport(ERROR,
-			(errcode(ERRCODE_SYNTAX_ERROR),
-			 errmsg("ORDER/GROUP BY expression not found in targetlist")));
+	elog(ERROR, "ORDER/GROUP BY expression not found in targetlist");
 	return NULL;				/* keep compiler quiet */
 }
 
@@ -434,15 +449,6 @@ get_sortgroupclauses_tles_recurse(List *clauses, List *targetList,
 		{
 			get_sortgroupclauses_tles_recurse((List *) node, targetList,
 											  tles, sortops, eqops);
-		}
-		else if (IsA(node, GroupingClause))
-		{
-			/* GroupingClauses are collected into separate list */
-			get_sortgroupclauses_tles_recurse(((GroupingClause *) node)->groupsets,
-											  targetList,
-											  &sub_grouping_tles,
-											  &sub_grouping_sortops,
-											  &sub_grouping_eqops);
 		}
 		else
 			elog(ERROR, "unrecognized node type in list of sort/group clauses: %d",
@@ -513,113 +519,46 @@ get_sortgrouplist_exprs(List *sgClauses, List *targetList)
 }
 
 /*
- * get_grouplist_colidx
- *		Given a list of GroupClauses, build an array of the referenced
- *		targetlist resnos and their sort operators.  If numCols is not NULL,
- *		it is filled by the length of returned array.  Results are allocated
- *		by palloc.
+ * get_sortgroupref_clause
+ *		Find the SortGroupClause matching the given SortGroupRef index,
+ *		and return it.
  */
-void
-get_grouplist_colidx(List *groupClauses, List *targetList, int *numCols,
-					 AttrNumber **colIdx, Oid **grpOperators)
+SortGroupClause *
+get_sortgroupref_clause(Index sortref, List *clauses)
 {
-	List	   *tles;
-	List	   *sortops;
-	List	   *eqops;
-	ListCell   *lc_tle;
-	ListCell   *lc_eqop;
-	int			i,
-				len;
+	ListCell   *l;
 
-	len = num_distcols_in_grouplist(groupClauses);
-	if (numCols)
-		*numCols = len;
-
-	if (len == 0)
+	foreach(l, clauses)
 	{
-		*colIdx = NULL;
-		*grpOperators = NULL;
-		return;
+		SortGroupClause *cl = (SortGroupClause *) lfirst(l);
+
+		if (cl->tleSortGroupRef == sortref)
+			return cl;
 	}
 
-	get_sortgroupclauses_tles(groupClauses, targetList, &tles, &sortops, &eqops);
-
-	*colIdx = (AttrNumber *) palloc(sizeof(AttrNumber) * len);
-	*grpOperators = (Oid *) palloc(sizeof(Oid) * len);
-
-	i = 0;
-	forboth(lc_tle, tles, lc_eqop, eqops)
-	{
-		TargetEntry	*tle = lfirst(lc_tle);
-		Oid			eqop = lfirst_oid(lc_eqop);
-
-		Assert (i < len);
-
-		(*colIdx)[i] = tle->resno;
-		(*grpOperators)[i] = eqop;
-		if (!OidIsValid((*grpOperators)[i]))		/* shouldn't happen */
-			elog(ERROR, "could not find equality operator for ordering operator %u",
-				 (*grpOperators)[i]);
-		i++;
-	}
+	elog(ERROR, "ORDER/GROUP BY expression not found in list");
+	return NULL;				/* keep compiler quiet */
 }
 
 /*
- * get_grouplist_exprs
- *     Find a list of unique referenced targetlist expressions used in a given
- *     list of GroupClauses or a GroupingClauses.
- *
- * All expressions will appear in the same order as they appear in the
- * given list of GroupClauses or a GroupingClauses.
- *
- * Note that the top-level empty sets will be removed here.
+ * get_sortgroupref_clause_noerr
+ *		As above, but return NULL rather than throwing an error if not found.
  */
-List *
-get_grouplist_exprs(List *groupClauses, List *targetList)
+SortGroupClause *
+get_sortgroupref_clause_noerr(Index sortref, List *clauses)
 {
-	List *result = NIL;
-	ListCell *l;
+	ListCell   *l;
 
-	foreach (l, groupClauses)
+	foreach(l, clauses)
 	{
-		Node *groupClause = lfirst(l);
+		SortGroupClause *cl = (SortGroupClause *) lfirst(l);
 
-		if (groupClause == NULL)
-			continue;
-
-		Assert(IsA(groupClause, SortGroupClause) ||
-			   IsA(groupClause, GroupingClause) ||
-			   IsA(groupClause, List));
-
-		if (IsA(groupClause, SortGroupClause))
-		{
-			Node *expr = get_sortgroupclause_expr((SortGroupClause *) groupClause,
-												  targetList);
-
-			if (!list_member(result, expr))
-				result = lappend(result, expr);
-		}
-
-		else if (IsA(groupClause, List))
-			result = list_concat_unique(result,
-								 get_grouplist_exprs((List *)groupClause, targetList));
-
-		else
-			result = list_concat_unique(result,
-								 get_grouplist_exprs(((GroupingClause*)groupClause)->groupsets,
-													 targetList));
+		if (cl->tleSortGroupRef == sortref)
+			return cl;
 	}
 
-	return result;
+	return NULL;
 }
-
-
-/*****************************************************************************
- *		Functions to extract data from a list of SortGroupClauses
- *
- * These don't really belong in tlist.c, but they are sort of related to the
- * functions just above, and they don't seem to deserve their own file.
- *****************************************************************************/
 
 /*
  * extract_grouping_ops - make an array of the equality operator OIDs
@@ -684,31 +623,10 @@ grouping_is_sortable(List *groupClause)
 
 	foreach(glitem, groupClause)
 	{
-		Node	   *node = lfirst(glitem);
+		SortGroupClause *groupcl = (SortGroupClause *) lfirst(glitem);
 
-		if (node == NULL)
-			continue;
-
-		if (IsA(node, List))
-		{
-			if (!grouping_is_sortable((List *) node))
-				return false;
-		}
-		else if (IsA(node, GroupingClause))
-		{
-			if (!grouping_is_sortable(((GroupingClause *) node)->groupsets))
-				return false;
-		}
-		else
-		{
-			SortGroupClause *groupcl;
-
-			Assert(IsA(node, SortGroupClause));
-
-			groupcl = (SortGroupClause *) node;
-			if (!OidIsValid(groupcl->sortop))
-				return false;
-		}
+		if (!OidIsValid(groupcl->sortop))
+			return false;
 	}
 	return true;
 }
@@ -725,32 +643,13 @@ grouping_is_hashable(List *groupClause)
 
 	foreach(glitem, groupClause)
 	{
-		Node	   *node = lfirst(glitem);
+		SortGroupClause *groupcl = (SortGroupClause *) lfirst(glitem);
 
-		if (node == NULL)
-			continue;
-
-		if (IsA(node, List))
-		{
-			if (!grouping_is_hashable((List *) node))
-				return false;
-		}
-		else if (IsA(node, GroupingClause))
-		{
-			if (!grouping_is_hashable(((GroupingClause *) node)->groupsets))
-				return false;
-		}
-		else
-		{
-			SortGroupClause *groupcl = (SortGroupClause *) node;
-
-			if (!groupcl->hashable)
-				return false;
-		}
+		if (!groupcl->hashable)
+			return false;
 	}
 	return true;
 }
-
 
 /*
  * Return the largest sortgroupref value in use in the given
@@ -849,4 +748,236 @@ int get_row_width(List *tlist)
 	}
 
     return width;
+}
+
+/*****************************************************************************
+ *		PathTarget manipulation functions
+ *
+ * PathTarget is a somewhat stripped-down version of a full targetlist; it
+ * omits all the TargetEntry decoration except (optionally) sortgroupref data,
+ * and it adds evaluation cost and output data width info.
+ *****************************************************************************/
+
+/*
+ * make_pathtarget_from_tlist
+ *	  Construct a PathTarget equivalent to the given targetlist.
+ *
+ * This leaves the cost and width fields as zeroes.  Most callers will want
+ * to use create_pathtarget(), so as to get those set.
+ */
+PathTarget *
+make_pathtarget_from_tlist(List *tlist)
+{
+	PathTarget *target = makeNode(PathTarget);
+	int			i;
+	ListCell   *lc;
+
+	target->sortgrouprefs = (Index *) palloc(list_length(tlist) * sizeof(Index));
+
+	i = 0;
+	foreach(lc, tlist)
+	{
+		TargetEntry *tle = (TargetEntry *) lfirst(lc);
+
+		target->exprs = lappend(target->exprs, tle->expr);
+		target->sortgrouprefs[i] = tle->ressortgroupref;
+		i++;
+	}
+
+	return target;
+}
+
+/*
+ * make_tlist_from_pathtarget
+ *	  Construct a targetlist from a PathTarget.
+ */
+List *
+make_tlist_from_pathtarget(PathTarget *target)
+{
+	List	   *tlist = NIL;
+	int			i;
+	ListCell   *lc;
+
+	i = 0;
+	foreach(lc, target->exprs)
+	{
+		Expr	   *expr = (Expr *) lfirst(lc);
+		TargetEntry *tle;
+
+		tle = makeTargetEntry(expr,
+							  i + 1,
+							  NULL,
+							  false);
+		if (target->sortgrouprefs)
+			tle->ressortgroupref = target->sortgrouprefs[i];
+		tlist = lappend(tlist, tle);
+		i++;
+	}
+
+	return tlist;
+}
+
+/*
+ * copy_pathtarget
+ *	  Copy a PathTarget.
+ *
+ * The new PathTarget has its own List cells, but shares the underlying
+ * target expression trees with the old one.  We duplicate the List cells
+ * so that items can be added to one target without damaging the other.
+ */
+PathTarget *
+copy_pathtarget(PathTarget *src)
+{
+	PathTarget *dst = makeNode(PathTarget);
+
+	/* Copy scalar fields */
+	memcpy(dst, src, sizeof(PathTarget));
+	/* Shallow-copy the expression list */
+	dst->exprs = list_copy(src->exprs);
+	/* Duplicate sortgrouprefs if any (if not, the memcpy handled this) */
+	if (src->sortgrouprefs)
+	{
+		Size		nbytes = list_length(src->exprs) * sizeof(Index);
+
+		dst->sortgrouprefs = (Index *) palloc(nbytes);
+		memcpy(dst->sortgrouprefs, src->sortgrouprefs, nbytes);
+	}
+	return dst;
+}
+
+/*
+ * create_empty_pathtarget
+ *	  Create an empty (zero columns, zero cost) PathTarget.
+ */
+PathTarget *
+create_empty_pathtarget(void)
+{
+	/* This is easy, but we don't want callers to hard-wire this ... */
+	return makeNode(PathTarget);
+}
+
+/*
+ * add_column_to_pathtarget
+ *		Append a target column to the PathTarget.
+ *
+ * As with make_pathtarget_from_tlist, we leave it to the caller to update
+ * the cost and width fields.
+ */
+void
+add_column_to_pathtarget(PathTarget *target, Expr *expr, Index sortgroupref)
+{
+	/* Updating the exprs list is easy ... */
+	target->exprs = lappend(target->exprs, expr);
+	/* ... the sortgroupref data, a bit less so */
+	if (target->sortgrouprefs)
+	{
+		int			nexprs = list_length(target->exprs);
+
+		/* This might look inefficient, but actually it's usually cheap */
+		target->sortgrouprefs = (Index *)
+			repalloc(target->sortgrouprefs, nexprs * sizeof(Index));
+		target->sortgrouprefs[nexprs - 1] = sortgroupref;
+	}
+	else if (sortgroupref)
+	{
+		/* Adding sortgroupref labeling to a previously unlabeled target */
+		int			nexprs = list_length(target->exprs);
+
+		target->sortgrouprefs = (Index *) palloc0(nexprs * sizeof(Index));
+		target->sortgrouprefs[nexprs - 1] = sortgroupref;
+	}
+}
+
+/*
+ * add_new_column_to_pathtarget
+ *		Append a target column to the PathTarget, but only if it's not
+ *		equal() to any pre-existing target expression.
+ *
+ * The caller cannot specify a sortgroupref, since it would be unclear how
+ * to merge that with a pre-existing column.
+ *
+ * As with make_pathtarget_from_tlist, we leave it to the caller to update
+ * the cost and width fields.
+ */
+void
+add_new_column_to_pathtarget(PathTarget *target, Expr *expr)
+{
+	if (!list_member(target->exprs, expr))
+		add_column_to_pathtarget(target, expr, 0);
+}
+
+/*
+ * add_new_columns_to_pathtarget
+ *		Apply add_new_column_to_pathtarget() for each element of the list.
+ */
+void
+add_new_columns_to_pathtarget(PathTarget *target, List *exprs)
+{
+	ListCell   *lc;
+
+	foreach(lc, exprs)
+	{
+		Expr	   *expr = (Expr *) lfirst(lc);
+
+		add_new_column_to_pathtarget(target, expr);
+	}
+}
+
+/*
+ * apply_pathtarget_labeling_to_tlist
+ *		Apply any sortgrouprefs in the PathTarget to matching tlist entries
+ *
+ * Here, we do not assume that the tlist entries are one-for-one with the
+ * PathTarget.  The intended use of this function is to deal with cases
+ * where createplan.c has decided to use some other tlist and we have
+ * to identify what matches exist.
+ */
+void
+apply_pathtarget_labeling_to_tlist(List *tlist, PathTarget *target)
+{
+	int			i;
+	ListCell   *lc;
+
+	/* Nothing to do if PathTarget has no sortgrouprefs data */
+	if (target->sortgrouprefs == NULL)
+		return;
+
+	i = 0;
+	foreach(lc, target->exprs)
+	{
+		Expr	   *expr = (Expr *) lfirst(lc);
+		TargetEntry *tle;
+
+		if (target->sortgrouprefs[i])
+		{
+			/*
+			 * For Vars, use tlist_member_match_var's weakened matching rule;
+			 * this allows us to deal with some cases where a set-returning
+			 * function has been inlined, so that we now have more knowledge
+			 * about what it returns than we did when the original Var was
+			 * created.  Otherwise, use regular equal() to find the matching
+			 * TLE.  (In current usage, only the Var case is actually needed;
+			 * but it seems best to have sane behavior here for non-Vars too.)
+			 */
+			if (expr && IsA(expr, Var))
+				tle = tlist_member_match_var((Var *) expr, tlist);
+			else
+				tle = tlist_member((Node *) expr, tlist);
+
+			/*
+			 * Complain if noplace for the sortgrouprefs label, or if we'd
+			 * have to label a column twice.  (The case where it already has
+			 * the desired label probably can't happen, but we may as well
+			 * allow for it.)
+			 */
+			if (!tle)
+				elog(ERROR, "ORDER/GROUP BY expression not found in targetlist");
+			if (tle->ressortgroupref != 0 &&
+				tle->ressortgroupref != target->sortgrouprefs[i])
+				elog(ERROR, "targetlist item has multiple sortgroupref labels");
+
+			tle->ressortgroupref = target->sortgrouprefs[i];
+		}
+		i++;
+	}
 }

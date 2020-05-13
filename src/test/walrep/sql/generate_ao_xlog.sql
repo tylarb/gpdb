@@ -8,7 +8,7 @@ INSERT INTO tmp SELECT 1, gp_execution_segment(), pg_current_xlog_location()
 FROM gp_dist_random('gp_id');
 
 -- Generate some xlog records for AO
-INSERT INTO generate_ao_xlog_table VALUES(1, 10), (2, 10), (8, 10), (3, 10);
+INSERT INTO generate_ao_xlog_table SELECT i,i+3 FROM generate_series(1,15)i;
 
 -- Verify that the insert AO xlog record was received
 SELECT gp_segment_id, relname, record_type, segment_filenum, recordlen, file_offset

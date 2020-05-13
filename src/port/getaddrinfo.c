@@ -13,7 +13,7 @@
  * use the Windows native routines, but if not, we use our own.
  *
  *
- * Copyright (c) 2003-2014, PostgreSQL Global Development Group
+ * Copyright (c) 2003-2016, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/port/getaddrinfo.c
@@ -404,7 +404,7 @@ getnameinfo(const struct sockaddr * sa, int salen,
 			ret = snprintf(service, servicelen, "%d",
 						   ntohs(((struct sockaddr_in *) sa)->sin_port));
 		}
-		if (ret == -1 || ret >= servicelen)
+		if (ret < 0 || ret >= servicelen)
 			return EAI_MEMORY;
 	}
 

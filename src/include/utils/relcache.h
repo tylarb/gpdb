@@ -6,7 +6,7 @@
  *
  * Portions Copyright (c) 2005-2009, Greenplum inc.
  * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/utils/relcache.h
@@ -40,6 +40,7 @@ extern void RelationClose(Relation relation);
  * Routines to compute/retrieve additional cached information
  */
 struct GpPolicy *RelationGetPartitioningKey(Relation relation);
+extern List *RelationGetFKeyList(Relation relation);
 extern List *RelationGetIndexList(Relation relation);
 extern Oid	RelationGetOidIndex(Relation relation);
 extern Oid	RelationGetReplicaIndex(Relation relation);
@@ -98,7 +99,7 @@ extern Relation RelationBuildLocalRelation(const char *relname,
 /*
  * Routine to manage assignment of new relfilenode to a relation
  */
-extern void RelationSetNewRelfilenode(Relation relation,
+extern void RelationSetNewRelfilenode(Relation relation, char persistence,
 						  TransactionId freezeXid, MultiXactId minmulti);
 
 /*

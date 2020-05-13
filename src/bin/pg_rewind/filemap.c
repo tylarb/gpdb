@@ -3,7 +3,7 @@
  * filemap.c
  *	  A data structure for keeping track of files that have changed.
  *
- * Copyright (c) 2013-2015, PostgreSQL Global Development Group
+ * Copyright (c) 2013-2016, PostgreSQL Global Development Group
  *
  *-------------------------------------------------------------------------
  */
@@ -20,6 +20,7 @@
 #include "pg_rewind.h"
 
 #include "catalog/catalog.h"
+#include "common/string.h"
 #include "catalog/pg_tablespace.h"
 #include "storage/fd.h"
 
@@ -31,6 +32,88 @@ static char *datasegpath(RelFileNode rnode, ForkNumber forknum,
 static int	path_cmp(const void *a, const void *b);
 static int	final_filemap_cmp(const void *a, const void *b);
 static void filemap_list_to_array(filemap_t *map);
+static bool check_file_excluded(const char *path, const char *type);
+
+/*
+ * The contents of these directories are removed or recreated during server
+ * start so they are not included in data processed by pg_rewind.
+ *
+ * Note: those lists should be kept in sync with what basebackup.c provides.
+ * Some of the values, contrary to what basebackup.c uses, are hardcoded as
+ * they are defined in backend-only headers.  So this list is maintained
+ * with a best effort in mind.
+ */
+static const char *excludeDirContents[] =
+{
+	/*
+	 * Skip temporary statistics files. PG_STAT_TMP_DIR must be skipped even
+	 * when stats_temp_directory is set because PGSS_TEXT_FILE is always
+	 * created there.
+	 */
+	"pg_stat_tmp",	/* defined as PG_STAT_TMP_DIR */
+
+	/*
+	 * It is generally not useful to backup the contents of this directory
+	 * even if the intention is to restore to another master. See backup.sgml
+	 * for a more detailed description.
+	 */
+	"pg_replslot",
+
+	/* Contents removed on startup, see dsm_cleanup_for_mmap(). */
+	"pg_dynshmem",	/* defined as PG_DYNSHMEM_DIR */
+
+	/* Contents removed on startup, see AsyncShmemInit(). */
+	"pg_notify",
+
+	/*
+	 * Old contents are loaded for possible debugging but are not required for
+	 * normal operation, see OldSerXidInit().
+	 */
+	"pg_serial",
+
+	/* Contents removed on startup, see DeleteAllExportedSnapshotFiles(). */
+	"pg_snapshots",
+
+	/* Contents zeroed on startup, see StartupSUBTRANS(). */
+	"pg_subtrans",
+
+	/* Contents unique to each segment instance. */
+	"pg_log",
+
+	/* end of list */
+	NULL
+};
+
+/*
+ * List of files excluded from filemap processing.
+ */
+static const char *excludeFiles[] =
+{
+	/* Skip auto conf temporary file. */
+	"postgresql.auto.conf.tmp", /* defined as PG_AUTOCONF_FILENAME */
+
+	/* Skip current log file temporary file */
+	"current_logfiles.tmp",		/* defined as LOG_METAINFO_DATAFILE_TMP */
+
+	/* Skip relation cache because it is rebuilt on startup */
+	"pg_internal.init",			/* defined as RELCACHE_INIT_FILENAME */
+
+	/*
+	 * If there's a backup_label or tablespace_map file, it belongs to a
+	 * backup started by the user with pg_start_backup().  It is *not* correct
+	 * for this backup.  Our backup_label is written later on separately.
+	 */
+	"backup_label",				/* defined as BACKUP_LABEL_FILE */
+	"tablespace_map",			/* defined as TABLESPACE_MAP */
+
+	"postmaster.pid",
+	"postmaster.opts",
+
+	GP_INTERNAL_AUTO_CONF_FILE_NAME,
+
+	/* end of list */
+	NULL
+};
 
 /*
  * Create a new file map (stored in the global pointer "filemap").
@@ -74,6 +157,7 @@ process_source_file(const char *path, file_type_t type, size_t newsize,
 					const char *link_target)
 {
 	bool		exists;
+	bool		is_gp_tablespace = false;
 	char		localpath[MAXPGPATH];
 	struct stat statbuf;
 	filemap_t  *map = filemap;
@@ -83,16 +167,21 @@ process_source_file(const char *path, file_type_t type, size_t newsize,
 
 	Assert(map->array == NULL);
 
-	/*
-	 * Completely ignore some special files in source and destination.
-	 */
-	if (strcmp(path, "postmaster.pid") == 0 ||
-		strcmp(path, "postmaster.opts") == 0)
+	/* ignore any path matching the exclusion filters */
+	if (check_file_excluded(path, "source"))
 		return;
 
 	/*
 	 * Pretend that pg_xlog is a directory, even if it's really a symlink.
 	 * We don't want to mess with the symlink itself, nor complain if it's a
+	 * symlink in source but not in target or vice versa.
+	 */
+	if (strcmp(path, "pg_xlog") == 0 && type == FILE_TYPE_SYMLINK)
+		type = FILE_TYPE_DIRECTORY;
+
+	/*
+	 * Pretend that pg_xlog is a directory, even if it's really a symlink. We
+	 * don't want to mess with the symlink itself, nor complain if it's a
 	 * symlink in source but not in target or vice versa.
 	 */
 	if (strcmp(path, "pg_xlog") == 0 && type == FILE_TYPE_SYMLINK)
@@ -162,7 +251,11 @@ process_source_file(const char *path, file_type_t type, size_t newsize,
 			}
 
 			if (!exists)
+			{
+				is_gp_tablespace =
+						 strncmp(path, "pg_tblspc/", strlen("pg_tblspc/")) == 0;
 				action = FILE_ACTION_CREATE;
+			}
 			else
 				action = FILE_ACTION_NONE;
 			oldsize = 0;
@@ -228,6 +321,9 @@ process_source_file(const char *path, file_type_t type, size_t newsize,
 					action = FILE_ACTION_NONE;
 			}
 			break;
+
+		case FILE_TYPE_FIFO:
+			break;
 	}
 
 	/* Create a new entry for this file */
@@ -242,6 +338,7 @@ process_source_file(const char *path, file_type_t type, size_t newsize,
 	entry->pagemap.bitmap = NULL;
 	entry->pagemap.bitmapsize = 0;
 	entry->isrelfile = isRelDataFile(path);
+	entry->is_gp_tablespace = is_gp_tablespace;
 
 	if (map->last)
 	{
@@ -272,6 +369,14 @@ process_target_file(const char *path, file_type_t type, size_t oldsize,
 	filemap_t  *map = filemap;
 	file_entry_t *entry;
 
+	/*
+	 * Ignore any path matching the exclusion filters.  This is not actually
+	 * mandatory for target files, but this does not hurt and let's be
+	 * consistent with the source processing.
+	 */
+	if (check_file_excluded(path, "target"))
+		return;
+
 	snprintf(localpath, sizeof(localpath), "%s/%s", datadir_target, path);
 	if (lstat(localpath, &statbuf) < 0)
 	{
@@ -299,11 +404,10 @@ process_target_file(const char *path, file_type_t type, size_t oldsize,
 	}
 
 	/*
-	 * Completely ignore some special files
+	 * Like in process_source_file, pretend that xlog is always a  directory.
 	 */
-	if (strcmp(path, "postmaster.pid") == 0 ||
-		strcmp(path, "postmaster.opts") == 0)
-		return;
+	if (strcmp(path, "pg_xlog") == 0 && type == FILE_TYPE_SYMLINK)
+		type = FILE_TYPE_DIRECTORY;
 
 	/*
 	 * Like in process_source_file, pretend that xlog is always a  directory.
@@ -422,6 +526,126 @@ process_block_change(ForkNumber forknum, RelFileNode rnode, BlockNumber blkno)
 		 * safely ignore it.
 		 */
 	}
+}
+
+void
+process_aofile_change(RelFileNode rnode, int segno, int64 offset)
+{
+	char	   *path;
+	file_entry_t key;
+	file_entry_t *key_ptr;
+	file_entry_t *entry;
+	filemap_t  *map = filemap;
+	file_entry_t **e;
+
+	Assert(map->array);
+
+	path = datasegpath(rnode, MAIN_FORKNUM, segno);
+
+	key.path = (char *) path;
+	key_ptr = &key;
+
+	e = bsearch(&key_ptr, map->array, map->narray, sizeof(file_entry_t *),
+				path_cmp);
+	if (e)
+		entry = *e;
+	else
+		entry = NULL;
+	pfree(path);
+
+	if (entry)
+	{
+		switch(entry->action)
+		{
+			case FILE_ACTION_COPY_TAIL:
+				/*
+				 * if the insertion happened in the area which copy_tail will
+				 * copy, no change in action needed. But if insert was
+				 * performed at offset lower than copy_tail's current starting
+				 * point, reset the starting point to lower value from xlog
+				 * record.
+				 */
+				if (offset < entry->oldsize)
+					entry->oldsize = offset;
+				break;
+			case FILE_ACTION_NONE:
+			case FILE_ACTION_TRUNCATE:
+				/*
+				 * if the insertion happened after the point we plan to
+				 * truncate, don't bother copying.
+				 */
+				if (offset < entry->newsize)
+				{
+					/*
+					 * convert action to copy_tail, to copy over the data
+					 * modified on target from source. Since the existing
+					 * action is FILE_ACTION_NONE or FILE_ACTION_TRUNCATE,
+					 * oldsize must be either equal or greater than newsize,
+					 * so we can safely assign offset to oldsize.
+					 */
+					Assert(offset <= entry->oldsize);
+					entry->oldsize = offset;
+					entry->action = FILE_ACTION_COPY_TAIL;
+				}
+				break;
+			case FILE_ACTION_COPY:
+			case FILE_ACTION_REMOVE:
+				break;
+			case FILE_ACTION_CREATE:
+				pg_fatal("unexpected AO file modification for directory or symbolic link \"%s\"\n", entry->path);
+		}
+
+		pg_log(PG_DEBUG, "Entry for path %s has action %d\n", entry->path, entry->action);
+	}
+	else
+	{
+		/* Similar to process_block_change(), the absence of the file entry is not an error */
+	}
+}
+
+/*
+ * Is this the path of file that pg_rewind can skip copying?
+ */
+static bool
+check_file_excluded(const char *path, const char *type)
+{
+	char	localpath[MAXPGPATH];
+	int		excludeIdx;
+	const char	*filename;
+
+	/* check individual files... */
+	for (excludeIdx = 0; excludeFiles[excludeIdx] != NULL; excludeIdx++)
+	{
+		filename = last_dir_separator(path);
+		if (filename == NULL)
+			filename = path;
+		else
+			filename++;
+		if (strcmp(filename, excludeFiles[excludeIdx]) == 0)
+		{
+			pg_log(PG_DEBUG, "entry \"%s\" excluded from %s file list\n",
+				   path, type);
+			return true;
+		}
+	}
+
+	/*
+	 * ... And check some directories.  Note that this includes any contents
+	 * within the directories themselves.
+	 */
+	for (excludeIdx = 0; excludeDirContents[excludeIdx] != NULL; excludeIdx++)
+	{
+		snprintf(localpath, sizeof(localpath), "%s/",
+				 excludeDirContents[excludeIdx]);
+		if (strstr(path, localpath) == path)
+		{
+			pg_log(PG_DEBUG, "entry \"%s\" excluded from %s file list\n",
+				   path, type);
+			return true;
+		}
+	}
+
+	return false;
 }
 
 /*
@@ -543,7 +767,11 @@ print_filemap(void)
 		if (entry->action != FILE_ACTION_NONE ||
 			entry->pagemap.bitmapsize > 0)
 		{
-			printf("%s (%s)\n", entry->path, action_to_str(entry->action));
+			pg_log(PG_DEBUG,
+			/*------
+			   translator: first %s is a file path, second is a keyword such as COPY */
+				   "%s (%s)\n", entry->path,
+				   action_to_str(entry->action));
 
 			if (entry->pagemap.bitmapsize > 0)
 				datapagemap_print(&entry->pagemap);

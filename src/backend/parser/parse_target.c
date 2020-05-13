@@ -3,7 +3,7 @@
  * parse_target.c
  *	  handle target lists
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -114,16 +114,23 @@ transformTargetEntry(ParseState *pstate,
  * transformTargetList()
  * Turns a list of ResTarget's into a list of TargetEntry's.
  *
- * At this point, we don't care whether we are doing SELECT, UPDATE,
- * or RETURNING; we just transform the given expressions (the "val" fields).
- * However, our subroutines care, so we need the exprKind parameter.
+ * This code acts mostly the same for SELECT, UPDATE, or RETURNING lists;
+ * the main thing is to transform the given expressions (the "val" fields).
+ * The exprKind parameter distinguishes these cases when necessary.
  */
 List *
 transformTargetList(ParseState *pstate, List *targetlist,
 					ParseExprKind exprKind)
 {
 	List	   *p_target = NIL;
+	bool		expand_star;
 	ListCell   *o_target;
+
+	/* Shouldn't have any leftover multiassign items at start */
+	Assert(pstate->p_multiassign_exprs == NIL);
+
+	/* Expand "something.*" in SELECT and RETURNING, but not UPDATE */
+	expand_star = (exprKind != EXPR_KIND_UPDATE_SOURCE);
 
 	foreach(o_target, targetlist)
 	{
@@ -134,35 +141,42 @@ transformTargetList(ParseState *pstate, List *targetlist,
 		 * "something", the star could appear as the last field in ColumnRef,
 		 * or as the last indirection item in A_Indirection.
 		 */
-		if (IsA(res->val, ColumnRef))
+		if (expand_star)
 		{
-			ColumnRef  *cref = (ColumnRef *) res->val;
-
-			if (IsA(llast(cref->fields), A_Star))
+			if (IsA(res->val, ColumnRef))
 			{
-				/* It is something.*, expand into multiple items */
-				p_target = list_concat(p_target,
-									   ExpandColumnRefStar(pstate, cref,
-														   true));
-				continue;
+				ColumnRef  *cref = (ColumnRef *) res->val;
+
+				if (IsA(llast(cref->fields), A_Star))
+				{
+					/* It is something.*, expand into multiple items */
+					p_target = list_concat(p_target,
+										   ExpandColumnRefStar(pstate,
+															   cref,
+															   true));
+					continue;
+				}
 			}
-		}
-		else if (IsA(res->val, A_Indirection))
-		{
-			A_Indirection *ind = (A_Indirection *) res->val;
-
-			if (IsA(llast(ind->indirection), A_Star))
+			else if (IsA(res->val, A_Indirection))
 			{
-				/* It is something.*, expand into multiple items */
-				p_target = list_concat(p_target,
-									   ExpandIndirectionStar(pstate, ind,
-															 true, exprKind));
-				continue;
+				A_Indirection *ind = (A_Indirection *) res->val;
+
+				if (IsA(llast(ind->indirection), A_Star))
+				{
+					/* It is something.*, expand into multiple items */
+					p_target = list_concat(p_target,
+										   ExpandIndirectionStar(pstate,
+																 ind,
+																 true,
+																 exprKind));
+					continue;
+				}
 			}
 		}
 
 		/*
-		 * Not "something.*", so transform as a single expression
+		 * Not "something.*", or we want to treat that as a plain whole-row
+		 * variable, so transform as a single expression
 		 */
 		p_target = lappend(p_target,
 						   transformTargetEntry(pstate,
@@ -171,6 +185,19 @@ transformTargetList(ParseState *pstate, List *targetlist,
 												exprKind,
 												res->name,
 												false));
+	}
+
+	/*
+	 * If any multiassign resjunk items were created, attach them to the end
+	 * of the targetlist.  This should only happen in an UPDATE tlist.  We
+	 * don't need to worry about numbering of these items; transformUpdateStmt
+	 * will set their resnos.
+	 */
+	if (pstate->p_multiassign_exprs)
+	{
+		Assert(exprKind == EXPR_KIND_UPDATE_SOURCE);
+		p_target = list_concat(p_target, pstate->p_multiassign_exprs);
+		pstate->p_multiassign_exprs = NIL;
 	}
 
 	return p_target;
@@ -234,6 +261,9 @@ transformExpressionList(ParseState *pstate, List *exprlist,
 		result = lappend(result,
 						 transformExpr(pstate, e, exprKind));
 	}
+
+	/* Shouldn't have any multiassign items here */
+	Assert(pstate->p_multiassign_exprs == NIL);
 
 	return result;
 }
@@ -521,11 +551,12 @@ transformAssignedExpr(ParseState *pstate,
 
 /*
  * updateTargetListEntry()
- *	This is used in UPDATE statements only. It prepares an UPDATE
- *	TargetEntry for assignment to a column of the target table.
- *	This includes coercing the given value to the target column's type
- *	(if necessary), and dealing with any subfield names or subscripts
- *	attached to the target column itself.
+ *	This is used in UPDATE statements (and ON CONFLICT DO UPDATE)
+ *	only.  It prepares an UPDATE TargetEntry for assignment to a
+ *	column of the target table.  This includes coercing the given
+ *	value to the target column's type (if necessary), and dealing with
+ *	any subfield names or subscripts attached to the target column
+ *	itself.
  *
  * pstate		parse state
  * tle			target list entry to be modified
@@ -633,7 +664,7 @@ transformAssignmentIndirection(ParseState *pstate,
 		if (IsA(n, A_Indices))
 		{
 			subscripts = lappend(subscripts, n);
-			if (((A_Indices *) n)->lidx != NULL)
+			if (((A_Indices *) n)->is_slice)
 				isSlice = true;
 		}
 		else if (IsA(n, A_Star))
@@ -1644,11 +1675,16 @@ FigureColnameInternal(Node *node, char **name)
 			*name = strVal(llast(((FuncCall *) node)->funcname));
 			return 2;
 		case T_A_Expr:
-			/* make nullif() act like a regular function */
 			if (((A_Expr *) node)->kind == AEXPR_NULLIF)
 			{
+				/* make nullif() act like a regular function */
 				*name = "nullif";
 				return 2;
+			}
+			if (((A_Expr *) node)->kind == AEXPR_PAREN)
+			{
+				/* look through dummy parenthesis node */
+				return FigureColnameInternal(((A_Expr *) node)->lexpr, name);
 			}
 			break;
 		case T_TypeCast:
@@ -1665,6 +1701,14 @@ FigureColnameInternal(Node *node, char **name)
 			break;
 		case T_CollateClause:
 			return FigureColnameInternal(((CollateClause *) node)->arg, name);
+		case T_GroupingFunc:
+			/* make GROUPING() act like a regular function */
+			*name = "grouping";
+			return 2;
+		case T_GroupId:
+			/* make GROUP_ID() act like a regular function */
+			*name = "group_id";
+			return 2;
 		case T_SubLink:
 			switch (((SubLink *) node)->subLinkType)
 			{
@@ -1701,10 +1745,12 @@ FigureColnameInternal(Node *node, char **name)
 					break;
 
 					/* As with other operator-like nodes, these have no names */
+				case MULTIEXPR_SUBLINK:
 				case ALL_SUBLINK:
 				case ANY_SUBLINK:
 				case ROWCOMPARE_SUBLINK:
 				case CTE_SUBLINK:
+				case INITPLAN_FUNC_SUBLINK:
 				case NOT_EXISTS_SUBLINK:
 					break;
 			}
@@ -1774,9 +1820,6 @@ FigureColnameInternal(Node *node, char **name)
 			break;
 		case T_XmlSerialize:
 			*name = "xmlserialize";
-			return 2;
-		case T_GroupingFunc:
-			*name = "grouping";
 			return 2;
 		default:
 			break;

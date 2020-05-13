@@ -22,6 +22,7 @@
 #include "postgres.h"
 
 #include "cdb/cdbmutate.h"		/* apply_shareinput */
+#include "cdb/cdbplan.h"
 #include "cdb/cdbvars.h"
 #include "nodes/makefuncs.h"
 #include "optimizer/orca.h"
@@ -35,6 +36,11 @@
 
 /* GPORCA entry point */
 extern PlannedStmt * GPOPTOptimizedPlan(Query *parse, bool *had_unexpected_failure);
+
+static Plan *remove_redundant_results(PlannerInfo *root, Plan *plan);
+static Node *remove_redundant_results_mutator(Node *node, void *);
+static bool can_replace_tlist(Plan *plan);
+static Node *push_down_expr_mutator(Node *node, List *child_tlist);
 
 /*
  * Logging of optimization outcome
@@ -53,23 +59,12 @@ log_optimizer(PlannedStmt *plan, bool fUnexpectedFailure)
 	}
 
 	/* optimizer failed to produce a plan, log failure */
-	if (OPTIMIZER_ALL_FAIL == optimizer_log_failure)
+	if ((OPTIMIZER_ALL_FAIL == optimizer_log_failure) ||
+		(fUnexpectedFailure && OPTIMIZER_UNEXPECTED_FAIL == optimizer_log_failure) || 		/* unexpected fall back */
+		(!fUnexpectedFailure && OPTIMIZER_EXPECTED_FAIL == optimizer_log_failure))			/* expected fall back */
 	{
-		elog(LOG, "Planner produced plan :%d", fUnexpectedFailure);
+		elog(LOG, "Pivotal Optimizer (GPORCA) failed to produce plan");
 		return;
-	}
-
-	if (fUnexpectedFailure && OPTIMIZER_UNEXPECTED_FAIL == optimizer_log_failure)
-	{
-		/* unexpected fall back */
-		elog(LOG, "Planner produced plan :%d", fUnexpectedFailure);
-		return;
-	}
-
-	if (!fUnexpectedFailure && OPTIMIZER_EXPECTED_FAIL == optimizer_log_failure)
-	{
-		/* expected fall back */
-		elog(LOG, "Planner produced plan :%d", fUnexpectedFailure);
 	}
 }
 
@@ -104,13 +99,10 @@ optimize_query(Query *parse, ParamListInfo boundParams)
 	glob->rewindPlanIDs = NULL;
 	glob->transientPlan = false;
 	glob->oneoffPlan = false;
-	glob->share.producers = NULL;
-	glob->share.producer_count = 0;
-	glob->share.sliceMarks = NULL;
+	glob->share.shared_inputs = NULL;
+	glob->share.shared_input_count = 0;
 	glob->share.motStack = NIL;
 	glob->share.qdShares = NIL;
-	glob->share.qdSlices = NIL;
-	glob->share.nextPlanId = 0;
 	/* these will be filled in below, in the pre- and post-processing steps */
 	glob->finalrtable = NIL;
 	glob->subplans = NIL;
@@ -163,6 +155,9 @@ optimize_query(Query *parse, ParamListInfo boundParams)
 	 */
 	glob->finalrtable = result->rtable;
 	glob->subplans = result->subplans;
+	glob->subplan_sliceIds = result->subplan_sliceIds;
+	glob->numSlices = result->numSlices;
+	glob->slices = result->slices;
 
 	/*
 	 * Fake a subroot for each subplan, so that postprocessing steps don't
@@ -206,6 +201,8 @@ optimize_query(Query *parse, ParamListInfo boundParams)
 	}
 	result->planTree = replace_shareinput_targetlists(root, result->planTree);
 
+	result->planTree = remove_redundant_results(root, result->planTree);
+
 	/*
 	 * To save on memory, and on the network bandwidth when the plan is
 	 * dispatched to QEs, strip all subquery RTEs of the original Query
@@ -243,7 +240,8 @@ optimize_query(Query *parse, ParamListInfo boundParams)
 	 */
 	extract_query_dependencies((Node *) pqueryCopy,
 							   &relationOids,
-							   &invalItems);
+							   &invalItems,
+							   &pqueryCopy->hasRowSecurity);
 	glob->relationOids = list_concat(glob->relationOids, relationOids);
 	glob->invalItems = list_concat(glob->invalItems, invalItems);
 
@@ -259,4 +257,139 @@ optimize_query(Query *parse, ParamListInfo boundParams)
 	result->transientPlan = glob->transientPlan;
 
 	return result;
+}
+
+/*
+ * ORCA tends to generate gratuitous Result nodes for various reasons. We
+ * try to clean it up here, as much as we can, by eliminating the Results
+ * that are not really needed.
+ */
+static Plan *
+remove_redundant_results(PlannerInfo *root, Plan *plan)
+{
+	plan_tree_base_prefix ctx;
+
+	ctx.node = (Node *) root;
+
+	return (Plan *) remove_redundant_results_mutator((Node *) plan, &ctx);
+}
+
+static Node *
+remove_redundant_results_mutator(Node *node, void *ctx)
+{
+	if (!node)
+		return NULL;
+
+	if (IsA(node, Result))
+	{
+		Result	   *result_plan = (Result *) node;
+		Plan	   *child_plan = result_plan->plan.lefttree;
+
+		/*
+		 * If this Result doesn't contain quals, hash filter or anything else
+		 * funny, and the child node is projection capable, we can let the
+		 * child node do the projection, and eliminate this Result.
+		 *
+		 * (We could probably push down quals and some other stuff to the child
+		 * node if we worked a bit harder.)
+		 */
+		if (result_plan->resconstantqual == NULL &&
+			result_plan->numHashFilterCols == 0 &&
+			result_plan->plan.initPlan == NIL &&
+			result_plan->plan.qual == NIL &&
+			!expression_returns_set((Node *) result_plan->plan.targetlist) &&
+			can_replace_tlist(child_plan))
+		{
+			List	   *tlist = result_plan->plan.targetlist;
+			ListCell   *lc;
+
+			child_plan = (Plan *)
+				remove_redundant_results_mutator((Node *) child_plan, ctx);
+
+			foreach(lc, tlist)
+			{
+				TargetEntry *tle = (TargetEntry *) lfirst(lc);
+
+				tle->expr = (Expr *) push_down_expr_mutator((Node *) tle->expr,
+															child_plan->targetlist);
+			}
+
+			child_plan->targetlist = tlist;
+			child_plan->flow = result_plan->plan.flow;
+
+			return (Node *) child_plan;
+		}
+	}
+
+	return plan_tree_mutator(node,
+							 remove_redundant_results_mutator,
+							 ctx,
+							 true);
+}
+
+/*
+ * Can the target list of a Plan node safely be replaced?
+ */
+static bool
+can_replace_tlist(Plan *plan)
+{
+	if (!plan)
+		return false;
+
+	/*
+	 * SRFs in targetlists are quite funky. Don't mess with them.
+	 * We could probably be smarter about them, but doesn't seem
+	 * worth the trouble.
+	 */
+	if (expression_returns_set((Node *) plan->targetlist))
+		return false;
+
+	if (!is_projection_capable_plan(plan))
+		return false;
+
+	/*
+	 * The Hash Filter column indexes in a Result node are based on
+	 * the output target list. Can't change the target list if there's
+	 * a Hash Filter, or it would mess up the column indexes.
+	 */
+	if (IsA(plan, Result))
+	{
+		Result	   *rplan = (Result *) plan;
+
+		if (rplan->numHashFilterCols > 0)
+			return false;
+	}
+
+	/*
+	 * Split Update node also calculates a hash based on the output
+	 * targetlist, like a Result with a Hash Filter.
+	 */
+	if (IsA(plan, SplitUpdate))
+		return false;
+
+	return true;
+}
+
+/*
+ * Fix up a target list, by replacing outer-Vars with the exprs from
+ * the child target list, when we're stripping off a Result node.
+ */
+static Node *
+push_down_expr_mutator(Node *node, List *child_tlist)
+{
+	if (!node)
+		return NULL;
+
+	if (IsA(node, Var))
+	{
+		Var		   *var = (Var *) node;
+
+		if (var->varno == OUTER_VAR && var->varattno > 0)
+		{
+			TargetEntry *child_tle = (TargetEntry *)
+				list_nth(child_tlist, var->varattno - 1);
+			return (Node *) child_tle->expr;
+		}
+	}
+	return expression_tree_mutator(node, push_down_expr_mutator, child_tlist);
 }

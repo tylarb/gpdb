@@ -24,7 +24,7 @@
  * should be killed by SIGQUIT and then a recovery cycle started.
  *
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  *
  *
  * IDENTIFICATION
@@ -36,7 +36,6 @@
 
 #include <signal.h>
 #include <sys/time.h>
-#include <time.h>
 #include <unistd.h>
 
 #include "access/xlog.h"
@@ -47,6 +46,7 @@
 #include "postmaster/bgwriter.h"
 #include "storage/bufmgr.h"
 #include "storage/buf_internals.h"
+#include "storage/condition_variable.h"
 #include "storage/fd.h"
 #include "storage/ipc.h"
 #include "storage/lwlock.h"
@@ -61,7 +61,6 @@
 #include "utils/faultinjector.h"
 #include "utils/timestamp.h"
 
-#include "tcop/tcopprot.h" /* quickdie() */
 
 /*
  * GUC parameters
@@ -101,6 +100,7 @@ static void BgSigHupHandler(SIGNAL_ARGS);
 static void ReqShutdownHandler(SIGNAL_ARGS);
 static void bgwriter_sigusr1_handler(SIGNAL_ARGS);
 
+
 /*
  * Main entry point for bgwriter process
  *
@@ -113,17 +113,7 @@ BackgroundWriterMain(void)
 	sigjmp_buf	local_sigjmp_buf;
 	MemoryContext bgwriter_context;
 	bool		prev_hibernate;
-
-	/*
-	 * If possible, make this process a group leader, so that the postmaster
-	 * can signal any child processes too.  (bgwriter probably never has any
-	 * child processes, but for consistency we make all postmaster child
-	 * processes do this.)
-	 */
-#ifdef HAVE_SETSID
-	if (setsid() < 0)
-		elog(FATAL, "setsid() failed: %m");
-#endif
+	WritebackContext wb_context;
 
 	/*
 	 * Properly accept or ignore signals the postmaster might send us.
@@ -177,6 +167,8 @@ BackgroundWriterMain(void)
 											 ALLOCSET_DEFAULT_MAXSIZE);
 	MemoryContextSwitchTo(bgwriter_context);
 
+	WritebackContextInit(&wb_context, &bgwriter_flush_after);
+
 	/*
 	 * If an exception is encountered, processing resumes here.
 	 *
@@ -199,6 +191,7 @@ BackgroundWriterMain(void)
 		 * about in bgwriter, but we do have LWLocks, buffers, and temp files.
 		 */
 		LWLockReleaseAll();
+		ConditionVariableCancelSleep();
 		AbortBufferIO();
 		UnlockBuffers();
 		/* buffer pins are released here: */
@@ -221,6 +214,9 @@ BackgroundWriterMain(void)
 		/* Flush any leaked data in the top-level context */
 		MemoryContextResetAndDeleteChildren(bgwriter_context);
 
+		/* re-initilialize to avoid repeated errors causing problems */
+		WritebackContextInit(&wb_context, &bgwriter_flush_after);
+
 		/* Now we can allow interrupts again */
 		RESUME_INTERRUPTS();
 
@@ -237,6 +233,9 @@ BackgroundWriterMain(void)
 		 * It's not clear we need it elsewhere, but shouldn't hurt.
 		 */
 		smgrcloseall();
+
+		/* Report wait end here, when there is no further possibility of wait */
+		pgstat_report_wait_end();
 	}
 
 	/* We can now handle ereport(ERROR) */
@@ -261,11 +260,11 @@ BackgroundWriterMain(void)
 		int			rc;
 
 #ifdef USE_ASSERT_CHECKING
-		SIMPLE_FAULT_INJECTOR(FaultInBackgroundWriterMain);
+		SIMPLE_FAULT_INJECTOR("fault_in_background_writer_main");
 #endif
 
 		/* Clear any already-pending wakeups */
-		ResetLatch(&MyProc->procLatch);
+		ResetLatch(MyLatch);
 
 		if (got_SIGHUP)
 		{
@@ -286,7 +285,7 @@ BackgroundWriterMain(void)
 		/*
 		 * Do one cycle of dirty-buffer writing.
 		 */
-		can_hibernate = BgBufferSync();
+		can_hibernate = BgBufferSync(&wb_context);
 
 		/*
 		 * Send off activity statistics to the stats collector
@@ -314,11 +313,11 @@ BackgroundWriterMain(void)
 		 * overall timeout handling but just assume we're going to get called
 		 * often enough even if hibernation mode is active. It's not that
 		 * important that log_snap_interval_ms is met strictly. To make sure
-		 * we're not waking the disk up unneccesarily on an idle system we
+		 * we're not waking the disk up unnecessarily on an idle system we
 		 * check whether there has been any WAL inserted since the last time
 		 * we've logged a running xacts.
 		 *
-		 * We do this logging in the bgwriter as its the only process thats
+		 * We do this logging in the bgwriter as its the only process that is
 		 * run regularly and returns to its mainloop all the time. E.g.
 		 * Checkpointer, when active, is barely ever in its mainloop and thus
 		 * makes it hard to log regularly.
@@ -353,7 +352,7 @@ BackgroundWriterMain(void)
 		 * down with latch events that are likely to happen frequently during
 		 * normal operation.
 		 */
-		rc = WaitLatch(&MyProc->procLatch,
+		rc = WaitLatch(MyLatch,
 					   WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH,
 					   BgWriterDelay /* ms */ );
 
@@ -378,13 +377,13 @@ BackgroundWriterMain(void)
 		if (rc == WL_TIMEOUT && can_hibernate && prev_hibernate)
 		{
 			/* Ask for notification at next buffer allocation */
-			StrategyNotifyBgWriter(&MyProc->procLatch);
+			StrategyNotifyBgWriter(MyProc->pgprocno);
 			/* Sleep ... */
-			rc = WaitLatch(&MyProc->procLatch,
+			rc = WaitLatch(MyLatch,
 						   WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH,
 						   BgWriterDelay * HIBERNATE_FACTOR);
 			/* Reset the notification request in case we timed out */
-			StrategyNotifyBgWriter(NULL);
+			StrategyNotifyBgWriter(-1);
 		}
 
 		/*
@@ -413,27 +412,21 @@ BackgroundWriterMain(void)
 static void
 bg_quickdie(SIGNAL_ARGS)
 {
-	PG_SETMASK(&BlockSig);
-
 	/*
-	 * We DO NOT want to run proc_exit() callbacks -- we're here because
-	 * shared memory may be corrupted, so we don't want to try to clean up our
-	 * transaction.  Just nail the windows shut and get out of town.  Now that
-	 * there's an atexit callback to prevent third-party code from breaking
-	 * things by calling exit() directly, we have to reset the callbacks
-	 * explicitly to make this work as intended.
-	 */
-	on_exit_reset();
-
-	/*
-	 * Note we do exit(2) not exit(0).  This is to force the postmaster into a
-	 * system reset cycle if some idiot DBA sends a manual SIGQUIT to a random
+	 * We DO NOT want to run proc_exit() or atexit() callbacks -- we're here
+	 * because shared memory may be corrupted, so we don't want to try to
+	 * clean up our transaction.  Just nail the windows shut and get out of
+	 * town.  The callbacks wouldn't be safe to run from a signal handler,
+	 * anyway.
+	 *
+	 * Note we do _exit(2) not _exit(0).  This is to force the postmaster into
+	 * a system reset cycle if someone sends a manual SIGQUIT to a random
 	 * backend.  This is necessary precisely because we don't clean up our
 	 * shared memory state.  (The "dead man switch" mechanism in pmsignal.c
 	 * should ensure the postmaster sees this as a crash, too, but no harm in
 	 * being doubly sure.)
 	 */
-	exit(2);
+	_exit(2);
 }
 
 /* SIGHUP: set flag to re-read config file at next convenient time */
@@ -443,8 +436,7 @@ BgSigHupHandler(SIGNAL_ARGS)
 	int			save_errno = errno;
 
 	got_SIGHUP = true;
-	if (MyProc)
-		SetLatch(&MyProc->procLatch);
+	SetLatch(MyLatch);
 
 	errno = save_errno;
 }
@@ -456,8 +448,7 @@ ReqShutdownHandler(SIGNAL_ARGS)
 	int			save_errno = errno;
 
 	shutdown_requested = true;
-	if (MyProc)
-		SetLatch(&MyProc->procLatch);
+	SetLatch(MyLatch);
 
 	errno = save_errno;
 }

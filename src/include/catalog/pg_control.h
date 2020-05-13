@@ -5,7 +5,7 @@
  *	  However, we define it here so that the format is documented.
  *
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/catalog/pg_control.h
@@ -26,7 +26,7 @@
  * The first three digits is the PostgreSQL version number. The last
  * four digits indicates the GPDB version.
  */
-#define PG_CONTROL_VERSION	9420600
+#define PG_CONTROL_VERSION	9600700
 
 /*
  * Body of CheckPoint XLOG records.  This is declared here because we keep
@@ -52,12 +52,16 @@ typedef struct CheckPoint
 	MultiXactId oldestMulti;	/* cluster-wide minimum datminmxid */
 	Oid			oldestMultiDB;	/* database with minimum datminmxid */
 	pg_time_t	time;			/* time stamp of checkpoint */
+	TransactionId oldestCommitTsXid;	/* oldest Xid with valid commit
+										 * timestamp */
+	TransactionId newestCommitTsXid;	/* newest Xid with valid commit
+										 * timestamp */
 
 	/*
 	 * Oldest XID still running. This is only needed to initialize hot standby
 	 * mode from an online checkpoint, so we only bother calculating this for
-	 * online checkpoints and only when wal_level is hot_standby. Otherwise
-	 * it's set to InvalidTransactionId.
+	 * online checkpoints and only when wal_level is replica. Otherwise it's
+	 * set to InvalidTransactionId.
 	 */
 	TransactionId oldestActiveXid;
 
@@ -75,8 +79,9 @@ typedef struct CheckPoint
 #define XLOG_RESTORE_POINT				0x70
 #define XLOG_FPW_CHANGE					0x80
 #define XLOG_END_OF_RECOVERY			0x90
-#define XLOG_FPI						0xA0
-#define XLOG_NEXTRELFILENODE			0xB0
+#define XLOG_FPI_FOR_HINT				0xA0
+#define XLOG_FPI						0xB0
+#define XLOG_NEXTRELFILENODE			0xC0
 
 
 /*
@@ -91,8 +96,6 @@ typedef enum DBState
 	DB_SHUTDOWNING,
 	DB_IN_CRASH_RECOVERY,
 	DB_IN_ARCHIVE_RECOVERY,
-	DB_IN_STANDBY_MODE,
-	DB_IN_STANDBY_PROMOTED,
 	DB_IN_PRODUCTION
 } DBState;
 
@@ -186,6 +189,7 @@ typedef struct ControlFileData
 	int			max_worker_processes;
 	int			max_prepared_xacts;
 	int			max_locks_per_xact;
+	bool		track_commit_timestamp;
 
 	/*
 	 * This data is used to check for hardware-architecture compatibility of

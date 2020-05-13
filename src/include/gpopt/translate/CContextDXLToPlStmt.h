@@ -7,7 +7,7 @@
 //
 //	@doc:
 //		Class providing access to CIdGenerators (needed to number initplans, motion
-//		nodes as well as params), list of RangeTableEntires and Subplans
+//		nodes as well as params), list of RangeTableEntries and Subplans
 //		generated so far during DXL-->PlStmt translation.
 //
 //	@test:
@@ -19,6 +19,7 @@
 
 #include "gpopt/translate/CDXLTranslateContext.h"
 #include "gpopt/translate/CDXLTranslateContextBaseTable.h"
+#include "gpopt/translate/CTranslatorUtils.h"
 #include "gpos/base.h"
 
 #include "naucrates/dxl/gpdb_types.h"
@@ -51,7 +52,7 @@ namespace gpdxl
 	//
 	//	@doc:
 	//		Class providing access to CIdGenerators (needed to number initplans, motion
-	//		nodes as well as params), list of RangeTableEntires and Subplans
+	//		nodes as well as params), list of RangeTableEntries and Subplans
 	//		generated so far during DXL-->PlStmt translation.
 	//
 	//---------------------------------------------------------------------------
@@ -94,7 +95,7 @@ namespace gpdxl
 			typedef CHashMap<ULONG, SCTEConsumerInfo, gpos::HashValue<ULONG>, gpos::Equals<ULONG>,
 			CleanupDelete<ULONG>, CleanupDelete<SCTEConsumerInfo> > HMUlCTEConsumerInfo;
 
-			IMemoryPool *m_mp;
+			CMemoryPool *m_mp;
 
 			// counter for generating plan ids
 			CIdGenerator *m_plan_id_counter;
@@ -105,8 +106,11 @@ namespace gpdxl
 			// counter for generating unique param ids
 			CIdGenerator *m_param_id_counter;
 
+			// What operator classes to use for distribution keys?
+			DistributionHashOpsKind m_distribution_hashops;
+
 			// list of all rtable entries
-			List **m_rtable_entries_list;
+			List *m_rtable_entries_list;
 
 			// list of oids of partitioned tables
 			List *m_partitioned_tables_list;
@@ -115,7 +119,13 @@ namespace gpdxl
 			ULongPtrArray *m_num_partition_selectors_array;
 
 			// list of all subplan entries
-			List **m_subplan_entries_list;
+			List *m_subplan_entries_list;
+			List *m_subplan_sliceids_list;
+
+			// List of PlanSlices
+			List *m_slices_list;
+
+			PlanSlice *m_current_slice;
 
 			// index of the target relation in the rtable or 0 if not a DML statement
 			ULONG m_result_relation_index;
@@ -128,17 +138,16 @@ namespace gpdxl
 			
 			// CTAS distribution policy
 			GpPolicy  *m_distribution_policy;
-			
+
 		public:
 			// ctor/dtor
 			CContextDXLToPlStmt
 						(
-						IMemoryPool *mp,
+						CMemoryPool *mp,
 						CIdGenerator *plan_id_counter,
 						CIdGenerator *motion_id_counter,
 						CIdGenerator *param_id_counter,
-						List **rtable_entries_list,
-						List **subplan_entries_list
+						DistributionHashOpsKind distribution_hashops
 						)
 						;
 
@@ -167,7 +176,10 @@ namespace gpdxl
 			List *GetCTEConsumerList(ULONG cte_id) const;
 
 			// return list of range table entries
-			List *GetRTableEntriesList();
+			List *GetRTableEntriesList() const
+			{
+				return m_rtable_entries_list;
+			}
 
 			// return list of partitioned table indexes
 			List *GetPartitionedTablesList() const
@@ -178,13 +190,21 @@ namespace gpdxl
 			// return list containing number of partition selectors for every scan id
 			List *GetNumPartitionSelectorsList() const;
 
-			List *GetSubplanEntriesList();
+			List *GetSubplanEntriesList() const
+			{
+				return m_subplan_entries_list;
+			}
 
 			// index of result relation in the rtable
 			ULONG GetResultRelationIndex() const
 			{
 				return m_result_relation_index;
 			}
+
+
+			int *GetSubplanSliceIdArray();
+
+			PlanSlice *GetSlices(int *numSlices_p);
 
 			// add a range table entry
 			void AddRTE(RangeTblEntry *rte, BOOL is_result_relation = false);
@@ -196,7 +216,20 @@ namespace gpdxl
 			void IncrementPartitionSelectors(ULONG scan_id);
 
 			void AddSubplan(Plan * );
-				
+
+			// add a slice table entry
+			int AddSlice(PlanSlice *);
+
+			PlanSlice *GetCurrentSlice() const
+			{
+				return m_current_slice;
+			}
+
+			void SetCurrentSlice(PlanSlice *slice)
+			{
+				m_current_slice = slice;
+			}
+
 			// add CTAS information
 			void AddCtasInfo(IntoClause *into_clause, GpPolicy *distribution_policy);
 			
@@ -212,6 +245,10 @@ namespace gpdxl
 				return m_distribution_policy;
 			}
 
+			// Get the hash opclass or hash function for given datatype,
+			// based on decision made by DetermineDistributionHashOpclasses()
+			Oid GetDistributionHashOpclassForType(Oid typid);
+			Oid GetDistributionHashFuncForType(Oid typid);
 	};
 
 	}

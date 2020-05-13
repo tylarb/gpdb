@@ -9,7 +9,7 @@
  *
  * Portions Copyright (c) 2005-2009, Greenplum inc
  * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/nodes/primnodes.h
@@ -23,7 +23,6 @@
 #include "nodes/pg_list.h"
 #include "nodes/params.h"  /* For ParamListInfoData */
 #include "cdb/cdbpathlocus.h" /* For CdbLocusType */
-#include "catalog/gp_policy.h" /* For ReshuffleExpr */
 
 
 /* ----------------------------------------------------------------
@@ -106,6 +105,26 @@ typedef struct IntoClause
 	Node       *distributedBy;  /* GPDB: columns to distribubte the data on. */
 } IntoClause;
 
+typedef struct CopyIntoClause
+{
+	NodeTag		type;
+
+	List	   *attlist;		/* List of column names (as Strings), or NIL
+								 * for all columns */
+	bool		is_program;		/* is 'filename' a program to popen? */
+	char	   *filename;		/* filename, or NULL for STDIN/STDOUT */
+	List	   *options;		/* List of DefElem nodes */
+} CopyIntoClause;
+
+typedef struct RefreshClause
+{
+	NodeTag		type;
+
+	bool		concurrent;		/* allow concurrent access? */
+	bool		skipData;
+	RangeVar   *relation;		/* relation to insert into */
+} RefreshClause;
+
 
 /* ----------------------------------------------------------------
  *					node types for executable expressions
@@ -133,9 +152,13 @@ typedef struct Expr
  * upper-level plan nodes are reassigned to point to the outputs of their
  * subplans; for example, in a join node varno becomes INNER_VAR or OUTER_VAR
  * and varattno becomes the index of the proper element of that subplan's
- * target list.  But varnoold/varoattno continue to hold the original values.
- * The code doesn't really need varnoold/varoattno, but they are very useful
- * for debugging and interpreting completed plans, so we keep them around.
+ * target list.  Similarly, INDEX_VAR is used to identify Vars that reference
+ * an index column rather than a heap column.  (In ForeignScan and CustomScan
+ * plan nodes, INDEX_VAR is abused to signify references to columns of a
+ * custom scan tuple type.)  In all these cases, varnoold/varoattno hold the
+ * original values.  The code doesn't really need varnoold/varoattno, but they
+ * are very useful for debugging and interpreting completed plans, so we keep
+ * them around.
  */
 #define    INNER_VAR		65000		/* reference to inner subplan */
 #define    OUTER_VAR		65001		/* reference to outer subplan */
@@ -167,6 +190,11 @@ typedef struct Var
 
 /*
  * Const
+ *
+ * Note: for varlena data types, we make a rule that a Const node's value
+ * must be in non-extended form (4-byte header, no compression or external
+ * references).  This ensures that the Const node is self-contained and makes
+ * it more likely that equal() will see logically identical values as equal.
  */
 typedef struct Const
 {
@@ -185,9 +213,10 @@ typedef struct Const
 	int			location;		/* token location, or -1 if unknown */
 } Const;
 
-/* ----------------
+/*
  * Param
- *		paramkind - specifies the kind of parameter. The possible values
+ *
+ *		paramkind specifies the kind of parameter. The possible values
  *		for this field are:
  *
  *		PARAM_EXTERN:  The parameter value is supplied from outside the plan.
@@ -204,18 +233,19 @@ typedef struct Const
  *				`paramid' field.  (This type of Param is converted to
  *				PARAM_EXEC during planning.)
  *
- * Note: currently, paramtypmod is valid for PARAM_SUBLINK Params, and for
- * PARAM_EXEC Params generated from them; it is always -1 for PARAM_EXTERN
- * params, since the APIs that supply values for such parameters don't carry
- * any typmod info.
- * ----------------
+ *		PARAM_MULTIEXPR:  Like PARAM_SUBLINK, the parameter represents an
+ *				output column of a SubLink node's sub-select, but here, the
+ *				SubLink is always a MULTIEXPR SubLink.  The high-order 16 bits
+ *				of the `paramid' field contain the SubLink's subLinkId, and
+ *				the low-order 16 bits contain the column number.  (This type
+ *				of Param is also converted to PARAM_EXEC during planning.)
  */
 typedef enum ParamKind
 {
 	PARAM_EXTERN,
 	PARAM_EXEC,
-	PARAM_EXEC_REMOTE, /* MPP ???? */
-	PARAM_SUBLINK
+	PARAM_SUBLINK,
+	PARAM_MULTIEXPR
 } ParamKind;
 
 typedef struct Param
@@ -228,21 +258,6 @@ typedef struct Param
 	Oid			paramcollid;	/* OID of collation, or InvalidOid if none */
 	int			location;		/* token location, or -1 if unknown */
 } Param;
-
-/* AggStage enumeration indicates how the executor should handle an
- * Aggref node.
- */
-typedef enum AggStage
-{
-	AGGSTAGE_NORMAL = 0,
-	AGGSTAGE_PARTIAL, /* First (lower, earlier) stage of 2-stage aggregation. */
-	AGGSTAGE_INTERMEDIATE, /* The intermediate stage between AGGSTAGE_PARTIAL and
-							* AGGSTAGE_FINAL that handles the higher aggregation
-							* level in a (partial) ROLLUP grouping extension
-							* query.
-							*/
-	AGGSTAGE_FINAL /* Second (upper, later) stage of 2-stage aggregation. */
-} AggStage;
 
 
 /*
@@ -266,6 +281,23 @@ typedef enum AggStage
  * DISTINCT is not supported in this case, so aggdistinct will be NIL.
  * The direct arguments appear in aggdirectargs (as a list of plain
  * expressions, not TargetEntry nodes).
+ *
+ * aggtranstype is the data type of the state transition values for this
+ * aggregate (resolved to an actual type, if agg's transtype is polymorphic).
+ * This is determined during planning and is InvalidOid before that.
+ *
+ * aggargtypes is an OID list of the data types of the direct and regular
+ * arguments.  Normally it's redundant with the aggdirectargs and args lists,
+ * but in a combining aggregate, it's not because the args list has been
+ * replaced with a single argument representing the partial-aggregate
+ * transition values.
+ *
+ * aggsplit indicates the expected partial-aggregation mode for the Aggref's
+ * parent plan node.  It's always set to AGGSPLIT_SIMPLE in the parser, but
+ * the planner might change it to something else.  We use this mainly as
+ * a crosscheck that the Aggrefs match the plan; but note that when aggsplit
+ * indicates a non-final mode, aggtype reflects the transition data type
+ * not the SQL-level output type of the aggregate.
  */
 typedef struct Aggref
 {
@@ -274,6 +306,8 @@ typedef struct Aggref
 	Oid			aggtype;		/* type Oid of result of the aggregate */
 	Oid			aggcollid;		/* OID of collation of result */
 	Oid			inputcollid;	/* OID of collation that function should use */
+	Oid			aggtranstype;	/* type Oid of aggregate's transition value */
+	List	   *aggargtypes;	/* type Oids of direct and aggregated args */
 	List	   *aggdirectargs;	/* direct arguments, if an ordered-set agg */
 	List	   *args;			/* aggregated arguments and sort expressions */
 	List	   *aggorder;		/* ORDER BY (list of SortGroupClause) */
@@ -284,24 +318,9 @@ typedef struct Aggref
 								 * combined into an array last argument */
 	char		aggkind;		/* aggregate kind (see pg_aggregate.h) */
 	Index		agglevelsup;	/* > 0 if agg belongs to outer query */
-	AggStage	aggstage;		/* MPP: 2-stage? If so, which stage */
+	AggSplit	aggsplit;		/* expected agg-splitting mode of parent Agg */
 	int			location;		/* token location, or -1 if unknown */
 } Aggref;
-
-
-/*
- * Grouping: describe the hidden GROUPING column for grouping extensions.
- *
- * Defined for making it easily to distinguish this column with others.
- *
- * Used with GroupingFunc to distinguish 'null' values that are created
- * through grouping with those that are in the raw data. See also GroupingFunc
- * for more details.
- */
-typedef struct Grouping
-{
-	Expr        xpr;
-} Grouping;
 
 /*
  * GroupId -
@@ -340,16 +359,86 @@ typedef struct Grouping
  */
 typedef struct GroupId
 {
-	Expr      xpr;
+	Expr		xpr;
+	Index		agglevelsup;	/* same as Aggref.agglevelsup */
+	int			location;		/* token location */
 } GroupId;
 
 /*
- * WindowFunc: describes a window function call
+ * GroupingSetId
+ */
+typedef struct GroupingSetId
+{
+	Expr		xpr;
+	int			location;		/* token location */
+} GroupingSetId;
+
+/*
+ * AggExprId
+ *
+ *    A hint for aggregation which agg expr is this split tuple for.
+ */
+typedef struct AggExprId
+{
+	Expr        xpr;
+} AggExprId;
+
+/*
+ * RowIdExprId
+ *
+ * This is used in JOIN_DEDUP_SEMI plans, to tag each row on the one side of
+ * the join with a unique id before broadcasting it, so that the duplicates
+ * generated by the broadcast can be eliminated away later. The 'rowidexpr_id'
+ * can be used to distinguish RowIdExprs generated for different joins.
+ */
+typedef struct RowIdExpr
+{
+	Expr        xpr;
+
+	int			rowidexpr_id;
+} RowIdExpr;
+
+/*
+ * GroupingFunc
+ *
+ * A GroupingFunc is a GROUPING(...) expression, which behaves in many ways
+ * like an aggregate function (e.g. it "belongs" to a specific query level,
+ * which might not be the one immediately containing it), but also differs in
+ * an important respect: it never evaluates its arguments, they merely
+ * designate expressions from the GROUP BY clause of the query level to which
+ * it belongs.
+ *
+ * The spec defines the evaluation of GROUPING() purely by syntactic
+ * replacement, but we make it a real expression for optimization purposes so
+ * that one Agg node can handle multiple grouping sets at once.  Evaluating the
+ * result only needs the column positions to check against the grouping set
+ * being projected.  However, for EXPLAIN to produce meaningful output, we have
+ * to keep the original expressions around, since expression deparse does not
+ * give us any feasible way to get at the GROUP BY clause.
+ *
+ * Also, we treat two GroupingFunc nodes as equal if they have equal arguments
+ * lists and agglevelsup, without comparing the refs and cols annotations.
+ *
+ * In raw parse output we have only the args list; parse analysis fills in the
+ * refs list, and the planner fills in the cols list.
+ */
+typedef struct GroupingFunc
+{
+	Expr		xpr;
+	List	   *args;			/* arguments, not evaluated but kept for
+								 * benefit of EXPLAIN etc. */
+	List	   *refs;			/* ressortgrouprefs of arguments */
+	List	   *cols;			/* actual column positions set by planner */
+	Index		agglevelsup;	/* same as Aggref.agglevelsup */
+	int			location;		/* token location */
+} GroupingFunc;
+
+/*
+ * WindowFunc
  *
  * In a query tree, a WindowFunc corresponds to a SQL window function
  * call.  In a plan tree, a WindowRef is an expression the corresponds
  * to some or all of the calculation of the window function result.
- *
  */
 typedef struct WindowFunc
 {
@@ -366,7 +455,6 @@ typedef struct WindowFunc
 	bool		windistinct;	/* TRUE if it's agg(DISTINCT ...) */
 	int			location;		/* token location, or -1 if unknown */
 } WindowFunc;
-
 
 /* ----------------
  *	ArrayRef: describes an array subscripting operation
@@ -385,9 +473,16 @@ typedef struct WindowFunc
  * reflowerindexpr must be the same length as refupperindexpr when it
  * is not NIL.
  *
+ * In the slice case, individual expressions in the subscript lists can be
+ * NULL, meaning "substitute the array's current lower or upper bound".
+ *
  * Note: the result datatype is the element type when fetching a single
  * element; but it is the array type when doing subarray fetch or either
  * type of store.
+ *
+ * Note: for the cases where an array is returned, if refexpr yields a R/W
+ * expanded array, then the implementation is allowed to modify that object
+ * in-place and return the same object.)
  * ----------------
  */
 typedef struct ArrayRef
@@ -400,7 +495,7 @@ typedef struct ArrayRef
 	List	   *refupperindexpr;/* expressions that evaluate to upper array
 								 * indexes */
 	List	   *reflowerindexpr;/* expressions that evaluate to lower array
-								 * indexes */
+								 * indexes, or NIL for single array element */
 	Expr	   *refexpr;		/* the expression that evaluates to an array
 								 * value */
 	Expr	   *refassgnexpr;	/* expression for the source value, or NULL if
@@ -545,12 +640,8 @@ typedef struct ScalarArrayOpExpr
  * BoolExpr - expression node for the basic Boolean operators AND, OR, NOT
  *
  * Notice the arguments are given as a List.  For NOT, of course the list
- * must always have exactly one element.  For AND and OR, the executor can
- * handle any number of arguments.  The parser generally treats AND and OR
- * as binary and so it typically only produces two-element lists, but the
- * optimizer will flatten trees of AND and OR nodes to produce longer lists
- * when possible.  There are also a few special cases where more arguments
- * can appear before optimization.
+ * must always have exactly one element.  For AND and OR, there can be two
+ * or more arguments.
  */
 typedef enum BoolExprType
 {
@@ -590,14 +681,23 @@ typedef struct TableValueExpr
  *	ANY_SUBLINK			(lefthand) op ANY (SELECT ...)
  *	ROWCOMPARE_SUBLINK	(lefthand) op (SELECT ...)
  *	EXPR_SUBLINK		(SELECT with single targetlist item ...)
+ *	MULTIEXPR_SUBLINK	(SELECT with multiple targetlist items ...)
  *	ARRAY_SUBLINK		ARRAY(SELECT with single targetlist item ...)
  *	CTE_SUBLINK			WITH query (never actually part of an expression)
+ *	INITPLAN_FUNC_SUBLINK	for function run as initplan.
+ * For query like (create table t as select * from f()), QD is used to run
+ * CTAS, hence f() could only be run on entryDB(or QEs). But entryDB could not
+ * do the dispatch work. So if f() contains DDLs, the above query would fail.
+ * We introduce this new INITPLAN_FUNC_SUBLINK to make f() run as initplan
+ * and store intermidiate result into tuplestore. CTAS will fetch tuples from
+ * this tuplestore.
  * For ALL, ANY, and ROWCOMPARE, the lefthand is a list of expressions of the
  * same length as the subselect's targetlist.  ROWCOMPARE will *always* have
  * a list with more than one entry; if the subselect has just one target
  * then the parser will create an EXPR_SUBLINK instead (and any operator
- * above the subselect will be represented separately).  Note that both
- * ROWCOMPARE and EXPR require the subselect to deliver only one row.
+ * above the subselect will be represented separately).
+ * ROWCOMPARE, EXPR, and MULTIEXPR require the subselect to deliver at most
+ * one row (if it returns no rows, the result is NULL).
  * ALL, ANY, and ROWCOMPARE require the combining operators to deliver boolean
  * results.  ALL and ANY combine the per-row results using AND and OR
  * semantics respectively.
@@ -616,8 +716,14 @@ typedef struct TableValueExpr
  * output columns of the subselect.  And subselect is transformed to a Query.
  * This is the representation seen in saved rules and in the rewriter.
  *
- * In EXISTS, EXPR, and ARRAY SubLinks, testexpr and operName are unused and
- * are always null.
+ * In EXISTS, EXPR, MULTIEXPR, and ARRAY SubLinks, testexpr and operName
+ * are unused and are always null.
+ *
+ * subLinkId is currently used only for MULTIEXPR SubLinks, and is zero in
+ * other SubLinks.  This number identifies different multiple-assignment
+ * subqueries within an UPDATE statement's SET list.  It is unique only
+ * within a particular targetlist.  The output column(s) of the MULTIEXPR
+ * are referenced by PARAM_MULTIEXPR Params appearing elsewhere in the tlist.
  *
  * The CTE_SUBLINK case never occurs in actual SubLink nodes, but it is used
  * in SubPlans generated for WITH subqueries.
@@ -629,8 +735,10 @@ typedef enum SubLinkType
 	ANY_SUBLINK,
 	ROWCOMPARE_SUBLINK,
 	EXPR_SUBLINK,
+	MULTIEXPR_SUBLINK,
 	ARRAY_SUBLINK,
 	CTE_SUBLINK,				/* for SubPlans only */
+	INITPLAN_FUNC_SUBLINK,		/* for function run as initplan */
 	NOT_EXISTS_SUBLINK /* GPORCA uses NOT_EXIST_SUBLINK to implement correlated left anti semijoin. */
 } SubLinkType;
 
@@ -639,9 +747,10 @@ typedef struct SubLink
 {
 	Expr		xpr;
 	SubLinkType subLinkType;	/* see above */
+	int			subLinkId;		/* ID (1..n); 0 if not MULTIEXPR */
 	Node	   *testexpr;		/* outer-query test for ALL/ANY/ROWCOMPARE */
 	List	   *operName;		/* originally specified operator name */
-	Node	   *subselect;		/* subselect as Query* or parsetree */
+	Node	   *subselect;		/* subselect as Query* or raw parsetree */
 	int			location;		/* token location, or -1 if unknown */
 } SubLink;
 
@@ -692,8 +801,6 @@ typedef struct SubPlan
 	Node	   *testexpr;		/* OpExpr or RowCompareExpr expression tree */
 	List	   *paramIds;		/* IDs of Params embedded in the above */
 
-    int         qDispSliceId;   /* CDB: slice# of initplan's root slice, or 0 */
-
 	/* Identification of the Plan tree to use: */
 	int			plan_id;		/* Index (from 1) in PlannedStmt.subplans */
 	/* Identification of the SubPlan for EXPLAIN and debugging purposes: */
@@ -713,7 +820,6 @@ typedef struct SubPlan
 								 * initplan? */
 	bool		is_multirow;	/* CDB: May the subplan return more than
 								 * one row? */
-	bool		is_parallelized; /* Has subplan been processed to be executed in parallel setting */
 	/* Information for passing params into and out of the subselect: */
 	/* setParam and parParam are lists of integers (param IDs) */
 	List	   *setParam;		/* initplan subqueries have to set these
@@ -724,7 +830,6 @@ typedef struct SubPlan
 	/* Estimated execution costs: */
 	Cost		startup_cost;	/* one-time setup cost */
 	Cost		per_call_cost;	/* cost for each subplan evaluation */
-	bool		initPlanParallel; /* CDB: Init plan is parallelled */
 } SubPlan;
 
 /*
@@ -1092,7 +1197,6 @@ typedef struct MinMaxExpr
  * Note: result type/typmod/collation are not stored, but can be deduced
  * from the XmlExprOp.  The type/typmod fields are just used for display
  * purposes, and are NOT necessarily the true result type of the node.
- * (We also use type == InvalidOid to mark a not-yet-parse-analyzed XmlExpr.)
  */
 typedef enum XmlExprOp
 {
@@ -1132,8 +1236,16 @@ typedef struct XmlExpr
  * NullTest represents the operation of testing a value for NULLness.
  * The appropriate test is performed and returned as a boolean Datum.
  *
- * NOTE: the semantics of this for rowtype inputs are noticeably different
- * from the scalar case.  We provide an "argisrow" flag to reflect that.
+ * When argisrow is false, this simply represents a test for the null value.
+ *
+ * When argisrow is true, the input expression must yield a rowtype, and
+ * the node implements "row IS [NOT] NULL" per the SQL standard.  This
+ * includes checking individual fields for NULLness when the row datum
+ * itself isn't NULL.
+ *
+ * NOTE: the combination of a rowtype input and argisrow==false does NOT
+ * correspond to the SQL notation "row IS [NOT] NULL"; instead, this case
+ * represents the SQL notation "row IS [NOT] DISTINCT FROM NULL".
  * ----------------
  */
 
@@ -1147,7 +1259,8 @@ typedef struct NullTest
 	Expr		xpr;
 	Expr	   *arg;			/* input expression */
 	NullTestType nulltesttype;	/* IS NULL, IS NOT NULL */
-	bool		argisrow;		/* T if input is of a composite type */
+	bool		argisrow;		/* T to perform field-by-field null checks */
+	int			location;		/* token location, or -1 if unknown */
 } NullTest;
 
 /*
@@ -1169,6 +1282,7 @@ typedef struct BooleanTest
 	Expr		xpr;
 	Expr	   *arg;			/* input expression */
 	BoolTestType booltesttype;	/* test type */
+	int			location;		/* token location, or -1 if unknown */
 } BooleanTest;
 
 /*
@@ -1251,6 +1365,21 @@ typedef struct CurrentOfExpr
 	Oid			target_relid;	/* OID of original target relation,
 								 * before any inheritance expansion */
 } CurrentOfExpr;
+
+/*
+ * InferenceElem - an element of a unique index inference specification
+ *
+ * This mostly matches the structure of IndexElems, but having a dedicated
+ * primnode allows for a clean separation between the use of index parameters
+ * by utility commands, and this node.
+ */
+typedef struct InferenceElem
+{
+	Expr		xpr;
+	Node	   *expr;			/* expression to infer from, or NULL */
+	Oid			infercollid;	/* OID of collation, or InvalidOid */
+	Oid			inferopclass;	/* OID of att opclass, or InvalidOid */
+} InferenceElem;
 
 /*--------------------
  * TargetEntry -
@@ -1416,68 +1545,32 @@ typedef struct FromExpr
 	Node	   *quals;			/* qualifiers on join, if any */
 } FromExpr;
 
-
-typedef enum Movement
-{
-	MOVEMENT_NONE,			/* No motion required. */
-	MOVEMENT_FOCUS,			/* Fixed motion to a single segment. */
-	MOVEMENT_BROADCAST,		/* Broadcast motion. */
-	MOVEMENT_REPARTITION,	/* Hash motion */
-	MOVEMENT_LIM_RESTRUCT,	/* Restructure a Limit node into three stages */
-	MOVEMENT_EXPLICIT		/* Move tuples to the segments specified in the segid column */
-} Movement;
-
 /*----------
- * Flow - describes a tuple flow in a parallelized plan
+ * OnConflictExpr - represents an ON CONFLICT DO ... expression
  *
- * This node type is a MPP extension.
- *
- * Plan nodes contain a reference to a Flow that characterizes the output
- * tuple flow of the node.  In addition, the node contains fields used for
- * parallelizing specification.
+ * The optimizer requires a list of inference elements, and optionally a WHERE
+ * clause to infer a unique index.  The unique index (or, occasionally,
+ * indexes) inferred are used to arbitrate whether or not the alternative ON
+ * CONFLICT path is taken.
  *----------
  */
-typedef struct Flow
+typedef struct OnConflictExpr
 {
-	NodeTag		type;			/* T_Flow */
-	FlowType	flotype;		/* Type of flow produced by the plan. */
+	NodeTag		type;
+	OnConflictAction action;	/* DO NOTHING or UPDATE? */
 
-	/* What motion (including none) should be applied to this Plan's output. */
-	Movement	req_move;
+	/* Arbiter */
+	List	   *arbiterElems;	/* unique index arbiter list (of
+								 * InferenceElem's) */
+	Node	   *arbiterWhere;	/* unique index arbiter WHERE clause */
+	Oid			constraint;		/* pg_constraint OID for arbiter */
 
-	/* Locus type (optimizer flow characterization).
-	 */
-	CdbLocusType	locustype;
-
-	/* If flotype is FLOW_SINGLETON, then this is the segment (-1 for entry)
-	 * on which tuples occur.  If req_move is MOVEMENT_FOCUS, then this is
-	 * the desired segment for the resulting singleton flow.
-	 */
-	int			segindex;		/* Segment index of singleton flow. */
-	int         numsegments;
-
-	/* If req_move is MOVEMENT_REPARTITION, these express the desired
-     * partitioning for a hash motion.  Else if flotype is FLOW_PARTITIONED,
-     * this is the partitioning key.  Otherwise NIL.
-	 * otherwise, they are NIL. */
-	List       *hashExpr;			/* list of hash expressions */
-
-	/* If req_move is MOVEMENT_EXPLICIT, this contains the index of the segid column
-	 * to use in the motion	 */
-	AttrNumber segidColIdx;
-
-    /* The original Flow ptr is saved here upon setting req_move. */
-    struct Flow    *flow_before_req_move;
-
-} Flow;
-
-typedef enum GroupingType
-{
-	GROUPINGTYPE_ROLLUP,         /* ROLLUP grouping extension */
-	GROUPINGTYPE_CUBE,           /* CUBE grouping extension */
-	GROUPINGTYPE_GROUPING_SETS   /* GROUPING SETS grouping extension */
-} GroupingType;
-
+	/* ON CONFLICT UPDATE */
+	List	   *onConflictSet;	/* List of ON CONFLICT SET TargetEntrys */
+	Node	   *onConflictWhere;	/* qualifiers to restrict UPDATE to */
+	int			exclRelIndex;	/* RT index of 'excluded' relation */
+	List	   *exclRelTlist;	/* tlist of the EXCLUDED pseudo relation */
+} OnConflictExpr;
 
 /*
  * DMLActionExpr
@@ -1576,22 +1669,5 @@ typedef struct PartListNullTestExpr
 	int			level;			/* partitioning level */
 	NullTestType nulltesttype;	/* IS NULL, IS NOT NULL */
 } PartListNullTestExpr;
-
-/*
- * ReshuffleExpr
- *
- * Represents the expression that determines which data needs to be
- * reshuffled, when the number of segments is changed.
- */
-typedef struct ReshuffleExpr
-{
-	Expr		xpr;
-	int			newSegs;
-	int			oldSegs;
-	List	   *hashKeys;
-	List	   *hashTypes;
-	GpPolicyType ptype;
-} ReshuffleExpr;
-
 
 #endif   /* PRIMNODES_H */

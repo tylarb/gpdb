@@ -5,7 +5,7 @@
  *
  * Portions Copyright (c) 2005-2008, Greenplum inc
  * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -16,22 +16,26 @@
  */
 #include "postgres.h"
 
-#include "nodes/makefuncs.h"                /* makeVar() */
-#include "nodes/nodeFuncs.h"
-#include "catalog/gp_policy.h"
+#include "miscadmin.h"
+#include "optimizer/clauses.h"
 #include "optimizer/cost.h"
 #include "optimizer/pathnode.h"
 #include "optimizer/paths.h"
 #include "optimizer/placeholder.h"
 #include "optimizer/plancat.h"
 #include "optimizer/restrictinfo.h"
+#include "optimizer/tlist.h"
+#include "utils/hsearch.h"
+
+#include "catalog/gp_policy.h"
+#include "cdb/cdbpath.h"
+#include "cdb/cdbutil.h"
+#include "nodes/makefuncs.h"                /* makeVar() */
+#include "nodes/nodeFuncs.h"
 #include "optimizer/var.h"                  /* contain_vars_of_level_or_above */
 #include "parser/parse_expr.h"              /* exprType(), exprTypmod() */
 #include "parser/parsetree.h"
-#include "utils/hsearch.h"
 #include "utils/lsyscache.h"
-
-#include "cdb/cdbpath.h"
 
 typedef struct JoinHashEntry
 {
@@ -102,38 +106,41 @@ build_simple_rel(PlannerInfo *root, int relid, RelOptKind reloptkind)
 	rte = root->simple_rte_array[relid];
 	Assert(rte != NULL);
 
-    /* CDB: Rel isn't expected to have any pseudo columns yet. */
-    Assert(!rte->pseudocols);
-
 	rel = makeNode(RelOptInfo);
 	rel->reloptkind = reloptkind;
 	rel->relids = bms_make_singleton(relid);
 	rel->rows = 0;
-	rel->width = 0;
 	/* cheap startup cost is interesting iff not all tuples to be retrieved */
 	rel->consider_startup = (root->tuple_fraction > 0);
-	rel->reltargetlist = NIL;
+	rel->consider_param_startup = false;		/* might get changed later */
+	rel->consider_parallel = false;		/* might get changed later */
+	rel->reltarget = create_empty_pathtarget();
 	rel->pathlist = NIL;
 	rel->ppilist = NIL;
+	rel->partial_pathlist = NIL;
     rel->onerow = false;
 	rel->cheapest_startup_path = NULL;
 	rel->cheapest_total_path = NULL;
 	rel->cheapest_unique_path = NULL;
 	rel->cheapest_parameterized_paths = NIL;
+	rel->direct_lateral_relids = NULL;
+	rel->lateral_relids = NULL;
 	rel->relid = relid;
 	rel->rtekind = rte->rtekind;
 	/* min_attr, max_attr, attr_needed, attr_widths are set below */
 	rel->lateral_vars = NIL;
-	rel->lateral_relids = NULL;
 	rel->lateral_referencers = NULL;
 	rel->indexlist = NIL;
 	rel->pages = 0;
 	rel->tuples = 0;
 	rel->allvisfrac = 0;
-	rel->subplan = NULL;
-	rel->extEntry = NULL;
 	rel->subroot = NULL;
 	rel->subplan_params = NIL;
+	rel->rel_parallel_workers = -1;		/* set up in GetRelationInfo */
+	rel->serverid = InvalidOid;
+	rel->userid = rte->checkAsUser;
+	rel->useridiscurrent = false;
+	rel->exec_location = FTEXECLOCATION_NOT_DEFINED;
 	rel->fdwroutine = NULL;
 	rel->fdw_private = NULL;
 	rel->baserestrictinfo = NIL;
@@ -154,8 +161,14 @@ build_simple_rel(PlannerInfo *root, int relid, RelOptKind reloptkind)
 			if (rte->forceDistRandom)
 			{
 				GpPolicy   *origpolicy = GpPolicyFetch(rte->relid);
+				int			numsegments;
 
-				rel->cdbpolicy = createRandomPartitionedPolicy(origpolicy->numsegments);
+				if (origpolicy->ptype != POLICYTYPE_ENTRY)
+					numsegments = origpolicy->numsegments;
+				else
+					numsegments = getgpsegmentCount();
+
+				rel->cdbpolicy = createRandomPartitionedPolicy(numsegments);
 
 				/* Scribble the tuple number of rel to reflect the real size */
 				rel->tuples = rel->tuples * planner_segment_count(rel->cdbpolicy);
@@ -396,17 +409,25 @@ build_join_rel(PlannerInfo *root,
 	joinrel->reloptkind = RELOPT_JOINREL;
 	joinrel->relids = bms_copy(joinrelids);
 	joinrel->rows = 0;
-	joinrel->width = 0;
 	/* cheap startup cost is interesting iff not all tuples to be retrieved */
 	joinrel->consider_startup = (root->tuple_fraction > 0);
-	joinrel->reltargetlist = NIL;
+	joinrel->consider_param_startup = false;
+	joinrel->consider_parallel = false;
+	joinrel->reltarget = create_empty_pathtarget();
 	joinrel->pathlist = NIL;
 	joinrel->ppilist = NIL;
+	joinrel->partial_pathlist = NIL;
     joinrel->onerow = false;
 	joinrel->cheapest_startup_path = NULL;
 	joinrel->cheapest_total_path = NULL;
 	joinrel->cheapest_unique_path = NULL;
 	joinrel->cheapest_parameterized_paths = NIL;
+	/* init direct_lateral_relids from children; we'll finish it up below */
+	joinrel->direct_lateral_relids =
+		bms_union(outer_rel->direct_lateral_relids,
+				  inner_rel->direct_lateral_relids);
+	joinrel->lateral_relids = min_join_parameterization(root, joinrel->relids,
+														outer_rel, inner_rel);
 	joinrel->relid = 0;			/* indicates not a baserel */
 	joinrel->rtekind = RTE_JOIN;
 	joinrel->min_attr = 0;
@@ -414,15 +435,18 @@ build_join_rel(PlannerInfo *root,
 	joinrel->attr_needed = NULL;
 	joinrel->attr_widths = NULL;
 	joinrel->lateral_vars = NIL;
-	joinrel->lateral_relids = NULL;
 	joinrel->lateral_referencers = NULL;
 	joinrel->indexlist = NIL;
 	joinrel->pages = 0;
 	joinrel->tuples = 0;
 	joinrel->allvisfrac = 0;
-	joinrel->subplan = NULL;
 	joinrel->subroot = NULL;
 	joinrel->subplan_params = NIL;
+	joinrel->rel_parallel_workers = -1;
+	joinrel->serverid = InvalidOid;
+	joinrel->userid = InvalidOid;
+	joinrel->useridiscurrent = false;
+	joinrel->exec_location = FTEXECLOCATION_NOT_DEFINED;
 	joinrel->fdwroutine = NULL;
 	joinrel->fdw_private = NULL;
 	joinrel->baserestrictinfo = NIL;
@@ -436,6 +460,54 @@ build_join_rel(PlannerInfo *root,
 		joinrel->onerow = true;
 
 	/*
+	 * Set up foreign-join fields if outer and inner relation are foreign
+	 * tables (or joins) belonging to the same server and assigned to the same
+	 * user to check access permissions as.  In addition to an exact match of
+	 * userid, we allow the case where one side has zero userid (implying
+	 * current user) and the other side has explicit userid that happens to
+	 * equal the current user; but in that case, pushdown of the join is only
+	 * valid for the current user.  The useridiscurrent field records whether
+	 * we had to make such an assumption for this join or any sub-join.
+	 *
+	 * Otherwise these fields are left invalid, so GetForeignJoinPaths will
+	 * not be called for the join relation.
+	 *
+	 * GPDB: Also, EXECUTE ON must match. (Perhaps we shouldn't allow EXECUTE
+	 * ON on individual tables? Then it would be enough to compare server id)
+	 */
+	if (OidIsValid(outer_rel->serverid) &&
+		inner_rel->serverid == outer_rel->serverid &&
+		inner_rel->exec_location == outer_rel->exec_location)
+	{
+		if (inner_rel->userid == outer_rel->userid)
+		{
+			joinrel->serverid = outer_rel->serverid;
+			joinrel->userid = outer_rel->userid;
+			joinrel->useridiscurrent = outer_rel->useridiscurrent || inner_rel->useridiscurrent;
+			joinrel->fdwroutine = outer_rel->fdwroutine;
+			joinrel->exec_location = outer_rel->exec_location;
+		}
+		else if (!OidIsValid(inner_rel->userid) &&
+				 outer_rel->userid == GetUserId())
+		{
+			joinrel->serverid = outer_rel->serverid;
+			joinrel->userid = outer_rel->userid;
+			joinrel->useridiscurrent = true;
+			joinrel->fdwroutine = outer_rel->fdwroutine;
+			joinrel->exec_location = outer_rel->exec_location;
+		}
+		else if (!OidIsValid(outer_rel->userid) &&
+				 inner_rel->userid == GetUserId())
+		{
+			joinrel->serverid = outer_rel->serverid;
+			joinrel->userid = inner_rel->userid;
+			joinrel->useridiscurrent = true;
+			joinrel->fdwroutine = outer_rel->fdwroutine;
+			joinrel->exec_location = outer_rel->exec_location;
+		}
+	}
+
+	/*
 	 * Create a new tlist containing just the vars that need to be output from
 	 * this join (ie, are needed for higher joinclauses or final output).
 	 *
@@ -443,12 +515,28 @@ build_join_rel(PlannerInfo *root,
 	 * and inner rels we first try to build it from.  But the contents should
 	 * be the same regardless.
 	 */
-	build_joinrel_tlist(root, joinrel, outer_rel->reltargetlist);
-	build_joinrel_tlist(root, joinrel, inner_rel->reltargetlist);
-	add_placeholders_to_joinrel(root, joinrel);
+	build_joinrel_tlist(root, joinrel, outer_rel->reltarget->exprs);
+	build_joinrel_tlist(root, joinrel, inner_rel->reltarget->exprs);
+	add_placeholders_to_joinrel(root, joinrel, outer_rel, inner_rel);
 
+	/*
+	 * add_placeholders_to_joinrel also took care of adding the ph_lateral
+	 * sets of any PlaceHolderVars computed here to direct_lateral_relids, so
+	 * now we can finish computing that.  This is much like the computation of
+	 * the transitively-closed lateral_relids in min_join_parameterization,
+	 * except that here we *do* have to consider the added PHVs.
+	 */
+	joinrel->direct_lateral_relids =
+		bms_del_members(joinrel->direct_lateral_relids, joinrel->relids);
+	if (bms_is_empty(joinrel->direct_lateral_relids))
+		joinrel->direct_lateral_relids = NULL;
+
+	/* GPDB_96_MERGE_FIXME: The 'width' is now in joinrel->reltarget. But I
+	 * don't think this is the right place to set it. Do we actually care
+	 * about doing this? PostgreSQL doesn't bother..
+	 */
 	/* cap width of output row by sum of its inputs */
-	joinrel->width = Min(joinrel->width, outer_rel->width + inner_rel->width);
+	//joinrel->width = Min(joinrel->width, outer_rel->width + inner_rel->width);
 
 	/*
 	 * Construct restrict and join clause lists for the new joinrel. (The
@@ -472,6 +560,25 @@ build_join_rel(PlannerInfo *root,
 	 */
 	set_joinrel_size_estimates(root, joinrel, outer_rel, inner_rel,
 							   sjinfo, restrictlist);
+
+	/*
+	 * Set the consider_parallel flag if this joinrel could potentially be
+	 * scanned within a parallel worker.  If this flag is false for either
+	 * inner_rel or outer_rel, then it must be false for the joinrel also.
+	 * Even if both are true, there might be parallel-restricted expressions
+	 * in the targetlist or quals.
+	 *
+	 * Note that if there are more than two rels in this relation, they could
+	 * be divided between inner_rel and outer_rel in any arbitrary way.  We
+	 * assume this doesn't matter, because we should hit all the same baserels
+	 * and joinclauses while building up to this joinrel no matter which we
+	 * take; therefore, we should make the same decision here however we get
+	 * here.
+	 */
+	if (inner_rel->consider_parallel && outer_rel->consider_parallel &&
+		!has_parallel_hazard((Node *) restrictlist, false) &&
+		!has_parallel_hazard((Node *) joinrel->reltarget->exprs, false))
+		joinrel->consider_parallel = true;
 
 	/*
 	 * Add the joinrel to the query's joinrel list, and store it into the
@@ -508,6 +615,45 @@ build_join_rel(PlannerInfo *root,
 	}
 
 	return joinrel;
+}
+
+/*
+ * min_join_parameterization
+ *
+ * Determine the minimum possible parameterization of a joinrel, that is, the
+ * set of other rels it contains LATERAL references to.  We save this value in
+ * the join's RelOptInfo.  This function is split out of build_join_rel()
+ * because join_is_legal() needs the value to check a prospective join.
+ */
+Relids
+min_join_parameterization(PlannerInfo *root,
+						  Relids joinrelids,
+						  RelOptInfo *outer_rel,
+						  RelOptInfo *inner_rel)
+{
+	Relids		result;
+
+	/*
+	 * Basically we just need the union of the inputs' lateral_relids, less
+	 * whatever is already in the join.
+	 *
+	 * It's not immediately obvious that this is a valid way to compute the
+	 * result, because it might seem that we're ignoring possible lateral refs
+	 * of PlaceHolderVars that are due to be computed at the join but not in
+	 * either input.  However, because create_lateral_join_info() already
+	 * charged all such PHV refs to each member baserel of the join, they'll
+	 * be accounted for already in the inputs' lateral_relids.  Likewise, we
+	 * do not need to worry about doing transitive closure here, because that
+	 * was already accounted for in the original baserel lateral_relids.
+	 */
+	result = bms_union(outer_rel->lateral_relids, inner_rel->lateral_relids);
+	result = bms_del_members(result, joinrelids);
+
+	/* Maintain invariant that result is exactly NULL if empty */
+	if (bms_is_empty(result))
+		result = NULL;
+
+	return result;
 }
 
 /*
@@ -548,21 +694,8 @@ build_joinrel_tlist(PlannerInfo *root, RelOptInfo *joinrel,
 		 * rels, which will never be seen here.)
 		 */
 		if (!IsA(var, Var))
-			elog(ERROR, "unexpected node type in reltargetlist: %d",
+			elog(ERROR, "unexpected node type in rel targetlist: %d",
 				 (int) nodeTag(var));
-
-        /* Pseudo column? */
-        if (var->varattno <= FirstLowInvalidHeapAttributeNumber)
-        {
-            CdbRelColumnInfo   *rci = cdb_find_pseudo_column(root, var);
-
-		    if (bms_nonempty_difference(rci->where_needed, relids))
-		    {
-			    joinrel->reltargetlist = lappend(joinrel->reltargetlist, var);
-			    joinrel->width += rci->attr_width;
-		    }
-            continue;
-        }
 
 		/* Get the Var's original base rel */
 		baserel = find_base_rel(root, var->varno);
@@ -576,8 +709,9 @@ build_joinrel_tlist(PlannerInfo *root, RelOptInfo *joinrel,
 		if (bms_nonempty_difference(baserel->attr_needed[ndx], relids))
 		{
 			/* Yup, add it to the output */
-			joinrel->reltargetlist = lappend(joinrel->reltargetlist, var);
-			joinrel->width += baserel->attr_widths[ndx];
+			joinrel->reltarget->exprs = lappend(joinrel->reltarget->exprs, var);
+			/* Vars have cost zero, so no need to adjust reltarget->cost */
+			joinrel->reltarget->width += baserel->attr_widths[ndx];
 		}
 	}
 }
@@ -742,169 +876,6 @@ subbuild_joinrel_joinlist(RelOptInfo *joinrel,
 }
 
 /*
- * cdb_define_pseudo_column
- *
- * Add a pseudo column definition to a baserel or appendrel.  Returns
- * a Var node referencing the new column.
- *
- * This function does not add the new Var node to the targetlist.  The
- * caller should do that, if needed, by calling add_vars_to_targetlist().
- *
- * A pseudo column is defined by an expression which is to be evaluated
- * in targetlist and/or qual expressions of the baserel's scan operator in
- * the Plan tree.
- *
- * A pseudo column is referenced by means of Var nodes in which varno = relid
- * and varattno = FirstLowInvalidHeapAttributeNumber minus the 0-based position
- * of the CdbRelColumnInfo node in the rte->pseudocols list.
- *
- * The special Var nodes will later be eliminated during set_plan_references().
- * Those in the scan or append operator's targetlist and quals will be replaced
- * by copies of the defining expression.  Those further downstream will be
- * replaced by ordinary Var nodes referencing the appropriate targetlist item.
- *
- * A pseudo column defined in an appendrel is merely a placeholder for a
- * column produced by the subpaths, allowing the column to be referenced
- * by downstream nodes.  Its defining expression is never evaluated because
- * the Append targetlist is not executed.  It is the caller's responsibility
- * to make corresponding changes to the targetlists of the appendrel and its
- * subpaths so that they all match.
- *
- * Note that a joinrel can't define a pseudo column because, lacking a
- * relid, there's no way for a Var node to reference such a column.
- */
-Var *
-cdb_define_pseudo_column(PlannerInfo   *root,
-                         RelOptInfo    *rel,
-                         const char    *colname,
-                         Expr          *defexpr,
-                         int32          width)
-{
-    CdbRelColumnInfo   *rci = makeNode(CdbRelColumnInfo);
-    RangeTblEntry      *rte = rt_fetch(rel->relid, root->parse->rtable);
-    ListCell           *cell;
-    Var                *var;
-    int                 i;
-
-    Assert(colname && strlen(colname) < sizeof(rci->colname)-10);
-    Assert(rel->reloptkind == RELOPT_BASEREL ||
-           rel->reloptkind == RELOPT_OTHER_MEMBER_REL);
-
-    rci->defexpr = defexpr;
-    rci->where_needed = NULL;
-
-    /* Assign attribute number. */
-    rci->pseudoattno = FirstLowInvalidHeapAttributeNumber - list_length(rte->pseudocols);
-
-    /* Make a Var node which upper nodes can copy to reference the column. */
-    var = makeVar(rel->relid, rci->pseudoattno,
-                  exprType((Node *) defexpr),
-				  exprTypmod((Node *) defexpr),
-				  exprCollation((Node *) defexpr),
-                  0);
-
-    /* Note the estimated number of bytes for a value of this type. */
-    if (width < 0)
-		width = get_typavgwidth(var->vartype, var->vartypmod);
-    rci->attr_width = width;
-
-    /* If colname isn't unique, add suffix "_2", "_3", etc. */
-    StrNCpy(rci->colname, colname, sizeof(rci->colname));
-    for (i = 1;;)
-    {
-        CdbRelColumnInfo   *rci2;
-        Value              *val;
-
-        /* Same as the name of a regular column? */
-        foreach(cell, rte->eref ? rte->eref->colnames : NULL)
-        {
-            val = (Value *)lfirst(cell);
-            Assert(IsA(val, String));
-            if (0 == strcmp(strVal(val), rci->colname))
-                break;
-        }
-
-        /* Same as the name of an already defined pseudo column? */
-        if (!cell)
-        {
-            foreach(cell, rte->pseudocols)
-            {
-                rci2 = (CdbRelColumnInfo *)lfirst(cell);
-                Assert(IsA(rci2, CdbRelColumnInfo));
-                if (0 == strcmp(rci2->colname, rci->colname))
-                    break;
-            }
-        }
-
-        if (!cell)
-            break;
-        Insist(i <= list_length(rte->eref->colnames) + list_length(rte->pseudocols));
-        snprintf(rci->colname, sizeof(rci->colname), "%s_%d", colname, ++i);
-    }
-
-    /* Add to the RTE's pseudo column list. */
-    rte->pseudocols = lappend(rte->pseudocols, rci);
-
-    return var;
-}                               /* cdb_define_pseudo_column */
-
-
-/*
- * cdb_find_pseudo_column
- *
- * Return the CdbRelColumnInfo node which defines a pseudo column.
- */
-CdbRelColumnInfo *
-cdb_find_pseudo_column(PlannerInfo *root, Var *var)
-{
-    CdbRelColumnInfo   *rci;
-    RangeTblEntry      *rte;
-    const char         *rtename;
-
-    Assert(IsA(var, Var) &&
-           var->varno > 0 &&
-           var->varno <= list_length(root->parse->rtable));
-
-    rte = rt_fetch(var->varno, root->parse->rtable);
-    rci = cdb_rte_find_pseudo_column(rte, var->varattno);
-    if (!rci)
-    {
-        rtename = (rte->eref && rte->eref->aliasname) ? rte->eref->aliasname
-                                                      : "*BOGUS*";
-        ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
-                        errmsg_internal("invalid varattno %d for rangetable entry %s",
-                                        var->varattno, rtename) ));
-    }
-    return rci;
-}                               /* cdb_find_pseudo_column */
-
-
-/*
- * cdb_rte_find_pseudo_column
- *
- * Return the CdbRelColumnInfo node which defines a pseudo column; or
- * NULL if didn't find a pseudo column with the given attno.
- */
-CdbRelColumnInfo *
-cdb_rte_find_pseudo_column(RangeTblEntry *rte, AttrNumber attno)
-{
-    int                 ndx = FirstLowInvalidHeapAttributeNumber - attno;
-    CdbRelColumnInfo   *rci;
-
-    Assert(IsA(rte, RangeTblEntry));
-
-    if (attno > FirstLowInvalidHeapAttributeNumber ||
-        ndx >= list_length(rte->pseudocols))
-        return NULL;
-
-    rci = (CdbRelColumnInfo *)list_nth(rte->pseudocols, ndx);
-
-    Assert(IsA(rci, CdbRelColumnInfo));
-    Insist(rci->pseudoattno == attno);
-    return rci;
-}                               /* cdb_rte_find_pseudo_column */
-
-/*
  * build_empty_join_rel
  *		Build a dummy join relation describing an empty set of base rels.
  *
@@ -925,8 +896,8 @@ build_empty_join_rel(PlannerInfo *root)
 	joinrel->reloptkind = RELOPT_JOINREL;
 	joinrel->relids = NULL;		/* empty set */
 	joinrel->rows = 1;			/* we produce one row for such cases */
-	joinrel->width = 0;			/* it contains no Vars */
 	joinrel->rtekind = RTE_JOIN;
+	joinrel->reltarget = create_empty_pathtarget();
 
 	root->join_rel_list = lappend(root->join_rel_list, joinrel);
 
@@ -935,11 +906,68 @@ build_empty_join_rel(PlannerInfo *root)
 
 
 /*
+ * fetch_upper_rel
+ *		Build a RelOptInfo describing some post-scan/join query processing,
+ *		or return a pre-existing one if somebody already built it.
+ *
+ * An "upper" relation is identified by an UpperRelationKind and a Relids set.
+ * The meaning of the Relids set is not specified here, and very likely will
+ * vary for different relation kinds.
+ *
+ * Most of the fields in an upper-level RelOptInfo are not used and are not
+ * set here (though makeNode should ensure they're zeroes).  We basically only
+ * care about fields that are of interest to add_path() and set_cheapest().
+ */
+RelOptInfo *
+fetch_upper_rel(PlannerInfo *root, UpperRelationKind kind, Relids relids)
+{
+	RelOptInfo *upperrel;
+	ListCell   *lc;
+
+	/*
+	 * For the moment, our indexing data structure is just a List for each
+	 * relation kind.  If we ever get so many of one kind that this stops
+	 * working well, we can improve it.  No code outside this function should
+	 * assume anything about how to find a particular upperrel.
+	 */
+
+	/* If we already made this upperrel for the query, return it */
+	foreach(lc, root->upper_rels[kind])
+	{
+		upperrel = (RelOptInfo *) lfirst(lc);
+
+		if (bms_equal(upperrel->relids, relids))
+			return upperrel;
+	}
+
+	upperrel = makeNode(RelOptInfo);
+	upperrel->reloptkind = RELOPT_UPPER_REL;
+	upperrel->relids = bms_copy(relids);
+
+	/* cheap startup cost is interesting iff not all tuples to be retrieved */
+	upperrel->consider_startup = (root->tuple_fraction > 0);
+	upperrel->consider_param_startup = false;
+	upperrel->consider_parallel = false;		/* might get changed later */
+	upperrel->reltarget = create_empty_pathtarget();
+	upperrel->pathlist = NIL;
+	upperrel->cheapest_startup_path = NULL;
+	upperrel->cheapest_total_path = NULL;
+	upperrel->cheapest_unique_path = NULL;
+	upperrel->cheapest_parameterized_paths = NIL;
+
+	root->upper_rels[kind] = lappend(root->upper_rels[kind], upperrel);
+
+	return upperrel;
+}
+
+
+/*
  * find_childrel_appendrelinfo
  *		Get the AppendRelInfo associated with an appendrel child rel.
  *
  * This search could be eliminated by storing a link in child RelOptInfos,
- * but for now it doesn't seem performance-critical.
+ * but for now it doesn't seem performance-critical.  (Also, it might be
+ * difficult to maintain such a link during mutation of the append_rel_list.)
  */
 AppendRelInfo *
 find_childrel_appendrelinfo(PlannerInfo *root, RelOptInfo *rel)
@@ -960,6 +988,62 @@ find_childrel_appendrelinfo(PlannerInfo *root, RelOptInfo *rel)
 	/* should have found the entry ... */
 	elog(ERROR, "child rel %d not found in append_rel_list", relid);
 	return NULL;				/* not reached */
+}
+
+
+/*
+ * find_childrel_top_parent
+ *		Fetch the topmost appendrel parent rel of an appendrel child rel.
+ *
+ * Since appendrels can be nested, a child could have multiple levels of
+ * appendrel ancestors.  This function locates the topmost ancestor,
+ * which will be a regular baserel not an otherrel.
+ */
+RelOptInfo *
+find_childrel_top_parent(PlannerInfo *root, RelOptInfo *rel)
+{
+	do
+	{
+		AppendRelInfo *appinfo = find_childrel_appendrelinfo(root, rel);
+		Index		prelid = appinfo->parent_relid;
+
+		/* traverse up to the parent rel, loop if it's also a child rel */
+		rel = find_base_rel(root, prelid);
+	} while (rel->reloptkind == RELOPT_OTHER_MEMBER_REL);
+
+	Assert(rel->reloptkind == RELOPT_BASEREL);
+
+	return rel;
+}
+
+
+/*
+ * find_childrel_parents
+ *		Compute the set of parent relids of an appendrel child rel.
+ *
+ * Since appendrels can be nested, a child could have multiple levels of
+ * appendrel ancestors.  This function computes a Relids set of all the
+ * parent relation IDs.
+ */
+Relids
+find_childrel_parents(PlannerInfo *root, RelOptInfo *rel)
+{
+	Relids		result = NULL;
+
+	do
+	{
+		AppendRelInfo *appinfo = find_childrel_appendrelinfo(root, rel);
+		Index		prelid = appinfo->parent_relid;
+
+		result = bms_add_member(result, prelid);
+
+		/* traverse up to the parent rel, loop if it's also a child rel */
+		rel = find_base_rel(root, prelid);
+	} while (rel->reloptkind == RELOPT_OTHER_MEMBER_REL);
+
+	Assert(rel->reloptkind == RELOPT_BASEREL);
+
+	return result;
 }
 
 
@@ -1079,6 +1163,7 @@ get_joinrel_parampathinfo(PlannerInfo *root, RelOptInfo *joinrel,
 	Relids		inner_and_req;
 	List	   *pclauses;
 	List	   *eclauses;
+	List	   *dropped_ecs;
 	double		rows;
 	ListCell   *lc;
 
@@ -1132,20 +1217,96 @@ get_joinrel_parampathinfo(PlannerInfo *root, RelOptInfo *joinrel,
 												required_outer,
 												joinrel);
 	/* We only want ones that aren't movable to lower levels */
+	dropped_ecs = NIL;
 	foreach(lc, eclauses)
 	{
 		RestrictInfo *rinfo = (RestrictInfo *) lfirst(lc);
 
+		/*
+		 * In principle, join_clause_is_movable_into() should accept anything
+		 * returned by generate_join_implied_equalities(); but because its
+		 * analysis is only approximate, sometimes it doesn't.  So we
+		 * currently cannot use this Assert; instead just assume it's okay to
+		 * apply the joinclause at this level.
+		 */
+#ifdef NOT_USED
 		Assert(join_clause_is_movable_into(rinfo,
 										   joinrel->relids,
 										   join_and_req));
-		if (!join_clause_is_movable_into(rinfo,
-										 outer_path->parent->relids,
-										 outer_and_req) &&
-			!join_clause_is_movable_into(rinfo,
-										 inner_path->parent->relids,
-										 inner_and_req))
-			pclauses = lappend(pclauses, rinfo);
+#endif
+		if (join_clause_is_movable_into(rinfo,
+										outer_path->parent->relids,
+										outer_and_req))
+			continue;			/* drop if movable into LHS */
+		if (join_clause_is_movable_into(rinfo,
+										inner_path->parent->relids,
+										inner_and_req))
+		{
+			/* drop if movable into RHS, but remember EC for use below */
+			Assert(rinfo->left_ec == rinfo->right_ec);
+			dropped_ecs = lappend(dropped_ecs, rinfo->left_ec);
+			continue;
+		}
+		pclauses = lappend(pclauses, rinfo);
+	}
+
+	/*
+	 * EquivalenceClasses are harder to deal with than we could wish, because
+	 * of the fact that a given EC can generate different clauses depending on
+	 * context.  Suppose we have an EC {X.X, Y.Y, Z.Z} where X and Y are the
+	 * LHS and RHS of the current join and Z is in required_outer, and further
+	 * suppose that the inner_path is parameterized by both X and Z.  The code
+	 * above will have produced either Z.Z = X.X or Z.Z = Y.Y from that EC,
+	 * and in the latter case will have discarded it as being movable into the
+	 * RHS.  However, the EC machinery might have produced either Y.Y = X.X or
+	 * Y.Y = Z.Z as the EC enforcement clause within the inner_path; it will
+	 * not have produced both, and we can't readily tell from here which one
+	 * it did pick.  If we add no clause to this join, we'll end up with
+	 * insufficient enforcement of the EC; either Z.Z or X.X will fail to be
+	 * constrained to be equal to the other members of the EC.  (When we come
+	 * to join Z to this X/Y path, we will certainly drop whichever EC clause
+	 * is generated at that join, so this omission won't get fixed later.)
+	 *
+	 * To handle this, for each EC we discarded such a clause from, try to
+	 * generate a clause connecting the required_outer rels to the join's LHS
+	 * ("Z.Z = X.X" in the terms of the above example).  If successful, and if
+	 * the clause can't be moved to the LHS, add it to the current join's
+	 * restriction clauses.  (If an EC cannot generate such a clause then it
+	 * has nothing that needs to be enforced here, while if the clause can be
+	 * moved into the LHS then it should have been enforced within that path.)
+	 *
+	 * Note that we don't need similar processing for ECs whose clause was
+	 * considered to be movable into the LHS, because the LHS can't refer to
+	 * the RHS so there is no comparable ambiguity about what it might
+	 * actually be enforcing internally.
+	 */
+	if (dropped_ecs)
+	{
+		Relids		real_outer_and_req;
+
+		real_outer_and_req = bms_union(outer_path->parent->relids,
+									   required_outer);
+		eclauses =
+			generate_join_implied_equalities_for_ecs(root,
+													 dropped_ecs,
+													 real_outer_and_req,
+													 required_outer,
+													 outer_path->parent);
+		foreach(lc, eclauses)
+		{
+			RestrictInfo *rinfo = (RestrictInfo *) lfirst(lc);
+
+			/* As above, can't quite assert this here */
+#ifdef NOT_USED
+			Assert(join_clause_is_movable_into(rinfo,
+											   outer_path->parent->relids,
+											   real_outer_and_req));
+#endif
+			if (!join_clause_is_movable_into(rinfo,
+											 outer_path->parent->relids,
+											 outer_and_req))
+				pclauses = lappend(pclauses, rinfo);
+		}
 	}
 
 	/*
@@ -1165,8 +1326,8 @@ get_joinrel_parampathinfo(PlannerInfo *root, RelOptInfo *joinrel,
 
 	/* Estimate the number of rows returned by the parameterized join */
 	rows = get_parameterized_joinrel_size(root, joinrel,
-										  outer_path->rows,
-										  inner_path->rows,
+										  outer_path,
+										  inner_path,
 										  sjinfo,
 										  *restrict_clauses);
 

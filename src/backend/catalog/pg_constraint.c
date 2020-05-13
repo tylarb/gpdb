@@ -3,7 +3,7 @@
  * pg_constraint.c
  *	  routines to support manipulation of the pg_constraint relation
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -17,11 +17,13 @@
 #include "access/genam.h"
 #include "access/heapam.h"
 #include "access/htup_details.h"
+#include "access/sysattr.h"
 #include "catalog/dependency.h"
 #include "catalog/indexing.h"
 #include "catalog/objectaccess.h"
 #include "catalog/oid_dispatch.h"
 #include "catalog/pg_constraint.h"
+#include "catalog/pg_constraint_fn.h"
 #include "catalog/pg_operator.h"
 #include "catalog/pg_type.h"
 #include "cdb/cdbvars.h"
@@ -43,6 +45,8 @@
  * Subsidiary records (such as triggers or indexes to implement the
  * constraint) are *not* created here.  But we do make dependency links
  * from the constraint to the things it depends on.
+ *
+ * The new constraint's OID is returned.
  */
 Oid
 CreateConstraintEntry(const char *constraintName,
@@ -750,7 +754,8 @@ AlterConstraintNamespaces(Oid ownerId, Oid oldNspId,
 		if (object_address_present(&thisobj, objsMoved))
 			continue;
 
-		if (conform->connamespace == oldNspId)
+		/* Don't update if the object is already part of the namespace */
+		if (conform->connamespace == oldNspId && oldNspId != newNspId)
 		{
 			tup = heap_copytuple(tup);
 			conform = (Form_pg_constraint) GETSTRUCT(tup);
@@ -778,22 +783,61 @@ AlterConstraintNamespaces(Oid ownerId, Oid oldNspId,
 }
 
 /*
- * get_constraint_relation_oids
- *		Find the IDs of the relations to which a constraint refers.
+ * ConstraintSetParentConstraint
+ *		Set a partition's constraint as child of its parent table's
+ *
+ * This updates the constraint's pg_constraint row to show it as inherited, and
+ * add a dependency to the parent so that it cannot be removed on its own.
  */
 void
-get_constraint_relation_oids(Oid constraint_oid, Oid *conrelid, Oid *confrelid)
+ConstraintSetParentConstraint(Oid childConstrId, Oid parentConstrId)
 {
-	HeapTuple	tup;
-	Form_pg_constraint con;
+	Relation	constrRel;
+	Form_pg_constraint constrForm;
+	HeapTuple	tuple,
+				newtup;
+	ObjectAddress depender;
+	ObjectAddress referenced;
 
-	tup = SearchSysCache1(CONSTROID, ObjectIdGetDatum(constraint_oid));
-	if (!HeapTupleIsValid(tup)) /* should not happen */
-		elog(ERROR, "cache lookup failed for constraint %u", constraint_oid);
-	con = (Form_pg_constraint) GETSTRUCT(tup);
-	*conrelid = con->conrelid;
-	*confrelid = con->confrelid;
-	ReleaseSysCache(tup);
+	constrRel = heap_open(ConstraintRelationId, RowExclusiveLock);
+	tuple = SearchSysCache1(CONSTROID, ObjectIdGetDatum(childConstrId));
+	if (!HeapTupleIsValid(tuple))
+		elog(ERROR, "cache lookup failed for constraint %u", childConstrId);
+	newtup = heap_copytuple(tuple);
+	constrForm = (Form_pg_constraint) GETSTRUCT(newtup);
+	if (OidIsValid(parentConstrId))
+	{
+		/* don't allow setting parent for a constraint that already has one */
+		Assert(constrForm->coninhcount == 0);
+
+		constrForm->conislocal = false;
+		constrForm->coninhcount++;
+
+		simple_heap_update(constrRel, &tuple->t_self, newtup);
+		CatalogUpdateIndexes(constrRel, newtup);
+
+		ObjectAddressSet(referenced, ConstraintRelationId, parentConstrId);
+		ObjectAddressSet(depender, ConstraintRelationId, childConstrId);
+
+		recordDependencyOn(&depender, &referenced, DEPENDENCY_INTERNAL_AUTO);
+	}
+	else
+	{
+		constrForm->coninhcount--;
+		constrForm->conislocal = true;
+
+		/* Make sure there's no further inheritance. */
+		Assert(constrForm->coninhcount == 0);
+
+		deleteDependencyRecordsForClass(ConstraintRelationId, childConstrId,
+										ConstraintRelationId,
+										DEPENDENCY_INTERNAL_AUTO);
+		simple_heap_update(constrRel, &tuple->t_self, newtup);
+		CatalogUpdateIndexes(constrRel, newtup);
+	}
+	
+	ReleaseSysCache(tuple);
+	heap_close(constrRel, RowExclusiveLock);
 }
 
 /*
@@ -855,6 +899,45 @@ get_relation_constraint_oid(Oid relid, const char *conname, bool missing_ok)
 }
 
 /*
+ * Return the OID of the constraint associated with the given index in the
+ * given relation; or InvalidOid if no such index is catalogued.
+ */
+Oid
+get_relation_idx_constraint_oid(Oid relationId, Oid indexId)
+{
+	Relation	pg_constraint;
+	SysScanDesc scan;
+	ScanKeyData key;
+	HeapTuple	tuple;
+	Oid			constraintId = InvalidOid;
+
+	pg_constraint = heap_open(ConstraintRelationId, AccessShareLock);
+
+	ScanKeyInit(&key,
+				Anum_pg_constraint_conrelid,
+				BTEqualStrategyNumber,
+				F_OIDEQ,
+				ObjectIdGetDatum(relationId));
+	scan = systable_beginscan(pg_constraint, ConstraintRelidIndexId,
+							  true, NULL, 1, &key);
+	while ((tuple = systable_getnext(scan)) != NULL)
+	{
+		Form_pg_constraint constrForm;
+
+		constrForm = (Form_pg_constraint) GETSTRUCT(tuple);
+		if (constrForm->conindid == indexId)
+		{
+			constraintId = HeapTupleGetOid(tuple);
+			break;
+		}
+	}
+	systable_endscan(scan);
+
+	heap_close(pg_constraint, AccessShareLock);
+	return constraintId;
+}
+
+/*
  * get_domain_constraint_oid
  *		Find a constraint on the specified domain with the specified name.
  *		Returns constraint's OID.
@@ -913,6 +996,99 @@ get_domain_constraint_oid(Oid typid, const char *conname, bool missing_ok)
 }
 
 /*
+ * get_primary_key_attnos
+ *		Identify the columns in a relation's primary key, if any.
+ *
+ * Returns a Bitmapset of the column attnos of the primary key's columns,
+ * with attnos being offset by FirstLowInvalidHeapAttributeNumber so that
+ * system columns can be represented.
+ *
+ * If there is no primary key, return NULL.  We also return NULL if the pkey
+ * constraint is deferrable and deferrableOk is false.
+ *
+ * *constraintOid is set to the OID of the pkey constraint, or InvalidOid
+ * on failure.
+ */
+Bitmapset *
+get_primary_key_attnos(Oid relid, bool deferrableOk, Oid *constraintOid)
+{
+	Bitmapset  *pkattnos = NULL;
+	Relation	pg_constraint;
+	HeapTuple	tuple;
+	SysScanDesc scan;
+	ScanKeyData skey[1];
+
+	/* Set *constraintOid, to avoid complaints about uninitialized vars */
+	*constraintOid = InvalidOid;
+
+	/* Scan pg_constraint for constraints of the target rel */
+	pg_constraint = heap_open(ConstraintRelationId, AccessShareLock);
+
+	ScanKeyInit(&skey[0],
+				Anum_pg_constraint_conrelid,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(relid));
+
+	scan = systable_beginscan(pg_constraint, ConstraintRelidIndexId, true,
+							  NULL, 1, skey);
+
+	while (HeapTupleIsValid(tuple = systable_getnext(scan)))
+	{
+		Form_pg_constraint con = (Form_pg_constraint) GETSTRUCT(tuple);
+		Datum		adatum;
+		bool		isNull;
+		ArrayType  *arr;
+		int16	   *attnums;
+		int			numkeys;
+		int			i;
+
+		/* Skip constraints that are not PRIMARY KEYs */
+		if (con->contype != CONSTRAINT_PRIMARY)
+			continue;
+
+		/*
+		 * If the primary key is deferrable, but we've been instructed to
+		 * ignore deferrable constraints, then we might as well give up
+		 * searching, since there can only be a single primary key on a table.
+		 */
+		if (con->condeferrable && !deferrableOk)
+			break;
+
+		/* Extract the conkey array, ie, attnums of PK's columns */
+		adatum = heap_getattr(tuple, Anum_pg_constraint_conkey,
+							  RelationGetDescr(pg_constraint), &isNull);
+		if (isNull)
+			elog(ERROR, "null conkey for constraint %u",
+				 HeapTupleGetOid(tuple));
+		arr = DatumGetArrayTypeP(adatum);		/* ensure not toasted */
+		numkeys = ARR_DIMS(arr)[0];
+		if (ARR_NDIM(arr) != 1 ||
+			numkeys < 0 ||
+			ARR_HASNULL(arr) ||
+			ARR_ELEMTYPE(arr) != INT2OID)
+			elog(ERROR, "conkey is not a 1-D smallint array");
+		attnums = (int16 *) ARR_DATA_PTR(arr);
+
+		/* Construct the result value */
+		for (i = 0; i < numkeys; i++)
+		{
+			pkattnos = bms_add_member(pkattnos,
+							attnums[i] - FirstLowInvalidHeapAttributeNumber);
+		}
+		*constraintOid = HeapTupleGetOid(tuple);
+
+		/* No need to search further */
+		break;
+	}
+
+	systable_endscan(scan);
+
+	heap_close(pg_constraint, AccessShareLock);
+
+	return pkattnos;
+}
+
+/*
  * Determine whether a relation can be proven functionally dependent on
  * a set of grouping columns.  If so, return TRUE and add the pg_constraint
  * OIDs of the constraints needed for the proof to the *constraintDeps list.
@@ -936,95 +1112,37 @@ check_functional_grouping(Oid relid,
 						  List *grouping_columns,
 						  List **constraintDeps)
 {
-	bool		result = false;
-	Relation	pg_constraint;
-	HeapTuple	tuple;
-	SysScanDesc scan;
-	ScanKeyData skey[1];
+	Bitmapset  *pkattnos;
+	Bitmapset  *groupbyattnos;
+	Oid			constraintOid;
+	ListCell   *gl;
 
-	/* Scan pg_constraint for constraints of the target rel */
-	pg_constraint = heap_open(ConstraintRelationId, AccessShareLock);
+	/* If the rel has no PK, then we can't prove functional dependency */
+	pkattnos = get_primary_key_attnos(relid, false, &constraintOid);
+	if (pkattnos == NULL)
+		return false;
 
-	ScanKeyInit(&skey[0],
-				Anum_pg_constraint_conrelid,
-				BTEqualStrategyNumber, F_OIDEQ,
-				ObjectIdGetDatum(relid));
-
-	scan = systable_beginscan(pg_constraint, ConstraintRelidIndexId, true,
-							  NULL, 1, skey);
-
-	while (HeapTupleIsValid(tuple = systable_getnext(scan)))
+	/* Identify all the rel's columns that appear in grouping_columns */
+	groupbyattnos = NULL;
+	foreach(gl, grouping_columns)
 	{
-		Form_pg_constraint con = (Form_pg_constraint) GETSTRUCT(tuple);
-		Datum		adatum;
-		bool		isNull;
-		ArrayType  *arr;
-		int16	   *attnums;
-		int			numkeys;
-		int			i;
-		bool		found_col;
+		Var		   *gvar = (Var *) lfirst(gl);
 
-		/* Only PK constraints are of interest for now, see comment above */
-		if (con->contype != CONSTRAINT_PRIMARY)
-			continue;
-		/* Constraint must be non-deferrable */
-		if (con->condeferrable)
-			continue;
-
-		/* Extract the conkey array, ie, attnums of PK's columns */
-		adatum = heap_getattr(tuple, Anum_pg_constraint_conkey,
-							  RelationGetDescr(pg_constraint), &isNull);
-		if (isNull)
-			elog(ERROR, "null conkey for constraint %u",
-				 HeapTupleGetOid(tuple));
-		arr = DatumGetArrayTypeP(adatum);		/* ensure not toasted */
-		numkeys = ARR_DIMS(arr)[0];
-		if (ARR_NDIM(arr) != 1 ||
-			numkeys < 0 ||
-			ARR_HASNULL(arr) ||
-			ARR_ELEMTYPE(arr) != INT2OID)
-			elog(ERROR, "conkey is not a 1-D smallint array");
-		attnums = (int16 *) ARR_DATA_PTR(arr);
-
-		found_col = false;
-		for (i = 0; i < numkeys; i++)
-		{
-			AttrNumber	attnum = attnums[i];
-			ListCell   *gl;
-
-			found_col = false;
-			foreach(gl, grouping_columns)
-			{
-				Var		   *gvar = (Var *) lfirst(gl);
-
-				if (IsA(gvar, Var) &&
-					gvar->varno == varno &&
-					gvar->varlevelsup == varlevelsup &&
-					gvar->varattno == attnum)
-				{
-					found_col = true;
-					break;
-				}
-			}
-			if (!found_col)
-				break;
-		}
-
-		if (found_col)
-		{
-			/* The PK is a subset of grouping_columns, so we win */
-			*constraintDeps = lappend_oid(*constraintDeps,
-										  HeapTupleGetOid(tuple));
-			result = true;
-			break;
-		}
+		if (IsA(gvar, Var) &&
+			gvar->varno == varno &&
+			gvar->varlevelsup == varlevelsup)
+			groupbyattnos = bms_add_member(groupbyattnos,
+						gvar->varattno - FirstLowInvalidHeapAttributeNumber);
 	}
 
-	systable_endscan(scan);
+	if (bms_is_subset(pkattnos, groupbyattnos))
+	{
+		/* The PK is a subset of grouping_columns, so we win */
+		*constraintDeps = lappend_oid(*constraintDeps, constraintOid);
+		return true;
+	}
 
-	heap_close(pg_constraint, AccessShareLock);
-
-	return result;
+	return false;
 }
 
 

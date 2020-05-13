@@ -27,7 +27,6 @@
 #include "utils/tuplesort.h"
 #include "nodes/execnodes.h"
 #include "utils/workfile_mgr.h"
-#include "gpmon/gpmon.h"
 
 /*
  *-------------------------------------------------------------------------
@@ -43,10 +42,10 @@ struct StringInfoData;                  /* #include "lib/stringinfo.h" */
  */
 typedef struct TuplesortPos TuplesortPos;
 struct Tuplesortstate;
-
+struct ScanState;
 
 extern struct Tuplesortstate *tuplesort_begin_heap_file_readerwriter(
-		ScanState * ss,
+		struct ScanState * ss,
 		const char* rwfile_prefix, bool isWriter,
 		TupleDesc tupDesc, 
 		int nkeys, AttrNumber *attNums,
@@ -60,7 +59,7 @@ extern void cdb_tuplesort_init(struct Tuplesortstate *state, int unique,
 
 extern void tuplesort_begin_pos(struct Tuplesortstate *state, TuplesortPos **pos);
 extern bool tuplesort_gettupleslot_pos(struct Tuplesortstate *state, TuplesortPos *pos,
-                          bool forward, TupleTableSlot *slot, MemoryContext mcontext);
+                          bool forward, TupleTableSlot *slot, Datum *abbrev, MemoryContext mcontext);
 
 extern void tuplesort_flush(struct Tuplesortstate *state);
 extern void tuplesort_finalize_stats(struct Tuplesortstate *state);
@@ -90,15 +89,6 @@ extern void tuplesort_restorepos_pos(struct Tuplesortstate *state, TuplesortPos 
 extern void tuplesort_set_instrument(struct Tuplesortstate *state,
                          struct Instrumentation    *instrument,
                          struct StringInfoData     *explainbuf);
-
-/* Gpmon */
-extern void 
-tuplesort_set_gpmon(struct Tuplesortstate *state,
-					gpmon_packet_t *gpmon_pkt,
-					int *gpmon_tick);
-
-extern void 
-tuplesort_checksend_gpmonpkt(gpmon_packet_t *pkt, int *tick);
 
 #endif   /* TUPLESORT_GP_H */
 

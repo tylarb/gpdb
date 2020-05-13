@@ -3,7 +3,7 @@
  * copydir.c
  *	  copies a directory
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *	While "xcopy /e /i /q" works fine for copying directories, on Windows XP
@@ -38,8 +38,8 @@ copydir(char *fromdir, char *todir, bool recurse)
 {
 	DIR		   *xldir;
 	struct dirent *xlde;
-	char		fromfile[MAXPGPATH];
-	char		tofile[MAXPGPATH];
+	char		fromfile[MAXPGPATH * 2];
+	char		tofile[MAXPGPATH * 2];
 
 	if (mkdir(todir, S_IRWXU) != 0)
 		ereport(ERROR,
@@ -63,8 +63,8 @@ copydir(char *fromdir, char *todir, bool recurse)
 			strcmp(xlde->d_name, "..") == 0)
 			continue;
 
-		snprintf(fromfile, MAXPGPATH, "%s/%s", fromdir, xlde->d_name);
-		snprintf(tofile, MAXPGPATH, "%s/%s", todir, xlde->d_name);
+		snprintf(fromfile, sizeof(fromfile), "%s/%s", fromdir, xlde->d_name);
+		snprintf(tofile, sizeof(tofile), "%s/%s", todir, xlde->d_name);
 
 		if (lstat(fromfile, &fst) < 0)
 			ereport(ERROR,
@@ -103,7 +103,7 @@ copydir(char *fromdir, char *todir, bool recurse)
 			strcmp(xlde->d_name, "..") == 0)
 			continue;
 
-		snprintf(tofile, MAXPGPATH, "%s/%s", todir, xlde->d_name);
+		snprintf(tofile, sizeof(tofile), "%s/%s", todir, xlde->d_name);
 
 		/*
 		 * We don't need to sync subdirectories here since the recursive
@@ -190,9 +190,9 @@ copy_file(char *fromfile, char *tofile)
 		/*
 		 * We fsync the files later but first flush them to avoid spamming the
 		 * cache and hopefully get the kernel to start writing them out before
-		 * the fsync comes.  Ignore any error, since it's only a hint.
+		 * the fsync comes.
 		 */
-		(void) pg_flush_data(dstfd, offset, nbytes);
+		pg_flush_data(dstfd, offset, nbytes);
 	}
 
 	if (CloseTransientFile(dstfd))

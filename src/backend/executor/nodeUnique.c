@@ -11,7 +11,7 @@
  * (It's debatable whether the savings justifies carrying two plan node
  * types, though.)
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -181,8 +181,6 @@ ExecEndUnique(UniqueState *node)
 	MemoryContextDelete(node->tempContext);
 
 	ExecEndNode(outerPlanState(node));
-
-	EndPlanStateGpmonPkt(&node->ps);
 }
 
 

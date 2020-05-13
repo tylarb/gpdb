@@ -3,7 +3,7 @@
  * fmgr.c
  *	  The Postgres function manager.
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -541,11 +541,10 @@ record_C_func(HeapTuple procedureTuple,
 		MemSet(&hash_ctl, 0, sizeof(hash_ctl));
 		hash_ctl.keysize = sizeof(Oid);
 		hash_ctl.entrysize = sizeof(CFuncHashTabEntry);
-		hash_ctl.hash = oid_hash;
 		CFuncHash = hash_create("CFuncHash",
 								100,
 								&hash_ctl,
-								HASH_ELEM | HASH_FUNCTION);
+								HASH_ELEM | HASH_BLOBS);
 	}
 
 	entry = (CFuncHashTabEntry *)
@@ -1323,10 +1322,6 @@ FunctionCall1Coll(FmgrInfo *flinfo, Oid collation, Datum arg1)
 Datum
 FunctionCall2Coll(FmgrInfo *flinfo, Oid collation, Datum arg1, Datum arg2)
 {
-	/*
-	 * XXX if you change this routine, see also the inlined version in
-	 * utils/sort/tuplesort.c!
-	 */
 	FunctionCallInfoData fcinfo;
 	Datum		result;
 

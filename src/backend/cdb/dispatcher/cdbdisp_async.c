@@ -16,7 +16,6 @@
  */
 
 #include "postgres.h"
-#include <limits.h>
 
 #ifdef HAVE_POLL_H
 #include <poll.h>
@@ -580,6 +579,8 @@ dispatchCommand(CdbDispatchResult *dispatchResult,
 						dispatchResult->segdbDesc->whoami, msg ? msg : "unknown error")));
 	}
 
+	forwardQENotices();
+
 	if (DEBUG1 >= log_min_messages)
 	{
 		TimestampDifference(beforeSend, GetCurrentTimestamp(), &secs, &usecs);
@@ -640,6 +641,7 @@ handlePollError(CdbDispatchCmdAsync *pParms)
 			dispatchResult->stillRunning = false;
 		}
 	}
+	forwardQENotices();
 
 	return;
 }
@@ -853,6 +855,7 @@ processResults(CdbDispatchResult *dispatchResult)
 									   segdbDesc->whoami, msg ? msg : "unknown error");
 		return true;
 	}
+	forwardQENotices();
 
 	/*
 	 * If we have received one or more complete messages, process them.
@@ -863,6 +866,8 @@ processResults(CdbDispatchResult *dispatchResult)
 		PGresult   *pRes;
 		ExecStatusType resultStatus;
 		int			resultIndex;
+
+		forwardQENotices();
 
 		/*
 		 * PQisBusy() does some error handling, which can cause the connection
@@ -900,6 +905,9 @@ processResults(CdbDispatchResult *dispatchResult)
 			/* this is normal end of command */
 			return true;
 		}
+
+		if (segdbDesc->conn->wrote_xlog)
+			MarkTopTransactionWriteXLogOnExecutor();
 
 		/*
 		 * Attach the PGresult object to the CdbDispatchResult object.
@@ -980,6 +988,8 @@ processResults(CdbDispatchResult *dispatchResult)
 		}
 	}
 
+	forwardQENotices();
+
 	/*
 	 * If there was nextval request then respond back on this libpq connection
 	 * with the next value. Check and process nextval message only if QD has not
@@ -1023,6 +1033,8 @@ processResults(CdbDispatchResult *dispatchResult)
 	}
 	if (nextval)
 		PQfreemem(nextval);
+
+	forwardQENotices();
 
 	return false;				/* we must keep on monitoring this socket */
 }

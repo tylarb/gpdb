@@ -3,7 +3,7 @@
  * parse_func.c
  *		handle function calls in parser
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -107,6 +107,7 @@ ParseFuncOrColumn(ParseState *pstate, List *funcname, List *fargs,
 	Oid			vatype;
 	FuncDetailCode fdresult;
 	char		aggkind = 0;
+	ParseCallbackState pcbstate;
 
 	/*
 	 * If there's an aggregate filter, transform it using transformWhereClause
@@ -249,12 +250,18 @@ ParseFuncOrColumn(ParseState *pstate, List *funcname, List *fargs,
 	 * type.  We'll fix up the variadic case below.  We may also have to deal
 	 * with default arguments.
 	 */
+
+	setup_parser_errposition_callback(&pcbstate, pstate, location);
+
 	fdresult = func_get_detail(funcname, fargs, argnames, nargs,
 							   actual_arg_types,
 							   !func_variadic, true,
 							   &funcid, &rettype, &retset,
 							   &nvargs, &vatype,
 							   &declared_arg_types, &argdefaults);
+
+	cancel_parser_errposition_callback(&pcbstate);
+
 	if (fdresult == FUNCDETAIL_COERCION)
 	{
 		/*
@@ -588,7 +595,7 @@ ParseFuncOrColumn(ParseState *pstate, List *funcname, List *fargs,
 
 	/*
 	 * If it's a variadic function call, transform the last nvargs arguments
-	 * into an array -- unless it's an "any" variadic.
+	 * into an array --- unless it's an "any" variadic.
 	 */
 	if (nvargs > 0 && vatype != ANYOID)
 	{
@@ -662,6 +669,8 @@ ParseFuncOrColumn(ParseState *pstate, List *funcname, List *fargs,
 		aggref->aggfnoid = funcid;
 		aggref->aggtype = rettype;
 		/* aggcollid and inputcollid will be set by parse_collate.c */
+		aggref->aggtranstype = InvalidOid;		/* will be set by planner */
+		/* aggargtypes will be set by transformAggregateCall */
 		/* aggdirectargs and args will be set by transformAggregateCall */
 		/* aggorder and aggdistinct will be set by transformAggregateCall */
 		aggref->aggfilter = agg_filter;
@@ -669,6 +678,7 @@ ParseFuncOrColumn(ParseState *pstate, List *funcname, List *fargs,
 		aggref->aggvariadic = func_variadic;
 		aggref->aggkind = aggkind;
 		/* agglevelsup will be set by transformAggregateCall */
+		aggref->aggsplit = AGGSPLIT_SIMPLE;		/* planner might change this */
 		aggref->location = location;
 
 		/*
@@ -1330,6 +1340,9 @@ func_get_detail(List *funcname,
 	FuncCandidateList raw_candidates;
 	FuncCandidateList best_candidate;
 
+	/* Passing NULL for argtypes is no longer allowed */
+	Assert(argtypes);
+
 	/* initialize output arguments to silence compiler warnings */
 	*funcid = InvalidOid;
 	*rettype = InvalidOid;
@@ -1845,7 +1858,7 @@ ParseComplexProjection(ParseState *pstate, char *funcname, Node *first_arg,
 									 ((Var *) first_arg)->varno,
 									 ((Var *) first_arg)->varlevelsup);
 		/* Return a Var if funcname matches a column, else NULL */
-		return scanRTEForColumn(pstate, rte, funcname, location);
+		return scanRTEForColumn(pstate, rte, funcname, location, 0, NULL);
 	}
 
 	/*
@@ -1919,7 +1932,7 @@ funcname_signature_string(const char *funcname, int nargs,
 			appendStringInfoString(&argbuf, ", ");
 		if (i >= numposargs)
 		{
-			appendStringInfo(&argbuf, "%s := ", (char *) lfirst(lc));
+			appendStringInfo(&argbuf, "%s => ", (char *) lfirst(lc));
 			lc = lnext(lc);
 		}
 		appendStringInfoString(&argbuf, format_type_be(argtypes[i]));
@@ -1957,6 +1970,9 @@ Oid
 LookupFuncName(List *funcname, int nargs, const Oid *argtypes, bool noError)
 {
 	FuncCandidateList clist;
+
+	/* Passing NULL for argtypes is no longer allowed */
+	Assert(argtypes);
 
 	clist = FuncnameGetCandidates(funcname, nargs, NIL, false, false, noError);
 
@@ -2116,7 +2132,7 @@ checkTableFunctions_walker(Node *node, check_table_func_context *context)
 		return false;
 
 	/* 
-	 * TABLE() value expressions are currently only permited as parameters
+	 * TABLE() value expressions are currently only permitted as parameters
 	 * to table functions called in the FROM clause.
 	 */
 	if (IsA(node, TableValueExpr))

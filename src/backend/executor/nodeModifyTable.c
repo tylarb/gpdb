@@ -3,7 +3,7 @@
  * nodeModifyTable.c
  *	  routines to handle ModifyTable nodes.
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -38,6 +38,7 @@
 #include "postgres.h"
 
 #include "access/htup_details.h"
+#include "access/tupconvert.h"
 #include "access/xact.h"
 #include "commands/trigger.h"
 #include "executor/executor.h"
@@ -46,6 +47,7 @@
 #include "miscadmin.h"
 #include "nodes/nodeFuncs.h"
 #include "storage/bufmgr.h"
+#include "storage/lmgr.h"
 #include "utils/builtins.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
@@ -62,6 +64,31 @@
 #include "utils/lsyscache.h"
 #include "utils/snapmgr.h"
 
+
+static bool ExecOnConflictUpdate(ModifyTableState *mtstate,
+					 ResultRelInfo *resultRelInfo,
+					 ItemPointer conflictTid,
+					 TupleTableSlot *planSlot,
+					 TupleTableSlot *excludedSlot,
+					 EState *estate,
+					 bool canSetTag,
+					 TupleTableSlot **returning);
+
+static Oid
+table_insert(ResultRelInfo *resultRelInfo, EState *estate, TupleTableSlot *slot,
+			 Oid tuple_oid, ItemPointer lastTid, CommandId cid);
+static HTSU_Result
+table_update(ResultRelInfo *resultRelInfo, EState *estate, ItemPointer tupleid, TupleTableSlot *slot,
+			 CommandId cid,
+			 Snapshot crosscheck_snapshot,
+			 bool wait,
+			 HeapUpdateFailureData *hufd, LockTupleMode *lockmode, bool *wasHotUpdate);
+static HTSU_Result
+table_delete(ResultRelInfo *resultRelInfo, EState *estate, bool isUpdate, ItemPointer tupleid,
+			 CommandId cid,
+			 Snapshot crosscheck_snapshot,
+			 bool wait,
+			 HeapUpdateFailureData *hufd);
 
 /*
  * Verify that the tuples to be produced by INSERT or UPDATE match the
@@ -116,6 +143,10 @@ ExecCheckPlanOutput(Relation resultRel, List *targetList)
 			 * In any case the planner has most likely inserted an INT4 null.
 			 * What we insist on is just *some* NULL constant.
 			 */
+			/* GPDB_96_MERGE_FIXME: the subplan can be a Motion, so that the NULLs
+			 * are transferred through the Motion node.
+			 */
+#if 0
 			if (!IsA(tle->expr, Const) ||
 				!((Const *) tle->expr)->constisnull)
 				ereport(ERROR,
@@ -123,6 +154,7 @@ ExecCheckPlanOutput(Relation resultRel, List *targetList)
 						 errmsg("table row type and query-specified row type do not match"),
 						 errdetail("Query provides a value for a dropped column at ordinal position %d.",
 								   attno)));
+#endif
 		}
 	}
 	if (attno != resultDesc->natts)
@@ -138,6 +170,9 @@ ExecCheckPlanOutput(Relation resultRel, List *targetList)
  * projectReturning: RETURNING projection info for current result rel
  * tupleSlot: slot holding tuple actually inserted/updated/deleted
  * planSlot: slot holding tuple returned by top subplan node
+ *
+ * Note: If tupleSlot is NULL, the FDW should have already provided econtext's
+ * scan tuple.
  *
  * Returns a slot holding the result tuple
  */
@@ -155,11 +190,72 @@ ExecProcessReturning(ProjectionInfo *projectReturning,
 	ResetExprContext(econtext);
 
 	/* Make tuple and any needed join variables available to ExecProject */
-	econtext->ecxt_scantuple = tupleSlot;
+	if (tupleSlot)
+		econtext->ecxt_scantuple = tupleSlot;
+	else
+	{
+		HeapTuple	tuple;
+
+		/*
+		 * RETURNING expressions might reference the tableoid column, so
+		 * initialize t_tableOid before evaluating them.
+		 */
+		Assert(!TupIsNull(econtext->ecxt_scantuple));
+		tuple = ExecMaterializeSlot(econtext->ecxt_scantuple);
+#if 0
+		tuple->t_tableOid = RelationGetRelid(resultRelInfo->ri_RelationDesc);
+#endif
+	}
 	econtext->ecxt_outertuple = planSlot;
 
 	/* Compute the RETURNING expressions */
 	return ExecProject(projectReturning, NULL);
+}
+
+/*
+ * ExecCheckHeapTupleVisible -- verify heap tuple is visible
+ *
+ * It would not be consistent with guarantees of the higher isolation levels to
+ * proceed with avoiding insertion (taking speculative insertion's alternative
+ * path) on the basis of another tuple that is not visible to MVCC snapshot.
+ * Check for the need to raise a serialization failure, and do so as necessary.
+ */
+static void
+ExecCheckHeapTupleVisible(Relation rel,
+						  EState *estate,
+						  HeapTuple tuple,
+						  Buffer buffer)
+{
+	if (!IsolationUsesXactSnapshot())
+		return;
+
+	if (!HeapTupleSatisfiesVisibility(rel, tuple, estate->es_snapshot, buffer))
+		ereport(ERROR,
+				(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+			 errmsg("could not serialize access due to concurrent update")));
+}
+
+/*
+ * ExecCheckTIDVisible -- convenience variant of ExecCheckHeapTupleVisible()
+ */
+static void
+ExecCheckTIDVisible(EState *estate,
+					ResultRelInfo *relinfo,
+					ItemPointer tid)
+{
+	Relation	rel = relinfo->ri_RelationDesc;
+	Buffer		buffer;
+	HeapTupleData tuple;
+
+	/* Redundantly check isolation level */
+	if (!IsolationUsesXactSnapshot())
+		return;
+
+	tuple.t_self = *tid;
+	if (!heap_fetch(rel, SnapshotAny, &tuple, &buffer, false, NULL))
+		elog(ERROR, "failed to fetch conflicting tuple for ON CONFLICT");
+	ExecCheckHeapTupleVisible(rel, estate, &tuple, buffer);
+	ReleaseBuffer(buffer);
 }
 
 /* ----------------------------------------------------------------
@@ -179,12 +275,14 @@ ExecProcessReturning(ProjectionInfo *projectReturning,
  *
  * ----------------------------------------------------------------
  */
-TupleTableSlot *
-ExecInsert(TupleTableSlot *parentslot,
+static TupleTableSlot *
+ExecInsert(ModifyTableState *mtstate,
+		   TupleTableSlot *parentslot,
 		   TupleTableSlot *planSlot,
+		   List *arbiterIndexes,
+		   OnConflictAction onconflict,
 		   EState *estate,
 		   bool canSetTag,
-		   PlanGenerator planGen,
 		   bool isUpdate,
 		   Oid	tupleOid)
 {
@@ -193,10 +291,6 @@ ExecInsert(TupleTableSlot *parentslot,
 	Oid			newId;
 	List	   *recheckIndexes = NIL;
 
-	bool		rel_is_heap = false;
-	bool 		rel_is_aorows = false;
-	bool		rel_is_aocols = false;
-	bool		rel_is_external = false;
 	ItemPointerData lastTid;
 	Oid			tuple_oid = tupleOid;
 	ProjectionInfo *projectReturning;
@@ -213,7 +307,7 @@ ExecInsert(TupleTableSlot *parentslot,
 	 */
 	if (estate->es_result_partitions)
 	{
-		resultRelInfo = slot_get_partition(parentslot, estate);
+		resultRelInfo = slot_get_partition(parentslot, estate, true);
 
 		/*
 		 * Check whether the user provided the correct leaf part only if required.
@@ -253,8 +347,8 @@ ExecInsert(TupleTableSlot *parentslot,
 			{
 				ereport(ERROR,
 						(errcode(ERRCODE_CHECK_VIOLATION),
-						 errmsg("Trying to insert row into wrong partition"),
-						 errdetail("Expected partition: %s, provided partition: %s",
+						 errmsg("trying to insert row into wrong partition"),
+						 errdetail("Expected partition: %s, provided partition: %s.",
 							resultRelInfo->ri_RelationDesc->rd_rel->relname.data,
 							estate->es_result_relation_info->ri_RelationDesc->rd_rel->relname.data)));
 			}
@@ -267,42 +361,6 @@ ExecInsert(TupleTableSlot *parentslot,
 	}
 
 	resultRelationDesc = resultRelInfo->ri_RelationDesc;
-
-	rel_is_heap = RelationIsHeap(resultRelationDesc);
-	rel_is_aocols = RelationIsAoCols(resultRelationDesc);
-	rel_is_aorows = RelationIsAoRows(resultRelationDesc);
-	rel_is_external = RelationIsExternal(resultRelationDesc);
-
-	/*
-	 * Prepare the right kind of "insert desc".
-	 */
-	if (rel_is_aorows)
-	{
-		if (resultRelInfo->ri_aoInsertDesc == NULL)
-		{
-			/* Set the pre-assigned fileseg number to insert into */
-			ResultRelInfoSetSegno(resultRelInfo, estate->es_result_aosegnos);
-
-			resultRelInfo->ri_aoInsertDesc =
-				appendonly_insert_init(resultRelationDesc,
-									   resultRelInfo->ri_aosegno,
-									   false);
-		}
-	}
-	else if (rel_is_aocols)
-	{
-		if (resultRelInfo->ri_aocsInsertDesc == NULL)
-		{
-			ResultRelInfoSetSegno(resultRelInfo, estate->es_result_aosegnos);
-			resultRelInfo->ri_aocsInsertDesc = aocs_insert_init(resultRelationDesc,
-																resultRelInfo->ri_aosegno, false);
-		}
-	}
-	else if (rel_is_external)
-	{
-		if (resultRelInfo->ri_extInsertDesc == NULL)
-			resultRelInfo->ri_extInsertDesc = external_insert_init(resultRelationDesc);
-	}
 
 	/*
 	 * If the result relation has OIDs, force the tuple's OID to zero so that
@@ -322,7 +380,7 @@ ExecInsert(TupleTableSlot *parentslot,
 	 * what kind of a table this is (or neither for an AOCS table, since
 	 * aocs_insert() works directly off the slot). So we keep the Oid in a
 	 * local variable for now, and only set it in the tuple just before the
-	 * call to heap/appendonly/external_insert().
+	 * call to heap/appendonly_insert().
 	 */
 	if (resultRelationDesc->rd_rel->relhasoids)
 	{
@@ -333,33 +391,37 @@ ExecInsert(TupleTableSlot *parentslot,
 		{
 			GenericTuple gtuple;
 
-			gtuple = ExecFetchSlotGenericTuple(parentslot, false);
+			gtuple = ExecFetchSlotGenericTuple(parentslot);
 
 			if (!is_memtuple(gtuple))
 				tuple_oid = HeapTupleGetOid((HeapTuple) gtuple);
 			else
-			{
-				if (resultRelInfo->ri_aoInsertDesc)
-					tuple_oid = MemTupleGetOid((MemTuple) gtuple,
-											   resultRelInfo->ri_aoInsertDesc->mt_bind);
-			}
+				tuple_oid = MemTupleGetOidDirect((MemTuple) gtuple);
 		}
 	}
 
-	slot = reconstructMatchingTupleSlot(parentslot, resultRelInfo);
+	slot = reconstructPartitionTupleSlot(parentslot, resultRelInfo);
 
-	if (rel_is_external &&
+	if (resultRelationDesc->rd_rel->relkind == RELKIND_FOREIGN_TABLE &&
 		estate->es_result_partitions &&
 		estate->es_result_partitions->part->parrelid != 0)
 	{
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("Insert into external partitions not supported.")));
+				 errmsg("insert into foreign partitions not supported")));
 	}
 
 	Assert(slot != NULL);
 
-	/* BEFORE ROW INSERT Triggers */
+	/*
+	 * BEFORE ROW INSERT Triggers.
+	 *
+	 * Note: We fire BEFORE ROW TRIGGERS for every attempted insertion in an
+	 * INSERT ... ON CONFLICT statement.  We cannot check for constraint
+	 * violations before firing these triggers, because they can change the
+	 * values to insert.  Also, they can run arbitrary user-defined code with
+	 * side-effects that we can't cancel by just not inserting the tuple.
+	 */
 	if (resultRelInfo->ri_TrigDesc &&
 		resultRelInfo->ri_TrigDesc->trig_insert_before_row &&
 		!isUpdate)
@@ -405,6 +467,21 @@ ExecInsert(TupleTableSlot *parentslot,
 		if (slot == NULL)		/* "do nothing" */
 			return NULL;
 
+#if 0
+		/* FDW might have changed tuple */
+		/*
+		 * GPDB: Greenplum does not allow triggers/contraints to reference
+		 * system columns which makes the t_tableOid initialization reduntant.
+		 */
+		tuple = ExecMaterializeSlot(slot);
+
+		/*
+		 * AFTER ROW Triggers or RETURNING expressions might reference the
+		 * tableoid column, so initialize t_tableOid before evaluating them.
+		 */
+		tuple->t_tableOid = RelationGetRelid(resultRelationDesc);
+#endif
+
 		newId = InvalidOid;
 	}
 	else
@@ -414,8 +491,22 @@ ExecInsert(TupleTableSlot *parentslot,
 		 * t_tableOid before evaluating them.
 		 */
 #if 0
+		/*
+		 * GPDB: Greenplum does not allow triggers/contraints to reference
+		 * system columns which makes the t_tableOid initialization reduntant.
+		 */
 		tuple->t_tableOid = RelationGetRelid(resultRelationDesc);
 #endif
+
+		/*
+		 * Check any RLS INSERT WITH CHECK policies
+		 *
+		 * ExecWithCheckOptions() will skip any WCOs which are not of the kind
+		 * we are looking for at this point.
+		 */
+		if (resultRelInfo->ri_WithCheckOptions != NIL)
+			ExecWithCheckOptions(isUpdate ? WCO_RLS_UPDATE_CHECK : WCO_RLS_INSERT_CHECK,
+								 resultRelInfo, slot, estate);
 
 		/*
 		 * Check the constraints of the tuple
@@ -424,91 +515,136 @@ ExecInsert(TupleTableSlot *parentslot,
 			ExecConstraints(resultRelInfo, slot, estate);
 
 		/*
-		 * insert the tuple
-		 *
-		 * Note: heap_insert returns the tid (location) of the new tuple in the
-		 * t_self field.
-		 *
-		 * NOTE: for append-only relations we use the append-only access methods.
+		 * GPDB_95_MERGE_FIXME: enable speculative insertion in heaptable only.
 		 */
-		if (rel_is_aorows)
+		if (onconflict != ONCONFLICT_NONE && resultRelInfo->ri_NumIndices > 0 &&
+			RelationIsHeap(resultRelationDesc))
 		{
-			MemTuple	mtuple;
-
-			if (resultRelInfo->ri_aoInsertDesc == NULL)
-			{
-				/* Set the pre-assigned fileseg number to insert into */
-				ResultRelInfoSetSegno(resultRelInfo, estate->es_result_aosegnos);
-
-				resultRelInfo->ri_aoInsertDesc =
-					appendonly_insert_init(resultRelationDesc,
-										   resultRelInfo->ri_aosegno,
-										   false);
-			}
-
-			mtuple = ExecFetchSlotMemTuple(slot, false);
-			newId = appendonly_insert(resultRelInfo->ri_aoInsertDesc, mtuple, tuple_oid, (AOTupleId *) &lastTid);
-			(resultRelInfo->ri_aoprocessed)++;
-		}
-		else if (rel_is_aocols)
-		{
-			if (resultRelInfo->ri_aocsInsertDesc == NULL)
-			{
-				ResultRelInfoSetSegno(resultRelInfo, estate->es_result_aosegnos);
-				resultRelInfo->ri_aocsInsertDesc = aocs_insert_init(resultRelationDesc, 
-																	resultRelInfo->ri_aosegno, false);
-			}
-
-			newId = aocs_insert(resultRelInfo->ri_aocsInsertDesc, slot);
-			lastTid = *slot_get_ctid(slot);
-			(resultRelInfo->ri_aoprocessed)++;
-		}
-		else if (rel_is_external)
-		{
-			/* Writable external table */
+			/* Perform a speculative insertion. */
 			HeapTuple tuple;
-
-			if (resultRelInfo->ri_extInsertDesc == NULL)
-				resultRelInfo->ri_extInsertDesc = external_insert_init(resultRelationDesc);
+			uint32		specToken;
+			ItemPointerData conflictTid;
+			bool		specConflict;
 
 			/*
-			 * get the heap tuple out of the tuple table slot, making sure we have a
-			 * writable copy. (external_insert() can scribble on the tuple)
+			 * Do a non-conclusive check for conflicts first.
+			 *
+			 * We're not holding any locks yet, so this doesn't guarantee that
+			 * the later insert won't conflict.  But it avoids leaving behind
+			 * a lot of canceled speculative insertions, if you run a lot of
+			 * INSERT ON CONFLICT statements that do conflict.
+			 *
+			 * We loop back here if we find a conflict below, either during
+			 * the pre-check, or when we re-check after inserting the tuple
+			 * speculatively.
 			 */
+	vlock:
+			specConflict = false;
+			if (!ExecCheckIndexConstraints(slot, estate, &conflictTid,
+										   arbiterIndexes))
+			{
+				/* committed conflict tuple found */
+				if (onconflict == ONCONFLICT_UPDATE)
+				{
+					/*
+					 * In case of ON CONFLICT DO UPDATE, execute the UPDATE
+					 * part.  Be prepared to retry if the UPDATE fails because
+					 * of another concurrent UPDATE/DELETE to the conflict
+					 * tuple.
+					 */
+					TupleTableSlot *returning = NULL;
+
+					if (ExecOnConflictUpdate(mtstate, resultRelInfo,
+											 &conflictTid, planSlot, slot,
+											 estate, canSetTag, &returning))
+					{
+						InstrCountFiltered2(&mtstate->ps, 1);
+						return returning;
+					}
+					else
+						goto vlock;
+				}
+				else
+				{
+					/*
+					 * In case of ON CONFLICT DO NOTHING, do nothing. However,
+					 * verify that the tuple is visible to the executor's MVCC
+					 * snapshot at higher isolation levels.
+					 */
+					Assert(onconflict == ONCONFLICT_NOTHING);
+					ExecCheckTIDVisible(estate, resultRelInfo, &conflictTid);
+					InstrCountFiltered2(&mtstate->ps, 1);
+					return NULL;
+				}
+			}
+
 			tuple = ExecMaterializeSlot(slot);
 			if (resultRelationDesc->rd_rel->relhasoids)
 				HeapTupleSetOid(tuple, tuple_oid);
 
-			newId = external_insert(resultRelInfo->ri_extInsertDesc, tuple);
-			ItemPointerSetInvalid(&lastTid);
-		}
-		else
-		{
-			HeapTuple tuple;
-
-			Insist(rel_is_heap);
-
 			/*
-			 * get the heap tuple out of the tuple table slot, making sure we have a
-			 * writable copy. (heap_insert() will scribble on the tuple)
+			 * Before we start insertion proper, acquire our "speculative
+			 * insertion lock".  Others can use that to wait for us to decide
+			 * if we're going to go ahead with the insertion, instead of
+			 * waiting for the whole transaction to complete.
 			 */
-			tuple = ExecMaterializeSlot(slot);
-			if (resultRelationDesc->rd_rel->relhasoids)
-				HeapTupleSetOid(tuple, tuple_oid);
+			specToken = SpeculativeInsertionLockAcquire(GetCurrentTransactionId());
+			HeapTupleHeaderSetSpeculativeToken(tuple->t_data, specToken);
 
+			/* insert the tuple, with the speculative token */
 			newId = heap_insert(resultRelationDesc,
 								tuple,
 								estate->es_output_cid, 0, NULL,
 								GetCurrentTransactionId());
 			lastTid = tuple->t_self;
-		}
 
-		/*
-		 * insert index entries for tuple
-		 */
-		if (resultRelInfo->ri_NumIndices > 0)
+			/* insert index entries for tuple */
 			recheckIndexes = ExecInsertIndexTuples(slot, &lastTid,
-												   estate);
+												   estate, true, &specConflict,
+												   arbiterIndexes);
+
+			/* adjust the tuple's state accordingly */
+			if (!specConflict)
+				heap_finish_speculative(resultRelationDesc, tuple);
+			else
+				heap_abort_speculative(resultRelationDesc, tuple);
+
+			/*
+			 * Wake up anyone waiting for our decision.  They will re-check
+			 * the tuple, see that it's no longer speculative, and wait on our
+			 * XID as if this was a regularly inserted tuple all along.  Or if
+			 * we killed the tuple, they will see it's dead, and proceed as if
+			 * the tuple never existed.
+			 */
+			SpeculativeInsertionLockRelease(GetCurrentTransactionId());
+
+			/*
+			 * If there was a conflict, start from the beginning.  We'll do
+			 * the pre-check again, which will now find the conflicting tuple
+			 * (unless it aborts before we get there).
+			 */
+			if (specConflict)
+			{
+				list_free(recheckIndexes);
+				goto vlock;
+			}
+
+			/* Since there was no insertion conflict, we're done */
+		}
+		else
+		{
+			/*
+			 * insert the tuple normally.
+			 */
+			newId = table_insert(resultRelInfo, estate, slot, tuple_oid, &lastTid,
+								 estate->es_output_cid);
+
+			/* insert index entries for tuple */
+			if (resultRelInfo->ri_NumIndices > 0)
+				recheckIndexes = ExecInsertIndexTuples(slot, &lastTid,
+													   estate, false, NULL,
+													   arbiterIndexes);
+		}
 	}
 	if (canSetTag)
 	{
@@ -530,14 +666,24 @@ ExecInsert(TupleTableSlot *parentslot,
 
 	list_free(recheckIndexes);
 
-	/* Check any WITH CHECK OPTION constraints */
+	/*
+	 * Check any WITH CHECK OPTION constraints from parent views.  We are
+	 * required to do this after testing all constraints and uniqueness
+	 * violations per the SQL spec, so we do it after actually inserting the
+	 * record into the heap and all indexes.
+	 *
+	 * ExecWithCheckOptions will elog(ERROR) if a violation is found, so the
+	 * tuple will never be seen, if it violates the WITH CHECK OPTION.
+	 *
+	 * ExecWithCheckOptions() will skip any WCOs which are not of the kind we
+	 * are looking for at this point.
+	 */
 	if (resultRelInfo->ri_WithCheckOptions != NIL)
-		ExecWithCheckOptions(resultRelInfo, slot, estate);
+		ExecWithCheckOptions(WCO_VIEW_CHECK, resultRelInfo, slot, estate);
 
 	/* Process RETURNING if present */
 	if (projectReturning)
-		return ExecProcessReturning(projectReturning,
-									parentslot, planSlot);
+		return ExecProcessReturning(projectReturning, parentslot, planSlot);
 
 	return NULL;
 }
@@ -563,21 +709,32 @@ ExecInsert(TupleTableSlot *parentslot,
  *		Returns RETURNING result if any, otherwise NULL.
  * ----------------------------------------------------------------
  */
-TupleTableSlot *
+static TupleTableSlot *
 ExecDelete(ItemPointer tupleid,
+		   int32 segid,
 		   HeapTuple oldtuple,
 		   TupleTableSlot *planSlot,
 		   EPQState *epqstate,
 		   EState *estate,
 		   bool canSetTag,
-		   PlanGenerator planGen,
 		   bool isUpdate)
 {
+	PlanGenerator planGen = estate->es_plannedstmt->planGen;
 	ResultRelInfo *resultRelInfo;
 	Relation	resultRelationDesc;
 	HTSU_Result result;
 	HeapUpdateFailureData hufd;
 	TupleTableSlot *slot = NULL;
+
+	/*
+	 * Sanity check the distribution of the tuple to prevent
+	 * potential data corruption in case users manipulate data
+	 * incorrectly (e.g. insert data on incorrect segment through
+	 * utility mode) or there is bug in code, etc.
+	 */
+	if (segid != GpIdentity.segindex)
+		elog(ERROR, "distribution key of the tuple doesn't belong to "
+			 "current segment (actually from seg%d)", segid);
 
 	/*
 	 * get information on the (current) result relation
@@ -591,7 +748,7 @@ ExecDelete(ItemPointer tupleid,
 #endif
 
 		/* Obtain part for current tuple. */
-		resultRelInfo = slot_get_partition(planSlot, estate);
+		resultRelInfo = slot_get_partition(planSlot, estate, true);
 		estate->es_result_relation_info = resultRelInfo;
 
 #ifdef USE_ASSERT_CHECKING
@@ -606,34 +763,27 @@ ExecDelete(ItemPointer tupleid,
 	}
 	resultRelationDesc = resultRelInfo->ri_RelationDesc;
 
-	if (planGen == PLANGEN_PLANNER)
+	/* BEFORE ROW DELETE Triggers */
+	if (resultRelInfo->ri_TrigDesc &&
+		resultRelInfo->ri_TrigDesc->trig_delete_before_row &&
+		!isUpdate)
 	{
-		/* BEFORE ROW DELETE Triggers */
-		if (resultRelInfo->ri_TrigDesc &&
-			resultRelInfo->ri_TrigDesc->trig_delete_before_row &&
-			!isUpdate)
-		{
-			bool		dodelete;
+		bool		dodelete;
 
-			dodelete = ExecBRDeleteTriggers(estate, epqstate, resultRelInfo,
-											tupleid, oldtuple);
+		dodelete = ExecBRDeleteTriggers(estate, epqstate, resultRelInfo,
+										tupleid, oldtuple);
 
-			if (!dodelete)			/* "do nothing" */
-				return NULL;
-		}
+		if (!dodelete)			/* "do nothing" */
+			return NULL;
 	}
 
-	bool isHeapTable = RelationIsHeap(resultRelationDesc);
-	bool isAORowsTable = RelationIsAoRows(resultRelationDesc);
-	bool isAOColsTable = RelationIsAoCols(resultRelationDesc);
-	bool isExternalTable = RelationIsExternal(resultRelationDesc);
-
-	if (isExternalTable && estate->es_result_partitions &&
+	if (resultRelationDesc->rd_rel->relkind == RELKIND_FOREIGN_TABLE &&
+		estate->es_result_partitions &&
 		estate->es_result_partitions->part->parrelid != 0)
 	{
 		ereport(ERROR,
-			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-			errmsg("Delete from external partitions not supported.")));
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("delete from foreign partitions not supported")));
 	}
 
 	/* INSTEAD OF ROW DELETE Triggers */
@@ -651,6 +801,11 @@ ExecDelete(ItemPointer tupleid,
 	}
 	else if (resultRelInfo->ri_FdwRoutine)
 	{
+#if 0
+		/* See comment regarding t_tableOid bellow */
+		HeapTuple	tuple;
+#endif
+
 		/*
 		 * delete from foreign table: let the FDW do it
 		 *
@@ -669,6 +824,22 @@ ExecDelete(ItemPointer tupleid,
 
 		if (slot == NULL)		/* "do nothing" */
 			return NULL;
+
+		/*
+		 * RETURNING expressions might reference the tableoid column, so
+		 * initialize t_tableOid before evaluating them.
+		 */
+		if (slot->PRIVATE_tts_flags & TTS_ISEMPTY)
+			ExecStoreAllNullTuple(slot);
+
+#if 0
+		/*
+		 * GPDB: Greenplum does not allow triggers/contraints to reference
+		 * system columns which makes the t_tableOid initialization reduntant.
+		 */
+		tuple = ExecMaterializeSlot(slot);
+		tuple->t_tableOid = RelationGetRelid(resultRelationDesc);
+#endif
 	}
 	else
 	{
@@ -682,64 +853,11 @@ ExecDelete(ItemPointer tupleid,
 		 * mode transactions.
 		 */
 ldelete:;
-		if (isHeapTable)
-		{
-			result = heap_delete(resultRelationDesc, tupleid,
-								 estate->es_output_cid,
-								 estate->es_crosscheck_snapshot,
-								 true /* wait for commit */ ,
-								 &hufd);
-		}
-		else if (isAORowsTable)
-		{
-			if (IsolationUsesXactSnapshot())
-			{
-				if (!isUpdate)
-					ereport(ERROR,
-							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-							 errmsg("Deletes on append-only tables are not supported in serializable transactions.")));
-				else
-					ereport(ERROR,
-							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-							 errmsg("Updates on append-only tables are not supported in serializable transactions.")));
-			}
-
-			if (resultRelInfo->ri_deleteDesc == NULL)
-			{
-				resultRelInfo->ri_deleteDesc = 
-					appendonly_delete_init(resultRelationDesc, GetActiveSnapshot());
-			}
-
-			AOTupleId *aoTupleId = (AOTupleId *) tupleid;
-			result = appendonly_delete(resultRelInfo->ri_deleteDesc, aoTupleId);
-		} 
-		else if (isAOColsTable)
-		{
-			if (IsolationUsesXactSnapshot())
-			{
-				if (!isUpdate)
-					ereport(ERROR,
-							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-							 errmsg("Deletes on append-only tables are not supported in serializable transactions.")));
-				else
-					ereport(ERROR,
-							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-							 errmsg("Updates on append-only tables are not supported in serializable transactions.")));
-			}
-
-			if (resultRelInfo->ri_deleteDesc == NULL)
-			{
-				resultRelInfo->ri_deleteDesc = 
-					aocs_delete_init(resultRelationDesc);
-			}
-
-			AOTupleId *aoTupleId = (AOTupleId *) tupleid;
-			result = aocs_delete(resultRelInfo->ri_deleteDesc, aoTupleId);
-		}
-		else
-		{
-			Insist(0);
-		}
+		result = table_delete(resultRelInfo, estate, isUpdate, tupleid,
+							  estate->es_output_cid,
+							  estate->es_crosscheck_snapshot,
+							  true /* wait for commit */ ,
+							  &hufd);
 		switch (result)
 		{
 			case HeapTupleSelfUpdated:
@@ -774,7 +892,7 @@ ldelete:;
 				 * AO case, as visimap update within same command happens at end
 				 * of command.
 				 */
-				if (!isAORowsTable && !isAOColsTable && hufd.cmax != estate->es_output_cid)
+				if (!RelationIsAppendOptimized(resultRelationDesc) && hufd.cmax != estate->es_output_cid)
 					ereport(ERROR,
 							(errcode(ERRCODE_TRIGGERED_DATA_CHANGE_VIOLATION),
 							 errmsg("tuple to be updated was already modified by an operation triggered by the current command"),
@@ -819,6 +937,26 @@ ldelete:;
 					ereport(ERROR,
 							(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
 							 errmsg("could not serialize access due to concurrent update")));
+
+				/*
+				 * If GDD is enabled and the DELETE operator is generated by
+				 * SplitUpdate node (SplitUpdate node is generated for updating
+				 * the distributed keys), we raise an error.
+				 *
+				 * The root cause is SplitUpdate will split the origin tuple
+				 * to two tuples, one is for deleting and the other one
+				 * is for inserting. we can skip the deleting tuple if we
+				 * found the tuple is updated concurrently by another
+				 * transaction, but it is difficult to skip the inserting
+				 * tuple, so it will leads to more tuples after updating.
+				 */
+				if (gp_enable_global_deadlock_detector && isUpdate)
+				{
+					ereport(ERROR,
+							(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE ),
+							 errmsg("concurrent updates distribution keys on the same row is not allowed")));
+				}
+
 				if (!ItemPointerEquals(tupleid, &hufd.ctid))
 				{
 					TupleTableSlot *epqslot;
@@ -857,14 +995,6 @@ ldelete:;
 	if (canSetTag)
 		(estate->es_processed)++;
 
-	if (!isUpdate)
-	{
-		/*
-		 * To notify master if tuples deleted or not, to update mod_count.
-		 */
-		(resultRelInfo->ri_aoprocessed)++;
-	}
-
 	/*
 	 * Note: Normally one would think that we have to delete index tuples
 	 * associated with the heap tuple now...
@@ -874,7 +1004,7 @@ ldelete:;
 	 * anyway, since the tuple is still visible to other transactions.
 	 */
 
-	if (!(isAORowsTable || isAOColsTable) && planGen == PLANGEN_PLANNER && !isUpdate)
+	if (!RelationIsAppendOptimized(resultRelationDesc) && !isUpdate)
 	{
 		/* AFTER ROW DELETE Triggers */
 		ExecARDeleteTriggers(estate, resultRelInfo, tupleid, oldtuple);
@@ -935,8 +1065,7 @@ ldelete:;
 			ExecStoreHeapTuple(&deltuple, slot, InvalidBuffer, false);
 		}
 
-		rslot = ExecProcessReturning(resultRelInfo->ri_projectReturning,
-									 slot, planSlot);
+		rslot = ExecProcessReturning(resultRelInfo->ri_projectReturning, slot, planSlot);
 
 		/*
 		 * Before releasing the target tuple again, make sure rslot has a
@@ -967,10 +1096,10 @@ checkPartitionUpdate(EState *estate, TupleTableSlot *partslot,
 {
 	Relation	resultRelationDesc = resultRelInfo->ri_RelationDesc;
 	AttrNumber	max_attr;
-	Datum	   *values = NULL;
-	bool	   *nulls = NULL;
-	TupleDesc	tupdesc = NULL;
-	Oid			parentRelid;
+	TupleTableSlot *parentslot = NULL;
+	Datum	   *values;
+	bool	   *nulls;
+	TupleDesc	tupdesc;
 	Oid			targetid;
 
 	Assert(estate->es_partition_state != NULL &&
@@ -988,56 +1117,41 @@ checkPartitionUpdate(EState *estate, TupleTableSlot *partslot,
 	 * has physically-different attribute numbers due to dropped columns,
 	 * we should map the child attribute numbers to the parent's attribute
 	 * numbers to perform the partition selection.
-	 * EState doesn't have the parent relation information at the moment,
-	 * so we have to do a hard job here by opening it and compare the
+	 *
+	 * To determine whether we need to remap, or if the child partition
+	 * has compatible physical shape with the parent, we compare the
 	 * tuple descriptors.  If we find we need to map attribute numbers,
 	 * max_partition_attr could also be bogus for this child part,
 	 * so we end up materializing the whole columns using slot_getallattrs().
 	 * The purpose of this code is just to prevent the tuple from
 	 * incorrectly staying in default partition that has no constraint
 	 * (parts with constraint will throw an error if the tuple is changing
-	 * partition keys to out of part value anyway.)  It's a bit overkill
-	 * to do this complicated logic just for this purpose, which is necessary
-	 * with our current partitioning design, but I hope some day we can
-	 * change this so that we disallow phyisically-different tuple descriptor
-	 * across partition.
+	 * partition keys to out of part value anyway.)
 	 */
-	parentRelid = estate->es_result_partitions->part->parrelid;
 
 	/*
-	 * I don't believe this is the case currently, but we check the parent relid
-	 * in case the updating partition has changed since the last time we opened it.
+	 * Check this at the first pass only to avoid repeated tupledesc
+	 * comparisons.
 	 */
-	if (resultRelInfo->ri_PartitionParent &&
-		parentRelid != RelationGetRelid(resultRelInfo->ri_PartitionParent))
+	if (resultRelInfo->ri_PartCheckTupDescMatch == 0)
 	{
-		resultRelInfo->ri_PartCheckTupDescMatch = 0;
-		if (resultRelInfo->ri_PartCheckMap != NULL)
-			pfree(resultRelInfo->ri_PartCheckMap);
-		if (resultRelInfo->ri_PartitionParent)
-			relation_close(resultRelInfo->ri_PartitionParent, AccessShareLock);
-	}
-
-	/*
-	 * Check this at the first pass only to avoid repeated catalog access.
-	 */
-	if (resultRelInfo->ri_PartCheckTupDescMatch == 0 &&
-		parentRelid != RelationGetRelid(resultRelInfo->ri_RelationDesc))
-	{
-		Relation	parentRel;
 		TupleDesc	resultTupdesc, parentTupdesc;
+		Oid			parentRelid;
+		Relation	parentRel;
 
 		/*
 		 * We are on a child part, let's see the tuple descriptor looks like
 		 * the parent's one.  Probably this won't cause deadlock because
 		 * DML should have opened the parent table with appropriate lock.
 		 */
+
+		parentRelid = estate->es_result_partitions->part->parrelid;
 		parentRel = relation_open(parentRelid, AccessShareLock);
 		resultTupdesc = RelationGetDescr(resultRelationDesc);
 		parentTupdesc = RelationGetDescr(parentRel);
 		if (!equalTupleDescs(resultTupdesc, parentTupdesc, false))
 		{
-			AttrMap		   *map;
+			TupleConversionMap *map;
 			MemoryContext	oldcontext;
 
 			/* Tuple looks different.  Construct attribute mapping. */
@@ -1047,47 +1161,29 @@ checkPartitionUpdate(EState *estate, TupleTableSlot *partslot,
 
 			/* And save it for later use. */
 			resultRelInfo->ri_PartCheckMap = map;
-
+			resultRelInfo->ri_PartitionParentSlot = MakeSingleTupleTableSlot(parentTupdesc);
 			resultRelInfo->ri_PartCheckTupDescMatch = -1;
 		}
 		else
 			resultRelInfo->ri_PartCheckTupDescMatch = 1;
 
-		resultRelInfo->ri_PartitionParent = parentRel;
-		/* parentRel will be closed as part of ResultRelInfo cleanup */
+		relation_close(parentRel, NoLock);
 	}
 
 	if (resultRelInfo->ri_PartCheckMap != NULL)
 	{
-		Datum	   *parent_values;
-		bool	   *parent_nulls;
-		Relation	parentRel = resultRelInfo->ri_PartitionParent;
-		TupleDesc	parentTupdesc;
-		AttrMap	   *map;
-
-		Assert(parentRel != NULL);
-		parentTupdesc = RelationGetDescr(parentRel);
-
 		/*
 		 * We need to map the attribute numbers to parent's one, to
 		 * select the would-be destination relation, since all partition
 		 * rules are based on the parent relation's tuple descriptor.
 		 * max_partition_attr can be bogus as well, so don't use it.
 		 */
-		slot_getallattrs(partslot);
-		values = slot_get_values(partslot);
-		nulls = slot_get_isnull(partslot);
-		parent_values = palloc(parentTupdesc->natts * sizeof(Datum));
-		parent_nulls = palloc0(parentTupdesc->natts * sizeof(bool));
-
-		map = resultRelInfo->ri_PartCheckMap;
-		reconstructTupleValues(map, values, nulls, partslot->tts_tupleDescriptor->natts,
-							   parent_values, parent_nulls, parentTupdesc->natts);
+		parentslot = execute_attr_map_slot(resultRelInfo->ri_PartCheckMap->attrMap,
+										   partslot,
+										   resultRelInfo->ri_PartitionParentSlot);
 
 		/* Now we have values/nulls in parent's view. */
-		values = parent_values;
-		nulls = parent_nulls;
-		tupdesc = RelationGetDescr(parentRel);
+		slot_getallattrs(parentslot);
 	}
 	else
 	{
@@ -1095,27 +1191,18 @@ checkPartitionUpdate(EState *estate, TupleTableSlot *partslot,
 		 * map == NULL means we can just fetch values/nulls from the
 		 * current slot.
 		 */
-		Assert(nulls == NULL && tupdesc == NULL);
+		parentslot = partslot;
 		max_attr = estate->es_partition_state->max_partition_attr;
 		slot_getsomeattrs(partslot, max_attr);
-		/* values/nulls pointing to partslot's array. */
-		values = slot_get_values(partslot);
-		nulls = slot_get_isnull(partslot);
-		tupdesc = partslot->tts_tupleDescriptor;
 	}
 
 	/* And select the destination relation that this tuple would go to. */
+	values = slot_get_values(parentslot);
+	nulls = slot_get_isnull(parentslot);
+	tupdesc = parentslot->tts_tupleDescriptor;
 	targetid = selectPartition(estate->es_result_partitions, values,
 							   nulls, tupdesc,
 							   estate->es_partition_state->accessMethods);
-
-	/* Free up if we allocated mapped attributes. */
-	if (values != slot_get_values(partslot))
-	{
-		Assert(nulls != slot_get_isnull(partslot));
-		pfree(values);
-		pfree(nulls);
-	}
 
 	if (!OidIsValid(targetid))
 		ereport(ERROR,
@@ -1125,8 +1212,7 @@ checkPartitionUpdate(EState *estate, TupleTableSlot *partslot,
 	if (RelationGetRelid(resultRelationDesc) != targetid)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("moving tuple from partition \"%s\" to "
-						"partition \"%s\" not supported",
+				 errmsg("moving tuple from partition \"%s\" to partition \"%s\" not supported",
 						get_rel_name(RelationGetRelid(resultRelationDesc)),
 						get_rel_name(targetid))));
 }
@@ -1153,11 +1239,12 @@ checkPartitionUpdate(EState *estate, TupleTableSlot *partslot,
  *		Returns RETURNING result if any, otherwise NULL.
  * ----------------------------------------------------------------
  */
-TupleTableSlot *
+static TupleTableSlot *
 ExecUpdate(ItemPointer tupleid,
 		   HeapTuple oldtuple,
 		   TupleTableSlot *slot,
 		   TupleTableSlot *planSlot,
+		   int32 segid, /* gpdb specific parameter, check if tuple to update is from local */
 		   EPQState *epqstate,
 		   EState *estate,
 		   bool canSetTag)
@@ -1177,23 +1264,28 @@ ExecUpdate(ItemPointer tupleid,
 		elog(ERROR, "cannot UPDATE during bootstrap");
 
 	/*
+	 * Sanity check the distribution of the tuple to prevent
+	 * potential data corruption in case users manipulate data
+	 * incorrectly (e.g. insert data on incorrect segment through
+	 * utility mode) or there is bug in code, etc.
+	 */
+	if (segid != GpIdentity.segindex)
+		elog(ERROR, "distribution key of the tuple doesn't belong to "
+			 "current segment (actually from seg%d)", segid);
+
+	/*
 	 * get information on the (current) result relation
 	 */
 	resultRelInfo = estate->es_result_relation_info;
 	resultRelationDesc = resultRelInfo->ri_RelationDesc;
 
-	bool		rel_is_heap = RelationIsHeap(resultRelationDesc);
-	bool 		rel_is_aorows = RelationIsAoRows(resultRelationDesc);
-	bool		rel_is_aocols = RelationIsAoCols(resultRelationDesc);
-	bool		rel_is_external = RelationIsExternal(resultRelationDesc);
-
-	if (rel_is_external &&
+	if (resultRelationDesc->rd_rel->relkind == RELKIND_FOREIGN_TABLE &&
 		estate->es_result_partitions &&
 		estate->es_result_partitions->part->parrelid != 0)
 	{
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("Update external partitions not supported.")));
+				 errmsg("updating foreign partitions not supported")));
 	}
 
 	/*
@@ -1201,7 +1293,7 @@ ExecUpdate(ItemPointer tupleid,
 	 * writable copy
 	 */
 
-	if (rel_is_aorows || rel_is_aocols)
+	if (RelationIsAppendOptimized(resultRelationDesc))
 	{
 		/*
 		 * It is necessary to reconstruct a logically compatible tuple to
@@ -1210,7 +1302,7 @@ ExecUpdate(ItemPointer tupleid,
 		 * columns, and MemTuple cannot deal with cases without converting
 		 * the target list back into the original relation's tuple desc.
 		 */
-		slot = reconstructMatchingTupleSlot(slot, resultRelInfo);
+		slot = reconstructPartitionTupleSlot(slot, resultRelInfo);
 	}
 
 	/* see if this update would move the tuple to a different partition */
@@ -1253,7 +1345,20 @@ ExecUpdate(ItemPointer tupleid,
 		if (slot == NULL)		/* "do nothing" */
 			return NULL;
 
+#if 0
 		/* FDW might have changed tuple */
+		/*
+		 * GPDB: Greenplum does not allow triggers/contraints to reference
+		 * system columns which makes the t_tableOid initialization reduntant.
+		 */
+		tuple = ExecMaterializeSlot(slot);
+
+		/*
+		 * AFTER ROW Triggers or RETURNING expressions might reference the
+		 * tableoid column, so initialize t_tableOid before evaluating them.
+		 */
+		tuple->t_tableOid = RelationGetRelid(resultRelationDesc);
+#endif
 	}
 	else
 	{
@@ -1264,19 +1369,33 @@ ExecUpdate(ItemPointer tupleid,
 		 * t_tableOid before evaluating them.
 		 */
 #if 0
+		/*
+		 * GPDB: Greenplum does not allow triggers/contraints to reference
+		 * system columns which makes the t_tableOid initialization reduntant.
+		 */
 		tuple->t_tableOid = RelationGetRelid(resultRelationDesc);
 #endif
 
 		/*
-		 * Check the constraints of the tuple
+		 * Check any RLS UPDATE WITH CHECK policies
 		 *
 		 * If we generate a new candidate tuple after EvalPlanQual testing, we
-		 * must loop back here and recheck constraints.  (We don't need to
-		 * redo triggers, however.  If there are any BEFORE triggers then
-		 * trigger.c will have done heap_lock_tuple to lock the correct tuple,
-		 * so there's no need to do them again.)
+		 * must loop back here and recheck any RLS policies and constraints.
+		 * (We don't need to redo triggers, however.  If there are any BEFORE
+		 * triggers then trigger.c will have done heap_lock_tuple to lock the
+		 * correct tuple, so there's no need to do them again.)
+		 *
+		 * ExecWithCheckOptions() will skip any WCOs which are not of the kind
+		 * we are looking for at this point.
 		 */
-lreplace:;
+		lreplace:;
+		if (resultRelInfo->ri_WithCheckOptions != NIL)
+			ExecWithCheckOptions(WCO_RLS_UPDATE_CHECK,
+								 resultRelInfo, slot, estate);
+
+		/*
+		 * Check the constraints of the tuple
+		 */
 		if (resultRelationDesc->rd_att->constr)
 			ExecConstraints(resultRelInfo, slot, estate);
 
@@ -1289,70 +1408,12 @@ lreplace:;
 		 * needed for referential integrity updates in transaction-snapshot
 		 * mode transactions.
 		 */
-		if (rel_is_heap)
-		{
-			HeapTuple tuple;
-
-			tuple = ExecMaterializeSlot(slot);
-
-			result = heap_update(resultRelationDesc, tupleid, tuple,
-							 estate->es_output_cid,
-							 estate->es_crosscheck_snapshot,
-							 true /* wait for commit */ ,
-							 &hufd, &lockmode);
-
-			lastTid = tuple->t_self;
-			wasHotUpdate = HeapTupleIsHeapOnly(tuple) != 0;
-		}
-		else if (rel_is_aorows)
-		{
-			MemTuple mtuple;
-
-			if (IsolationUsesXactSnapshot())
-			{
-				ereport(ERROR,
-						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						 errmsg("Updates on append-only tables are not supported in serializable transactions.")));
-			}
-
-			if (resultRelInfo->ri_updateDesc == NULL)
-			{
-				ResultRelInfoSetSegno(resultRelInfo, estate->es_result_aosegnos);
-				resultRelInfo->ri_updateDesc = (AppendOnlyUpdateDesc)
-					appendonly_update_init(resultRelationDesc, GetActiveSnapshot(), resultRelInfo->ri_aosegno);
-			}
-
-			mtuple = ExecFetchSlotMemTuple(slot, false);
-
-			result = appendonly_update(resultRelInfo->ri_updateDesc,
-									   mtuple, (AOTupleId *) tupleid, (AOTupleId *) &lastTid);
-			(resultRelInfo->ri_aoprocessed)++;
-			wasHotUpdate = false;
-		}
-		else if (rel_is_aocols)
-		{
-			if (IsolationUsesXactSnapshot())
-			{
-				ereport(ERROR,
-						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						 errmsg("Updates on append-only tables are not supported in serializable transactions.")));
-			}
-
-			if (resultRelInfo->ri_updateDesc == NULL)
-			{
-				ResultRelInfoSetSegno(resultRelInfo, estate->es_result_aosegnos);
-				resultRelInfo->ri_updateDesc = (AppendOnlyUpdateDesc)
-					aocs_update_init(resultRelationDesc, resultRelInfo->ri_aosegno);
-			}
-			result = aocs_update(resultRelInfo->ri_updateDesc,
-								 slot, (AOTupleId *) tupleid, (AOTupleId *) &lastTid);
-			(resultRelInfo->ri_aoprocessed)++;
-			wasHotUpdate = false;
-		}
-		else
-		{
-			elog(ERROR, "invalid relation type");
-		}
+		lastTid = *tupleid;
+		result = table_update(resultRelInfo, estate, &lastTid, slot,
+							  estate->es_output_cid,
+							  estate->es_crosscheck_snapshot,
+							  true /* wait for commit */ ,
+							  &hufd, &lockmode, &wasHotUpdate);
 
 		switch (result)
 		{
@@ -1387,11 +1448,11 @@ lreplace:;
 				 * AO case, as visimap update within same command happens at end
 				 * of command.
 				 */
-				if (!rel_is_aorows && !rel_is_aocols && hufd.cmax != estate->es_output_cid)
+				if (!RelationIsAppendOptimized(resultRelationDesc) && hufd.cmax != estate->es_output_cid)
 					ereport(ERROR,
 							(errcode(ERRCODE_TRIGGERED_DATA_CHANGE_VIOLATION),
-							 errmsg("tuple to be updated was already modified by an operation triggered by the current command"),
-							 errhint("Consider using an AFTER trigger instead of a BEFORE trigger to propagate changes to other rows.")));
+									errmsg("tuple to be updated was already modified by an operation triggered by the current command"),
+									errhint("Consider using an AFTER trigger instead of a BEFORE trigger to propagate changes to other rows.")));
 
 				/* Else, already updated by self; nothing to do */
 				return NULL;
@@ -1403,7 +1464,7 @@ lreplace:;
 				if (IsolationUsesXactSnapshot())
 					ereport(ERROR,
 							(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
-							 errmsg("could not serialize access due to concurrent update")));
+									errmsg("could not serialize access due to concurrent update")));
 				if (!ItemPointerEquals(tupleid, &hufd.ctid))
 				{
 					TupleTableSlot *epqslot;
@@ -1448,16 +1509,15 @@ lreplace:;
 		 */
 		if (resultRelInfo->ri_NumIndices > 0 && !wasHotUpdate)
 			recheckIndexes = ExecInsertIndexTuples(slot, &lastTid,
-												   estate);
+												   estate, false, NULL, NIL);
 	}
-
 	if (canSetTag)
 		(estate->es_processed)++;
 
 	/* AFTER ROW UPDATE Triggers */
 	if (resultRelInfo->ri_TrigDesc &&
 		resultRelInfo->ri_TrigDesc->trig_update_after_row &&
-		rel_is_heap)
+		RelationIsHeap(resultRelationDesc))
 	{
 		HeapTuple tuple = ExecMaterializeSlot(slot);
 
@@ -1467,16 +1527,219 @@ lreplace:;
 
 	list_free(recheckIndexes);
 
-	/* Check any WITH CHECK OPTION constraints */
+	/*
+	 * Check any WITH CHECK OPTION constraints from parent views.  We are
+	 * required to do this after testing all constraints and uniqueness
+	 * violations per the SQL spec, so we do it after actually updating the
+	 * record in the heap and all indexes.
+	 *
+	 * ExecWithCheckOptions() will skip any WCOs which are not of the kind we
+	 * are looking for at this point.
+	 */
 	if (resultRelInfo->ri_WithCheckOptions != NIL)
-		ExecWithCheckOptions(resultRelInfo, slot, estate);
+		ExecWithCheckOptions(WCO_VIEW_CHECK, resultRelInfo, slot, estate);
 
 	/* Process RETURNING if present */
 	if (resultRelInfo->ri_projectReturning)
-		return ExecProcessReturning(resultRelInfo->ri_projectReturning,
-									slot, planSlot);
+		return ExecProcessReturning(resultRelInfo->ri_projectReturning, slot, planSlot);
 
 	return NULL;
+}
+
+/*
+ * ExecOnConflictUpdate --- execute UPDATE of INSERT ON CONFLICT DO UPDATE
+ *
+ * Try to lock tuple for update as part of speculative insertion.  If
+ * a qual originating from ON CONFLICT DO UPDATE is satisfied, update
+ * (but still lock row, even though it may not satisfy estate's
+ * snapshot).
+ *
+ * Returns true if if we're done (with or without an update), or false if
+ * the caller must retry the INSERT from scratch.
+ */
+static bool
+ExecOnConflictUpdate(ModifyTableState *mtstate,
+					 ResultRelInfo *resultRelInfo,
+					 ItemPointer conflictTid,
+					 TupleTableSlot *planSlot,
+					 TupleTableSlot *excludedSlot,
+					 EState *estate,
+					 bool canSetTag,
+					 TupleTableSlot **returning)
+{
+	ExprContext *econtext = mtstate->ps.ps_ExprContext;
+	Relation	relation = resultRelInfo->ri_RelationDesc;
+	List	   *onConflictSetWhere = resultRelInfo->ri_onConflictSetWhere;
+	HeapTupleData tuple;
+	HeapUpdateFailureData hufd;
+	LockTupleMode lockmode;
+	HTSU_Result test;
+	Buffer		buffer;
+
+	/* Determine lock mode to use */
+	lockmode = ExecUpdateLockMode(estate, resultRelInfo);
+
+	/*
+	 * Lock tuple for update.  Don't follow updates when tuple cannot be
+	 * locked without doing so.  A row locking conflict here means our
+	 * previous conclusion that the tuple is conclusively committed is not
+	 * true anymore.
+	 */
+	tuple.t_self = *conflictTid;
+	test = heap_lock_tuple(relation, &tuple, estate->es_output_cid,
+						   lockmode, LockWaitBlock, false, &buffer,
+						   &hufd);
+	switch (test)
+	{
+		case HeapTupleMayBeUpdated:
+			/* success! */
+			break;
+
+		case HeapTupleInvisible:
+
+			/*
+			 * This can occur when a just inserted tuple is updated again in
+			 * the same command. E.g. because multiple rows with the same
+			 * conflicting key values are inserted.
+			 *
+			 * This is somewhat similar to the ExecUpdate()
+			 * HeapTupleSelfUpdated case.  We do not want to proceed because
+			 * it would lead to the same row being updated a second time in
+			 * some unspecified order, and in contrast to plain UPDATEs
+			 * there's no historical behavior to break.
+			 *
+			 * It is the user's responsibility to prevent this situation from
+			 * occurring.  These problems are why SQL-2003 similarly specifies
+			 * that for SQL MERGE, an exception must be raised in the event of
+			 * an attempt to update the same row twice.
+			 */
+			if (TransactionIdIsCurrentTransactionId(HeapTupleHeaderGetXmin(tuple.t_data)))
+				ereport(ERROR,
+						(errcode(ERRCODE_CARDINALITY_VIOLATION),
+						 errmsg("ON CONFLICT DO UPDATE command cannot affect row a second time"),
+						 errhint("Ensure that no rows proposed for insertion within the same command have duplicate constrained values.")));
+
+			/* This shouldn't happen */
+			elog(ERROR, "attempted to lock invisible tuple");
+			break;
+
+		case HeapTupleSelfUpdated:
+
+			/*
+			 * This state should never be reached. As a dirty snapshot is used
+			 * to find conflicting tuples, speculative insertion wouldn't have
+			 * seen this row to conflict with.
+			 */
+			elog(ERROR, "unexpected self-updated tuple");
+			break;
+
+		case HeapTupleUpdated:
+			if (IsolationUsesXactSnapshot())
+				ereport(ERROR,
+						(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+						 errmsg("could not serialize access due to concurrent update")));
+
+			/*
+			 * Tell caller to try again from the very start.
+			 *
+			 * It does not make sense to use the usual EvalPlanQual() style
+			 * loop here, as the new version of the row might not conflict
+			 * anymore, or the conflicting tuple has actually been deleted.
+			 */
+			ReleaseBuffer(buffer);
+			return false;
+
+		default:
+			elog(ERROR, "unrecognized heap_lock_tuple status: %u", test);
+	}
+
+	/*
+	 * Success, the tuple is locked.
+	 *
+	 * Reset per-tuple memory context to free any expression evaluation
+	 * storage allocated in the previous cycle.
+	 */
+	ResetExprContext(econtext);
+
+	/*
+	 * Verify that the tuple is visible to our MVCC snapshot if the current
+	 * isolation level mandates that.
+	 *
+	 * It's not sufficient to rely on the check within ExecUpdate() as e.g.
+	 * CONFLICT ... WHERE clause may prevent us from reaching that.
+	 *
+	 * This means we only ever continue when a new command in the current
+	 * transaction could see the row, even though in READ COMMITTED mode the
+	 * tuple will not be visible according to the current statement's
+	 * snapshot.  This is in line with the way UPDATE deals with newer tuple
+	 * versions.
+	 */
+	ExecCheckHeapTupleVisible(resultRelInfo->ri_RelationDesc, estate, &tuple, buffer);
+
+	/* Store target's existing tuple in the state's dedicated slot */
+	ExecStoreHeapTuple(&tuple, mtstate->mt_existing, buffer, false);
+
+	/*
+	 * Make tuple and any needed join variables available to ExecQual and
+	 * ExecProject.  The EXCLUDED tuple is installed in ecxt_innertuple, while
+	 * the target's existing tuple is installed in the scantuple.  EXCLUDED
+	 * has been made to reference INNER_VAR in setrefs.c, but there is no
+	 * other redirection.
+	 */
+	econtext->ecxt_scantuple = mtstate->mt_existing;
+	econtext->ecxt_innertuple = excludedSlot;
+	econtext->ecxt_outertuple = NULL;
+
+	if (!ExecQual(onConflictSetWhere, econtext, false))
+	{
+		ReleaseBuffer(buffer);
+		InstrCountFiltered1(&mtstate->ps, 1);
+		return true;			/* done with the tuple */
+	}
+
+	if (resultRelInfo->ri_WithCheckOptions != NIL)
+	{
+		/*
+		 * Check target's existing tuple against UPDATE-applicable USING
+		 * security barrier quals (if any), enforced here as RLS checks/WCOs.
+		 *
+		 * The rewriter creates UPDATE RLS checks/WCOs for UPDATE security
+		 * quals, and stores them as WCOs of "kind" WCO_RLS_CONFLICT_CHECK,
+		 * but that's almost the extent of its special handling for ON
+		 * CONFLICT DO UPDATE.
+		 *
+		 * The rewriter will also have associated UPDATE applicable straight
+		 * RLS checks/WCOs for the benefit of the ExecUpdate() call that
+		 * follows.  INSERTs and UPDATEs naturally have mutually exclusive WCO
+		 * kinds, so there is no danger of spurious over-enforcement in the
+		 * INSERT or UPDATE path.
+		 */
+		ExecWithCheckOptions(WCO_RLS_CONFLICT_CHECK, resultRelInfo,
+							 mtstate->mt_existing,
+							 mtstate->ps.state);
+	}
+
+	/* Project the new tuple version */
+	ExecProject(resultRelInfo->ri_onConflictSetProj, NULL);
+
+	/*
+	 * Note that it is possible that the target tuple has been modified in
+	 * this session, after the above heap_lock_tuple. We choose to not error
+	 * out in that case, in line with ExecUpdate's treatment of similar cases.
+	 * This can happen if an UPDATE is triggered from within ExecQual(),
+	 * ExecWithCheckOptions() or ExecProject() above, e.g. by selecting from a
+	 * wCTE in the ON CONFLICT's SET.
+	 */
+
+	/* Execute UPDATE with projection */
+	*returning = ExecUpdate(&tuple.t_self, NULL,
+							mtstate->mt_conflproj, planSlot,
+							GpIdentity.segindex,
+							&mtstate->mt_epqstate, mtstate->ps.state,
+							canSetTag);
+
+	ReleaseBuffer(buffer);
+	return true;
 }
 
 
@@ -1490,6 +1753,9 @@ fireBSTriggers(ModifyTableState *node)
 	{
 		case CMD_INSERT:
 			ExecBSInsertTriggers(node->ps.state, node->resultRelInfo);
+			if (node->mt_onconflict == ONCONFLICT_UPDATE)
+				ExecBSUpdateTriggers(node->ps.state,
+									 node->resultRelInfo);
 			break;
 		case CMD_UPDATE:
 			ExecBSUpdateTriggers(node->ps.state, node->resultRelInfo);
@@ -1512,6 +1778,9 @@ fireASTriggers(ModifyTableState *node)
 	switch (node->operation)
 	{
 		case CMD_INSERT:
+			if (node->mt_onconflict == ONCONFLICT_UPDATE)
+				ExecASUpdateTriggers(node->ps.state,
+									 node->resultRelInfo);
 			ExecASInsertTriggers(node->ps.state, node->resultRelInfo);
 			break;
 		case CMD_UPDATE:
@@ -1538,11 +1807,15 @@ TupleTableSlot *
 ExecModifyTable(ModifyTableState *node)
 {
 	EState	   *estate = node->ps.state;
+	PlanGenerator planGen = estate->es_plannedstmt->planGen;
 	CmdType		operation = node->operation;
 	ResultRelInfo *saved_resultRelInfo;
 	ResultRelInfo *resultRelInfo;
 	PlanState  *subplanstate;
 	JunkFilter *junkfilter;
+	AttrNumber  action_attno;
+	AttrNumber  segid_attno;
+	AttrNumber  tupleoid_attno;
 	TupleTableSlot *slot;
 	TupleTableSlot *planSlot;
 	ItemPointer tupleid = NULL;
@@ -1589,6 +1862,9 @@ ExecModifyTable(ModifyTableState *node)
 	resultRelInfo = node->resultRelInfo + node->mt_whichplan;
 	subplanstate = node->mt_plans[node->mt_whichplan];
 	junkfilter = resultRelInfo->ri_junkFilter;
+	action_attno = resultRelInfo->ri_action_attno;
+	segid_attno = resultRelInfo->ri_segid_attno;
+	tupleoid_attno = resultRelInfo->ri_tupleoid_attno;
 
 	/*
 	 * es_result_relation_info must point to the currently active result
@@ -1622,11 +1898,14 @@ ExecModifyTable(ModifyTableState *node)
 			/* advance to next subplan if any */
 			node->mt_whichplan++;
 			if (node->mt_whichplan < node->mt_nplans)
-		{
+			{
 				estate->es_result_relation_info = estate->es_result_relations + node->mt_whichplan;
 				resultRelInfo = estate->es_result_relation_info;
 				subplanstate = node->mt_plans[node->mt_whichplan];
 				junkfilter = estate->es_result_relation_info->ri_junkFilter;
+				action_attno = estate->es_result_relation_info->ri_action_attno;
+				segid_attno = estate->es_result_relation_info->ri_segid_attno;
+				tupleoid_attno = estate->es_result_relation_info->ri_tupleoid_attno;
 				EvalPlanQualSetPlan(&node->mt_epqstate, subplanstate->plan,
 									node->mt_arowmarks[node->mt_whichplan]);
 				continue;
@@ -1635,8 +1914,32 @@ ExecModifyTable(ModifyTableState *node)
 				break;
 		}
 
+		/*
+		 * If resultRelInfo->ri_usesFdwDirectModify is true, all we need to do
+		 * here is compute the RETURNING expressions.
+		 */
+		if (resultRelInfo->ri_usesFdwDirectModify)
+		{
+			Assert(resultRelInfo->ri_projectReturning);
+
+			/*
+			 * A scan slot containing the data that was actually inserted,
+			 * updated or deleted has already been made available to
+			 * ExecProcessReturning by IterateDirectModify, so no need to
+			 * provide it here.
+			 */
+			slot = ExecProcessReturning(resultRelInfo->ri_projectReturning, NULL, planSlot);
+
+			estate->es_result_relation_info = saved_resultRelInfo;
+			return slot;
+		}
+
 		EvalPlanQualSetSlot(&node->mt_epqstate, planSlot);
 		slot = planSlot;
+
+		int32 segid = GpIdentity.segindex;
+		int action = -1;
+		Oid tupleoid = InvalidOid;;
 
 		oldtuple = NULL;
 		if (junkfilter != NULL)
@@ -1703,6 +2006,43 @@ ExecModifyTable(ModifyTableState *node)
 				}
 				else
 					Assert(relkind == RELKIND_FOREIGN_TABLE);
+
+				/*
+				 * Extract GPDB-specific junk attributes.
+				 */
+				if (AttributeNumberIsValid(segid_attno))
+				{
+					datum = ExecGetJunkAttribute(slot,
+												 segid_attno,
+												 &isNull);
+					/* shouldn't ever get a null result... */
+					if (isNull)
+						elog(ERROR, "action is NULL");
+
+					segid = DatumGetInt32(datum);
+				}
+				if (AttributeNumberIsValid(action_attno))
+				{
+					datum = ExecGetJunkAttribute(slot,
+												 action_attno,
+												 &isNull);
+					/* shouldn't ever get a null result... */
+					if (isNull)
+						elog(ERROR, "gp_segment_id is NULL");
+
+					action = DatumGetInt32(datum);
+				}
+				if (AttributeNumberIsValid(tupleoid_attno))
+				{
+					datum = ExecGetJunkAttribute(slot,
+												 tupleoid_attno,
+												 &isNull);
+					/* shouldn't ever get a null result... */
+					if (isNull)
+						elog(ERROR, "tupleoid is NULL");
+
+					tupleoid = DatumGetInt32(datum);
+				}
 			}
 
 			/*
@@ -1715,59 +2055,39 @@ ExecModifyTable(ModifyTableState *node)
 		switch (operation)
 		{
 			case CMD_INSERT:
-				slot = ExecInsert(slot, planSlot, estate, node->canSetTag,
-								  PLANGEN_PLANNER,
+				slot = ExecInsert(node, slot, planSlot,
+								node->mt_arbiterindexes, node->mt_onconflict,
+								  estate, node->canSetTag,
 								  false /* isUpdate */, InvalidOid /* tupleOid */);
 				break;
 			case CMD_UPDATE:
+				if (!AttributeNumberIsValid(action_attno))
 				{
-					int			action;
-					bool		isnull;
-					int			actionColIdx;
-					int			tupleoidColIdx;
+					/* normal non-split UPDATE */
+					slot = ExecUpdate(tupleid, oldtuple, slot, planSlot, segid,
+									  &node->mt_epqstate, estate,
+									  node->canSetTag);
+				}
+				else if (DML_INSERT == action)
+				{
+					if (estate->es_result_partitions && planGen == PLANGEN_PLANNER)
+						checkPartitionUpdate(estate, slot, estate->es_result_relation_info);
 
-					actionColIdx = node->mt_action_col_idxes[node->mt_whichplan];
-					tupleoidColIdx = node->mt_oid_col_idxes[node->mt_whichplan];
-
-					/* It is planned as not split update mode */
-					if (actionColIdx <= 0)
-					{
-						slot = ExecUpdate(tupleid, oldtuple, slot, planSlot,
-										  &node->mt_epqstate, estate,
-										  node->canSetTag);
-						break;
-					}
-
-					action = DatumGetUInt32(slot_getattr(planSlot, actionColIdx, &isnull));
-					Assert(!isnull);
-
-					if (DML_INSERT == action)
-					{
-						Oid		tupleOid = InvalidOid;
-
-						if (tupleoidColIdx != 0)
-						{
-							bool			isnull;
-
-							tupleOid = slot_getattr(planSlot, tupleoidColIdx, &isnull);
-						}
-
-						if (estate->es_result_partitions)
-							checkPartitionUpdate(estate, slot, estate->es_result_relation_info);
-
-						slot = ExecInsert(slot, planSlot, estate, node->canSetTag,
-										  PLANGEN_PLANNER, true /* isUpdate */, tupleOid);
-					}
-					else /* DML_DELETE */
-						slot = ExecDelete(tupleid, oldtuple, planSlot,
-										  &node->mt_epqstate, estate, false,
-										  PLANGEN_PLANNER, true /* isUpdate */);
+					slot = ExecInsert(node, slot, planSlot, node->mt_arbiterindexes,
+									  node->mt_onconflict, estate, node->canSetTag,
+									  true /* isUpdate */, tupleoid);
+				}
+				else /* DML_DELETE */
+				{
+					slot = ExecDelete(tupleid, segid, oldtuple, planSlot,
+									  &node->mt_epqstate, estate, false,
+									  true /* isUpdate */);
 				}
 				break;
 			case CMD_DELETE:
-				slot = ExecDelete(tupleid, oldtuple, planSlot,
+				slot = ExecDelete(tupleid, segid, oldtuple, planSlot,
 								  &node->mt_epqstate, estate, node->canSetTag,
-								  PLANGEN_PLANNER, false /* isUpdate */);
+								  false /* isUpdate */);
 				break;
 			default:
 				elog(ERROR, "unknown operation");
@@ -1845,30 +2165,24 @@ ExecInitModifyTable(ModifyTable *node, EState *estate, int eflags)
 	mtstate->resultRelInfo = estate->es_result_relations + node->resultRelIndex;
 	mtstate->mt_arowmarks = (List **) palloc0(sizeof(List *) * nplans);
 	mtstate->mt_nplans = nplans;
+	mtstate->mt_onconflict = node->onConflictAction;
+	mtstate->mt_arbiterindexes = node->arbiterIndexes;
+
 	/* set up epqstate with dummy subplan data for the moment */
 	EvalPlanQualInit(&mtstate->mt_epqstate, estate, NULL, NIL, node->epqParam);
 
 	if (CMD_UPDATE == operation)
 	{
-		Assert(list_length(node->ctid_col_idxes) == nplans);
-		Assert(list_length(node->action_col_idxes) == nplans);
-		Assert(list_length(node->oid_col_idxes) == nplans);
+		mtstate->mt_isSplitUpdates = (bool *) palloc0(nplans * sizeof(bool));
+		if (node->isSplitUpdates)
+		{
+			if (list_length(node->isSplitUpdates) != nplans)
+				elog(ERROR, "ModifyTable node is missing is-split-update information");
 
-		mtstate->mt_action_col_idxes = (AttrNumber *) palloc0 (sizeof(AttrNumber) * list_length(node->action_col_idxes));
-		mtstate->mt_ctid_col_idxes = (AttrNumber *) palloc0 (sizeof(AttrNumber) * list_length(node->ctid_col_idxes));
-		mtstate->mt_oid_col_idxes = (AttrNumber *) palloc0 (sizeof(AttrNumber) * list_length(node->oid_col_idxes));
-
-		i = 0;
-		foreach(l, node->action_col_idxes)
-			mtstate->mt_action_col_idxes[i++] = lfirst_int(l);
-
-		i = 0;
-		foreach(l, node->ctid_col_idxes)
-			mtstate->mt_ctid_col_idxes[i++] = lfirst_int(l);
-
-		i = 0;
-		foreach(l, node->oid_col_idxes)
-			mtstate->mt_oid_col_idxes[i++] = lfirst_int(l);
+			i = 0;
+			foreach(l, node->isSplitUpdates)
+				mtstate->mt_isSplitUpdates[i++] = (bool) lfirst_int(l);
+		}
 	}
 
 	/* GPDB: Don't fire statement-triggers in QE reader processes */
@@ -1891,6 +2205,10 @@ ExecInitModifyTable(ModifyTable *node, EState *estate, int eflags)
 	{
 		subplan = (Plan *) lfirst(l);
 
+		/* Initialize the usesFdwDirectModify flag */
+		resultRelInfo->ri_usesFdwDirectModify = bms_is_member(i,
+												 node->fdwDirectModifyPlans);
+
 		/*
 		 * Verify result relation is a valid target for the current operation
 		 */
@@ -1908,14 +2226,15 @@ ExecInitModifyTable(ModifyTable *node, EState *estate, int eflags)
 		if (resultRelInfo->ri_RelationDesc->rd_rel->relhasindex &&
 			operation != CMD_DELETE &&
 			resultRelInfo->ri_IndexRelationDescs == NULL)
-			ExecOpenIndices(resultRelInfo);
+			ExecOpenIndices(resultRelInfo, mtstate->mt_onconflict != ONCONFLICT_NONE);
 
 		/* Now init the plan for this result rel */
 		estate->es_result_relation_info = resultRelInfo;
 		mtstate->mt_plans[i] = ExecInitNode(subplan, estate, eflags);
 
 		/* Also let FDWs init themselves for foreign-table result rels */
-		if (resultRelInfo->ri_FdwRoutine != NULL &&
+		if (!resultRelInfo->ri_usesFdwDirectModify &&
+			resultRelInfo->ri_FdwRoutine != NULL &&
 			resultRelInfo->ri_FdwRoutine->BeginForeignModify != NULL)
 		{
 			List	   *fdw_private = (List *) list_nth(node->fdwPrivLists, i);
@@ -2013,6 +2332,59 @@ ExecInitModifyTable(ModifyTable *node, EState *estate, int eflags)
 	}
 
 	/*
+	 * If needed, Initialize target list, projection and qual for ON CONFLICT
+	 * DO UPDATE.
+	 */
+	resultRelInfo = mtstate->resultRelInfo;
+	if (node->onConflictAction == ONCONFLICT_UPDATE)
+	{
+		ExprContext *econtext;
+		ExprState  *setexpr;
+		TupleDesc	tupDesc;
+
+		/* insert may only have one plan, inheritance is not expanded */
+		Assert(nplans == 1);
+
+		/* already exists if created by RETURNING processing above */
+		if (mtstate->ps.ps_ExprContext == NULL)
+			ExecAssignExprContext(estate, &mtstate->ps);
+
+		econtext = mtstate->ps.ps_ExprContext;
+
+		/* initialize slot for the existing tuple */
+		mtstate->mt_existing = ExecInitExtraTupleSlot(mtstate->ps.state);
+		ExecSetSlotDescriptor(mtstate->mt_existing,
+							  resultRelInfo->ri_RelationDesc->rd_att);
+
+		/* carried forward solely for the benefit of explain */
+		mtstate->mt_excludedtlist = node->exclRelTlist;
+
+		/* create target slot for UPDATE SET projection */
+		tupDesc = ExecTypeFromTL((List *) node->onConflictSet,
+						 resultRelInfo->ri_RelationDesc->rd_rel->relhasoids);
+		mtstate->mt_conflproj = ExecInitExtraTupleSlot(mtstate->ps.state);
+		ExecSetSlotDescriptor(mtstate->mt_conflproj, tupDesc);
+
+		/* build UPDATE SET expression and projection state */
+		setexpr = ExecInitExpr((Expr *) node->onConflictSet, &mtstate->ps);
+		resultRelInfo->ri_onConflictSetProj =
+			ExecBuildProjectionInfo((List *) setexpr, econtext,
+									mtstate->mt_conflproj,
+									resultRelInfo->ri_RelationDesc->rd_att);
+
+		/* build DO UPDATE WHERE clause expression */
+		if (node->onConflictWhere)
+		{
+			ExprState  *qualexpr;
+
+			qualexpr = ExecInitExpr((Expr *) node->onConflictWhere,
+									&mtstate->ps);
+
+			resultRelInfo->ri_onConflictSetWhere = (List *) qualexpr;
+		}
+	}
+
+	/*
 	 * If we have any secondary relations in an UPDATE or DELETE, they need to
 	 * be treated like non-locked relations in SELECT FOR UPDATE, ie, the
 	 * EvalPlanQual mechanism needs to be told about them.  Locate the
@@ -2062,7 +2434,7 @@ ExecInitModifyTable(ModifyTable *node, EState *estate, int eflags)
 		}
 
 		/* find ExecRowMark (same for all subplans) */
-		erm = ExecFindRowMark(estate, rc->rti);
+		erm = ExecFindRowMark(estate, rc->rti, false);
 
 		/* build ExecAuxRowMark for each subplan */
 		for (i = 0; i < nplans; i++)
@@ -2148,6 +2520,25 @@ ExecInitModifyTable(ModifyTable *node, EState *estate, int eflags)
 						j->jf_junkAttNo = ExecFindJunkAttribute(j, "ctid");
 						if (!AttributeNumberIsValid(j->jf_junkAttNo))
 							elog(ERROR, "could not find junk ctid column");
+
+						/* Extra GPDB junk columns */
+						resultRelInfo->ri_segid_attno = ExecFindJunkAttribute(j, "gp_segment_id");
+						if (!AttributeNumberIsValid(resultRelInfo->ri_segid_attno))
+							elog(ERROR, "could not find junk gp_segment_id column");
+
+						if (operation == CMD_UPDATE && mtstate->mt_isSplitUpdates[i])
+						{
+							resultRelInfo->ri_action_attno = ExecFindJunkAttribute(j, "DMLAction");
+							if (!AttributeNumberIsValid(resultRelInfo->ri_action_attno))
+								elog(ERROR, "could not find junk action column");
+
+							if (resultRelInfo->ri_RelationDesc->rd_rel->relhasoids)
+							{
+								resultRelInfo->ri_tupleoid_attno = ExecFindJunkAttribute(j, "oid");
+								if (!AttributeNumberIsValid(resultRelInfo->ri_tupleoid_attno))
+									elog(ERROR, "could not find junk tupleoid column");
+							}
+						}
 					}
 					else if (relkind == RELKIND_FOREIGN_TABLE)
 					{
@@ -2229,7 +2620,8 @@ ExecEndModifyTable(ModifyTableState *node)
 	{
 		ResultRelInfo *resultRelInfo = node->resultRelInfo + i;
 
-		if (resultRelInfo->ri_FdwRoutine != NULL &&
+		if (!resultRelInfo->ri_usesFdwDirectModify &&
+			resultRelInfo->ri_FdwRoutine != NULL &&
 			resultRelInfo->ri_FdwRoutine->EndForeignModify != NULL)
 			resultRelInfo->ri_FdwRoutine->EndForeignModify(node->ps.state,
 														   resultRelInfo);
@@ -2265,4 +2657,252 @@ ExecReScanModifyTable(ModifyTableState *node)
 	 * semantics of that would be a bit debatable anyway.
 	 */
 	elog(ERROR, "ExecReScanModifyTable is not implemented");
+}
+
+void
+ExecSquelchModifyTable(ModifyTableState *node)
+{
+	/*
+	 * ModifyTable nodes must run to completion when asked to Squelch so
+	 * that we don't risk losing modifications which should be performed
+	 * regardless of any LIMIT's or other forms for projections which could
+	 * end up causing a squelch to happen.
+	 */
+	for (;;)
+	{
+		TupleTableSlot *result;
+
+		result = ExecModifyTable(node);
+		if (!result)
+			break;
+	}
+}
+
+/*
+ * table_insert/update/delete()
+ *
+ * Helper functions for ExecInsert(), ExecUpdate(), ExecDelete() to deal with
+ * different kinds of tables in GPDB; appendonly, AOCO, external and heap.
+ * PostgreSQL uses just heap_insert/update/delete(), up to v12, and in v12,
+ * the new tableam API functions.
+ */
+static Oid
+table_insert(ResultRelInfo *resultRelInfo, EState *estate, TupleTableSlot *slot,
+			 Oid tuple_oid, ItemPointer lastTid, CommandId cid)
+{
+	Relation	resultRelationDesc = resultRelInfo->ri_RelationDesc;
+	Oid			newId;
+
+	if (RelationIsAoRows(resultRelationDesc))
+	{
+		MemTuple	mtuple;
+
+		if (resultRelInfo->ri_aoInsertDesc == NULL)
+		{
+			/* Set the pre-assigned fileseg number to insert into */
+			ResultRelInfoChooseSegno(resultRelInfo);
+
+			resultRelInfo->ri_aoInsertDesc =
+				appendonly_insert_init(resultRelationDesc,
+									   resultRelInfo->ri_aosegno,
+									   false);
+		}
+
+		mtuple = ExecFetchSlotMemTuple(slot);
+		newId = appendonly_insert(resultRelInfo->ri_aoInsertDesc, mtuple, tuple_oid, (AOTupleId *) lastTid);
+	}
+	else if (RelationIsAoCols(resultRelationDesc))
+	{
+		if (resultRelInfo->ri_aocsInsertDesc == NULL)
+		{
+			ResultRelInfoChooseSegno(resultRelInfo);
+			resultRelInfo->ri_aocsInsertDesc = aocs_insert_init(resultRelationDesc,
+																resultRelInfo->ri_aosegno, false);
+		}
+
+		newId = aocs_insert(resultRelInfo->ri_aocsInsertDesc, slot);
+		*lastTid = *slot_get_ctid(slot);
+	}
+	else if (RelationIsHeap(resultRelationDesc))
+	{
+		HeapTuple tuple;
+
+		/*
+		 * get the heap tuple out of the tuple table slot, making sure we have a
+		 * writable copy. (heap_insert() will scribble on the tuple)
+		 */
+		tuple = ExecMaterializeSlot(slot);
+		if (resultRelationDesc->rd_rel->relhasoids)
+			HeapTupleSetOid(tuple, tuple_oid);
+
+		/*
+		 * Note: heap_insert returns the tid (location) of the new tuple
+		 * in the t_self field.
+		 */
+		newId = heap_insert(resultRelationDesc,
+							tuple,
+							cid, 0, NULL,
+							GetCurrentTransactionId());
+		*lastTid = tuple->t_self;
+	}
+	else
+	{
+		elog(ERROR, "invalid relation type");
+	}
+
+	return newId;
+}
+
+static HTSU_Result
+table_update(ResultRelInfo *resultRelInfo, EState *estate, ItemPointer tupleid, TupleTableSlot *slot,
+			 CommandId cid,
+			 Snapshot crosscheck_snapshot,
+			 bool wait,
+			 HeapUpdateFailureData *hufd, LockTupleMode *lockmode, bool *wasHotUpdate)
+{
+	Relation	resultRelationDesc = resultRelInfo->ri_RelationDesc;
+	HTSU_Result result;
+
+	if (RelationIsHeap(resultRelationDesc))
+	{
+		HeapTuple tuple;
+
+		tuple = ExecMaterializeSlot(slot);
+
+		result = heap_update(resultRelationDesc, tupleid, tuple,
+							 cid,
+							 crosscheck_snapshot,
+							 wait,
+							 hufd, lockmode);
+
+		*tupleid = tuple->t_self;
+		*wasHotUpdate = HeapTupleIsHeapOnly(tuple) != 0;
+	}
+	else if (RelationIsAoRows(resultRelationDesc))
+	{
+		MemTuple mtuple;
+		ItemPointerData lastTid;
+
+		if (IsolationUsesXactSnapshot())
+		{
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("updates on append-only tables are not supported in serializable transactions")));
+		}
+
+		if (resultRelInfo->ri_updateDesc == NULL)
+		{
+			ResultRelInfoChooseSegno(resultRelInfo);
+			resultRelInfo->ri_updateDesc = (AppendOnlyUpdateDesc)
+				appendonly_update_init(resultRelationDesc, GetActiveSnapshot(),
+									   resultRelInfo->ri_aosegno);
+		}
+
+		mtuple = ExecFetchSlotMemTuple(slot);
+		result = appendonly_update(resultRelInfo->ri_updateDesc,
+								   mtuple, (AOTupleId *) tupleid, (AOTupleId *) &lastTid);
+		*tupleid = lastTid;
+		*wasHotUpdate = false;
+	}
+	else if (RelationIsAoCols(resultRelationDesc))
+	{
+		ItemPointerData lastTid;
+
+		if (IsolationUsesXactSnapshot())
+		{
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("updates on append-only tables are not supported in serializable transactions")));
+		}
+
+		if (resultRelInfo->ri_updateDesc == NULL)
+		{
+			ResultRelInfoChooseSegno(resultRelInfo);
+			resultRelInfo->ri_updateDesc = (AppendOnlyUpdateDesc)
+				aocs_update_init(resultRelationDesc, resultRelInfo->ri_aosegno);
+		}
+
+		result = aocs_update(resultRelInfo->ri_updateDesc,
+							 slot, (AOTupleId *) tupleid, (AOTupleId *) &lastTid);
+		*tupleid = lastTid;
+		*wasHotUpdate = false;
+	}
+	else
+	{
+		elog(ERROR, "invalid relation type");
+	}
+
+	return result;
+}
+
+static HTSU_Result
+table_delete(ResultRelInfo *resultRelInfo, EState *estate, bool isUpdate,
+			 ItemPointer tupleid,
+			 CommandId cid,
+			 Snapshot crosscheck_snapshot,
+			 bool wait,
+			 HeapUpdateFailureData *hufd)
+{
+	Relation	resultRelationDesc = resultRelInfo->ri_RelationDesc;
+	HTSU_Result result;
+
+	if (RelationIsHeap(resultRelationDesc))
+	{
+		result = heap_delete(resultRelationDesc, tupleid,
+							 cid,
+							 crosscheck_snapshot,
+							 wait,
+							 hufd);
+	}
+	else if (RelationIsAoRows(resultRelationDesc))
+	{
+		if (IsolationUsesXactSnapshot())
+		{
+			if (!isUpdate)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("deletes on append-only tables are not supported in serializable transactions")));
+			else
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("updates on append-only tables are not supported in serializable transactions")));
+		}
+
+		if (resultRelInfo->ri_deleteDesc == NULL)
+		{
+			resultRelInfo->ri_deleteDesc =
+				appendonly_delete_init(resultRelationDesc, GetActiveSnapshot());
+		}
+
+		result = appendonly_delete(resultRelInfo->ri_deleteDesc, (AOTupleId *) tupleid);
+	}
+	else if (RelationIsAoCols(resultRelationDesc))
+	{
+		if (IsolationUsesXactSnapshot())
+		{
+			if (!isUpdate)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("deletes on append-only tables are not supported in serializable transactions")));
+			else
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("updates on append-only tables are not supported in serializable transactions")));
+		}
+
+		if (resultRelInfo->ri_deleteDesc == NULL)
+		{
+			resultRelInfo->ri_deleteDesc =
+				aocs_delete_init(resultRelationDesc);
+		}
+
+		AOTupleId *aoTupleId = (AOTupleId *) tupleid;
+		result = aocs_delete(resultRelInfo->ri_deleteDesc, aoTupleId);
+	}
+	else
+	{
+		elog(ERROR, "invalid relation type");
+	}
+
+	return result;
 }

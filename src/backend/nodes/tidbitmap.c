@@ -20,7 +20,7 @@
  * point, but for now that seems useless complexity.
  *
  *
- * Copyright (c) 2003-2014, PostgreSQL Global Development Group
+ * Copyright (c) 2003-2016, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/backend/nodes/tidbitmap.c
@@ -204,12 +204,11 @@ tbm_create_pagetable(TIDBitmap *tbm)
 	MemSet(&hash_ctl, 0, sizeof(hash_ctl));
 	hash_ctl.keysize = sizeof(BlockNumber);
 	hash_ctl.entrysize = sizeof(PagetableEntry);
-	hash_ctl.hash = tag_hash;
 	hash_ctl.hcxt = tbm->mcxt;
 	tbm->pagetable = hash_create("TIDBitmap",
 								 128,	/* start small and extend */
 								 &hash_ctl,
-								 HASH_ELEM | HASH_FUNCTION | HASH_CONTEXT);
+								 HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
 
 	/* If entry1 is valid, push it into the hashtable */
 	if (tbm->status == TBM_ONE_PAGE)
@@ -292,6 +291,8 @@ void
 tbm_add_tuples(TIDBitmap *tbm, const ItemPointer tids, int ntids,
 			   bool recheck)
 {
+	BlockNumber currblk = InvalidBlockNumber;
+	PagetableEntry *page = NULL;	/* only valid when currblk is valid */
 	int			i;
 
 	Assert(!tbm->iterating);
@@ -299,7 +300,6 @@ tbm_add_tuples(TIDBitmap *tbm, const ItemPointer tids, int ntids,
 	{
 		BlockNumber blk = ItemPointerGetBlockNumber(tids + i);
 		OffsetNumber off = ItemPointerGetOffsetNumber(tids + i);
-		PagetableEntry *page;
 		int			wordnum,
 					bitnum;
 
@@ -311,10 +311,22 @@ tbm_add_tuples(TIDBitmap *tbm, const ItemPointer tids, int ntids,
 			elog(ERROR, "tuple offset out of range: %u", off);
 #endif
 
-		if (tbm_page_is_lossy(tbm, blk))
-			continue;			/* whole page is already marked */
+		/*
+		 * Look up target page unless we already did.  This saves cycles when
+		 * the input includes consecutive tuples on the same page, which is
+		 * common enough to justify an extra test here.
+		 */
+		if (blk != currblk)
+		{
+			if (tbm_page_is_lossy(tbm, blk))
+				page = NULL;	/* remember page is lossy */
+			else
+				page = tbm_get_pageentry(tbm, blk);
+			currblk = blk;
+		}
 
-		page = tbm_get_pageentry(tbm, blk);
+		if (page == NULL)
+			continue;			/* whole page is already marked */
 
 		if (page->ischunk)
 		{
@@ -331,7 +343,11 @@ tbm_add_tuples(TIDBitmap *tbm, const ItemPointer tids, int ntids,
 		page->recheck |= recheck;
 
 		if (tbm->nentries > tbm->maxentries)
+		{
 			tbm_lossify(tbm);
+			/* Page could have been converted to lossy, so force new lookup */
+			currblk = InvalidBlockNumber;
+		}
 	}
 }
 
@@ -425,6 +441,7 @@ tbm_union_page(TIDBitmap *a, const PagetableEntry *bpage)
 			/* Both pages are exact, merge at the bit level */
 			for (wordnum = 0; wordnum < WORDS_PER_PAGE; wordnum++)
 				apage->words[wordnum] |= bpage->words[wordnum];
+			apage->recheck |= bpage->recheck;
 		}
 	}
 
@@ -778,8 +795,8 @@ tbm_iterate_page(PagetableEntry *page, TBMIterateResult *output)
 	if (page->ischunk)
 	{
 		ntuples = -1;
+		output->recheck = true;
 	}
-
 	else
 	{
 		/* scan bitmap to extract individual offset numbers */
@@ -801,11 +818,11 @@ tbm_iterate_page(PagetableEntry *page, TBMIterateResult *output)
 				}
 			}
 		}
+		output->recheck = page->recheck;
 	}
 
 	output->blockno = page->blockno;
 	output->ntuples = ntuples;
-	output->recheck = page->recheck;
 
 	return true;
 }
@@ -896,7 +913,6 @@ tbm_next_page(TBMIterator *iterator, bool *more)
 			nextpage = (PagetableEntry *) palloc(sizeof(PagetableEntry));
 			nextpage->ischunk = true;
 			nextpage->blockno = chunk_blockno;
-			nextpage->recheck = true;
 			iterator->schunkbit++;
 			return nextpage;
 		}
@@ -1546,6 +1562,7 @@ opstream_iterate(StreamBMIterator *iterator, PagetableEntry *e)
 	List	   *matches;
 	bool		empty;
 
+	Assert(n->type == BMS_OR || n->type == BMS_AND);
 
 	/*
 	 * First, iterate through each input bitmap stream and save the block
@@ -1636,7 +1653,7 @@ restart:
 				continue;
 			}
 
-			/* already initialised, so OR together */
+			/* already initialised, so OR/AND together */
 			if (tmp->ischunk == true)
 			{
 				/*
@@ -1648,6 +1665,7 @@ restart:
 				list_free_deep(matches);
 				return res;
 			}
+
 			/* union/intersect existing output and new matches */
 			for (wordnum = 0; wordnum < WORDS_PER_PAGE; wordnum++)
 			{
@@ -1656,6 +1674,7 @@ restart:
 				else
 					e->words[wordnum] &= tmp->words[wordnum];
 			}
+			e->recheck |= tmp->recheck;
 		}
 		else if (n->type == BMS_AND)
 		{

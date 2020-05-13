@@ -19,11 +19,13 @@
 #include "access/hash.h"
 #include "catalog/index.h"
 #include "catalog/indexing.h"
+#include "catalog/pg_am.h"
 #include "catalog/pg_constraint.h"
 #include "catalog/pg_partition_rule.h"
 #include "cdb/cdbpartition.h"
 #include "cdb/partitionselection.h"
 #include "cdb/cdbvars.h"
+#include "executor/executor.h"
 #include "nodes/makefuncs.h"
 #include "parser/parse_expr.h"
 #include "utils/array.h"
@@ -478,7 +480,6 @@ constructIndexHashKey(Oid partOid,
 static void
 createIndexHashTables()
 {
-	MemoryContext context = NULL;
 	HASHCTL		hash_ctl;
 
 	/*
@@ -492,7 +493,7 @@ createIndexHashTables()
 	hash_ctl.hash = key_string_hash;
 	hash_ctl.match = key_string_compare;
 	hash_ctl.keycopy = key_string_copy;
-	hash_ctl.hcxt = context;
+	hash_ctl.hcxt = CurrentMemoryContext;
 	PartitionIndexHash = hash_create("Partition Index Hash",
 									 INITIAL_NUM_LOGICAL_INDEXES_ESTIMATE,
 									 &hash_ctl,
@@ -507,7 +508,7 @@ createIndexHashTables()
 	hash_ctl.keysize = sizeof(uint32);
 	hash_ctl.entrysize = sizeof(LogicalIndexInfoHashEntry);
 	hash_ctl.hash = tag_hash;
-	hash_ctl.hcxt = context;
+	hash_ctl.hcxt = CurrentMemoryContext;
 	LogicalIndexInfoHash = hash_create("Logical Index Info Hash",
 									   INITIAL_NUM_LOGICAL_INDEXES_ESTIMATE,
 									   &hash_ctl,
@@ -586,7 +587,11 @@ recordIndexesOnLeafPart(PartitionIndexNode **pNodePtr,
 		 */
 		indRel = index_open(indexoid, NoLock);
 
-		if (GIST_AM_OID == indRel->rd_rel->relam)
+		if (GIN_AM_OID == indRel->rd_rel->relam)
+		{
+			indType = INDTYPE_GIN;
+		}
+		else if (GIST_AM_OID == indRel->rd_rel->relam)
 		{
 			indType = INDTYPE_GIST;
 		}
@@ -772,8 +777,8 @@ indexParts(PartitionIndexNode **np, bool isDefault)
 	if (!n)
 		return;
 
-	x = bms_first_from(n->index, 0);
-	while (x >= 0)
+	x = -1;
+	while ((x = bms_next_member(n->index, x)) >= 0)
 	{
 		entry = (LogicalIndexInfoHashEntry *) hash_search(LogicalIndexInfoHash,
 														  (void *) &x, HASH_FIND, &found);
@@ -796,14 +801,13 @@ indexParts(PartitionIndexNode **np, bool isDefault)
 			numIndexesOnDefaultParts++;
 		}
 		else
-
+		{
 			/*
 			 * For regular non-default parts we just track the part oid which
 			 * will be used to get the part constraint.
 			 */
 			entry->partList = lappend_oid(entry->partList, n->parchildrelid);
-
-		x = bms_first_from(n->index, x + 1);
+		}
 	}
 
 	if (n->children)
@@ -839,7 +843,7 @@ getPartConstraints(Oid partOid, Oid rootOid, List *partKey)
 	char	   *conBin;
 	bool		conbinIsNull = false;
 	bool		conKeyIsNull = false;
-	AttrMap    *map;
+	TupleConversionMap *map;
 
 	/* create the map needed for mapping attnums */
 	Relation	rootRel = heap_open(rootOid, AccessShareLock);
@@ -1279,14 +1283,11 @@ dumpPartsIndexInfo(PartitionIndexNode *n, int level)
 
 	appendStringInfo(&logicalIndexes, "%d ", n->parchildrelid);
 
-	x = bms_first_from(n->index, 0);
 	appendStringInfo(&logicalIndexes, "%s ", " (");
 
-	while (x >= 0)
-	{
+	x = -1;
+	while ((x = bms_next_member(n->index, x)) >= 0)
 		appendStringInfo(&logicalIndexes, "%d ", x);
-		x = bms_first_from(n->index, x + 1);
-	}
 
 	appendStringInfo(&logicalIndexes, "%s ", " )");
 
@@ -1410,9 +1411,8 @@ extractStartEndRange(Node *clause, Node **ppnodeStart, Node **ppnodeEnd)
 	if (IsA(clause, OpExpr))
 	{
 		OpExpr	   *opexpr = (OpExpr *) clause;
-		Expr	   *pexprLeft = list_nth(opexpr->args, 0);
 		Expr	   *pexprRight = list_nth(opexpr->args, 1);
-		CmpType		cmptype = get_comparison_type(opexpr->opno, exprType((Node *) pexprLeft), exprType((Node *) pexprRight));
+		CmpType		cmptype = get_comparison_type(opexpr->opno);
 
 		if (CmptEq == cmptype)
 		{
@@ -1462,8 +1462,8 @@ extractStartEndRange(Node *clause, Node **ppnodeStart, Node **ppnodeEnd)
 	OpExpr	   *opexprStart = (OpExpr *) nodeStart;
 	OpExpr	   *opexprEnd = (OpExpr *) nodeEnd;
 
-	CmpType		cmptLeft = get_comparison_type(opexprStart->opno, exprType(list_nth(opexprStart->args, 0)), exprType(list_nth(opexprStart->args, 1)));
-	CmpType		cmptRight = get_comparison_type(opexprEnd->opno, exprType(list_nth(opexprEnd->args, 0)), exprType(list_nth(opexprEnd->args, 1)));
+	CmpType		cmptLeft = get_comparison_type(opexprStart->opno);
+	CmpType		cmptRight = get_comparison_type(opexprEnd->opno);
 
 	if ((CmptGT != cmptLeft && CmptGEq != cmptLeft) || (CmptLT != cmptRight && CmptLEq != cmptRight))
 	{
@@ -1557,7 +1557,11 @@ logicalIndexInfoForIndexOid(Oid rootOid, Oid indexOid)
 	}
 
 	plogicalIndexInfo->indType = INDTYPE_BITMAP;
-	if (GIST_AM_OID == indRel->rd_rel->relam)
+	if (GIN_AM_OID == indRel->rd_rel->relam)
+	{
+		plogicalIndexInfo->indType = INDTYPE_GIN;
+	}
+	else if (GIST_AM_OID == indRel->rd_rel->relam)
 	{
 		plogicalIndexInfo->indType = INDTYPE_GIST;
 	}

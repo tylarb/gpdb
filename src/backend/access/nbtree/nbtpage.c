@@ -4,7 +4,7 @@
  *	  BTree-specific page management code for the Postgres btree access
  *	  method.
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -22,9 +22,10 @@
  */
 #include "postgres.h"
 
-#include "access/heapam.h"	/* For RelationFetchGpRelationNodeForXLog. */
 #include "access/nbtree.h"
 #include "access/transam.h"
+#include "access/xlog.h"
+#include "access/xloginsert.h"
 #include "miscadmin.h"
 #include "storage/indexfsm.h"
 #include "storage/lmgr.h"
@@ -235,18 +236,25 @@ _bt_getroot(Relation rel, int access)
 		{
 			xl_btree_newroot xlrec;
 			XLogRecPtr	recptr;
-			XLogRecData rdata;
+			xl_btree_metadata md;
 
-			xlrec.node = rel->rd_node;
+			XLogBeginInsert();
+			XLogRegisterBuffer(0, rootbuf, REGBUF_WILL_INIT);
+			XLogRegisterBuffer(2, metabuf, REGBUF_WILL_INIT);
+
+			md.root = rootblkno;
+			md.level = 0;
+			md.fastroot = rootblkno;
+			md.fastlevel = 0;
+
+			XLogRegisterBufData(2, (char *) &md, sizeof(xl_btree_metadata));
+
 			xlrec.rootblk = rootblkno;
 			xlrec.level = 0;
 
-			rdata.data = (char *) &xlrec;
-			rdata.len = SizeOfBtreeNewroot;
-			rdata.buffer = InvalidBuffer;
-			rdata.next = NULL;
+			XLogRegisterData((char *) &xlrec, SizeOfBtreeNewroot);
 
-			recptr = XLogInsert(RM_BTREE_ID, XLOG_BTREE_NEWROOT, &rdata);
+			recptr = XLogInsert(RM_BTREE_ID, XLOG_BTREE_NEWROOT);
 
 			PageSetLSN(rootpage, recptr);
 			PageSetLSN(metapg, recptr);
@@ -518,8 +526,7 @@ _bt_checkpage(Relation rel, Buffer buf)
 				 errmsg("index \"%s\" contains corrupted page at block %u",
 						RelationGetRelationName(rel),
 						BufferGetBlockNumber(buf)),
-				 errhint("Please REINDEX it."),
-				 errSendAlert(true)));
+				 errhint("Please REINDEX it.")));
 }
 
 /*
@@ -528,39 +535,23 @@ _bt_checkpage(Relation rel, Buffer buf)
 static void
 _bt_log_reuse_page(Relation rel, BlockNumber blkno, TransactionId latestRemovedXid)
 {
-	if (!RelationNeedsWAL(rel))
-		return;
-
-	/* No ereport(ERROR) until changes are logged */
-	START_CRIT_SECTION();
+	xl_btree_reuse_page xlrec_reuse;
 
 	/*
-	 * We don't do MarkBufferDirty here because we're about to initialise the
-	 * page, and nobody else can see it yet.
+	 * Note that we don't register the buffer with the record, because this
+	 * operation doesn't modify the page. This record only exists to provide a
+	 * conflict point for Hot Standby.
 	 */
 
 	/* XLOG stuff */
-	{
-		XLogRecData rdata[1];
-		xl_btree_reuse_page xlrec_reuse;
+	xlrec_reuse.node = rel->rd_node;
+	xlrec_reuse.block = blkno;
+	xlrec_reuse.latestRemovedXid = latestRemovedXid;
 
-		xlrec_reuse.node = rel->rd_node;
-		xlrec_reuse.block = blkno;
-		xlrec_reuse.latestRemovedXid = latestRemovedXid;
-		rdata[0].data = (char *) &xlrec_reuse;
-		rdata[0].len = SizeOfBtreeReusePage;
-		rdata[0].buffer = InvalidBuffer;
-		rdata[0].next = NULL;
+	XLogBeginInsert();
+	XLogRegisterData((char *) &xlrec_reuse, SizeOfBtreeReusePage);
 
-		XLogInsert(RM_BTREE_ID, XLOG_BTREE_REUSE_PAGE, rdata);
-
-		/*
-		 * We don't do PageSetLSN here because we're about to initialise the
-		 * page, so no need.
-		 */
-	}
-
-	END_CRIT_SECTION();
+	XLogInsert(RM_BTREE_ID, XLOG_BTREE_REUSE_PAGE);
 }
 
 /*
@@ -631,9 +622,14 @@ _bt_getbuf(Relation rel, BlockNumber blkno, int access)
 					/*
 					 * If we are generating WAL for Hot Standby then create a
 					 * WAL record that will allow us to conflict with queries
-					 * running on standby.
+					 * running on standby, in case they have snapshots older
+					 * than btpo.xact.  This can only apply if the page does
+					 * have a valid btpo.xact value, ie not if it's new.  (We
+					 * must check that because an all-zero page has no special
+					 * space.)
 					 */
-					if (XLogStandbyInfoActive())
+					if (XLogStandbyInfoActive() && RelationNeedsWAL(rel) &&
+						!PageIsNew(page))
 					{
 						BTPageOpaque opaque = (BTPageOpaque) PageGetSpecialPointer(page);
 
@@ -725,7 +721,7 @@ _bt_relandgetbuf(Relation rel, Buffer obuf, BlockNumber blkno, int access)
  * Lock and pin (refcount) are both dropped.
  */
 void
-_bt_relbuf(Relation rel __attribute__((unused)), Buffer buf)
+_bt_relbuf(Relation rel, Buffer buf)
 {
 	UnlockReleaseBuffer(buf);
 }
@@ -746,7 +742,10 @@ _bt_pageinit(Page page, Size size)
  *	_bt_page_recyclable() -- Is an existing page recyclable?
  *
  * This exists to make sure _bt_getbuf and btvacuumscan have the same
- * policy about whether a page is safe to re-use.
+ * policy about whether a page is safe to re-use.  But note that _bt_getbuf
+ * knows enough to distinguish the PageIsNew condition from the other one.
+ * At some point it might be appropriate to redesign this to have a three-way
+ * result value.
  */
 bool
 _bt_page_recyclable(Page page)
@@ -798,10 +797,8 @@ _bt_delitems_vacuum(Relation rel, Buffer buf,
 					OffsetNumber *itemnos, int nitems,
 					BlockNumber lastBlockVacuumed)
 {
-	Page		page;
+	Page		page = BufferGetPage(buf);
 	BTPageOpaque opaque;
-
-	page = BufferGetPage(buf);
 
 	/* No ereport(ERROR) until changes are logged */
 	START_CRIT_SECTION();
@@ -811,8 +808,8 @@ _bt_delitems_vacuum(Relation rel, Buffer buf,
 		PageIndexMultiDelete(page, itemnos, nitems);
 
 	/*
-	 * If this is within VACUUM, we can clear the vacuum cycle ID since this
-	 * page has certainly been processed by the current vacuum scan.
+	 * We can clear the vacuum cycle ID since this page has certainly been
+	 * processed by the current vacuum scan.
 	 */
 	opaque = (BTPageOpaque) PageGetSpecialPointer(page);
 	opaque->btpo_cycleid = 0;
@@ -832,17 +829,13 @@ _bt_delitems_vacuum(Relation rel, Buffer buf,
 	if (RelationNeedsWAL(rel))
 	{
 		XLogRecPtr	recptr;
-		XLogRecData rdata[2];
 		xl_btree_vacuum xlrec_vacuum;
 
-		xlrec_vacuum.node = rel->rd_node;
-		xlrec_vacuum.block = BufferGetBlockNumber(buf);
-
 		xlrec_vacuum.lastBlockVacuumed = lastBlockVacuumed;
-		rdata[0].data = (char *) &xlrec_vacuum;
-		rdata[0].len = SizeOfBtreeVacuum;
-		rdata[0].buffer = InvalidBuffer;
-		rdata[0].next = &(rdata[1]);
+
+		XLogBeginInsert();
+		XLogRegisterBuffer(0, buf, REGBUF_STANDARD);
+		XLogRegisterData((char *) &xlrec_vacuum, SizeOfBtreeVacuum);
 
 		/*
 		 * The target-offsets array is not in the buffer, but pretend that it
@@ -850,20 +843,9 @@ _bt_delitems_vacuum(Relation rel, Buffer buf,
 		 * need not be stored too.
 		 */
 		if (nitems > 0)
-		{
-			rdata[1].data = (char *) itemnos;
-			rdata[1].len = nitems * sizeof(OffsetNumber);
-		}
-		else
-		{
-			rdata[1].data = NULL;
-			rdata[1].len = 0;
-		}
-		rdata[1].buffer = buf;
-		rdata[1].buffer_std = true;
-		rdata[1].next = NULL;
+			XLogRegisterBufData(0, (char *) itemnos, nitems * sizeof(OffsetNumber));
 
-		recptr = XLogInsert(RM_BTREE_ID, XLOG_BTREE_VACUUM, rdata);
+		recptr = XLogInsert(RM_BTREE_ID, XLOG_BTREE_VACUUM);
 
 		PageSetLSN(page, recptr);
 	}
@@ -921,36 +903,23 @@ _bt_delitems_delete(Relation rel, Buffer buf,
 	if (RelationNeedsWAL(rel))
 	{
 		XLogRecPtr	recptr;
-		XLogRecData rdata[3];
 		xl_btree_delete xlrec_delete;
 
-		xlrec_delete.node = rel->rd_node;
 		xlrec_delete.hnode = heapRel->rd_node;
-		xlrec_delete.block = BufferGetBlockNumber(buf);
 		xlrec_delete.nitems = nitems;
 
-		rdata[0].data = (char *) &xlrec_delete;
-		rdata[0].len = SizeOfBtreeDelete;
-		rdata[0].buffer = InvalidBuffer;
-		rdata[0].next = &(rdata[1]);
+		XLogBeginInsert();
+		XLogRegisterBuffer(0, buf, REGBUF_STANDARD);
+		XLogRegisterData((char *) &xlrec_delete, SizeOfBtreeDelete);
 
 		/*
 		 * We need the target-offsets array whether or not we store the whole
 		 * buffer, to allow us to find the latestRemovedXid on a standby
 		 * server.
 		 */
-		rdata[1].data = (char *) itemnos;
-		rdata[1].len = nitems * sizeof(OffsetNumber);
-		rdata[1].buffer = InvalidBuffer;
-		rdata[1].next = &(rdata[2]);
+		XLogRegisterData((char *) itemnos, nitems * sizeof(OffsetNumber));
 
-		rdata[2].data = NULL;
-		rdata[2].len = 0;
-		rdata[2].buffer = buf;
-		rdata[2].buffer_std = true;
-		rdata[2].next = NULL;
-
-		recptr = XLogInsert(RM_BTREE_ID, XLOG_BTREE_DELETE, rdata);
+		recptr = XLogInsert(RM_BTREE_ID, XLOG_BTREE_DELETE);
 
 		PageSetLSN(page, recptr);
 	}
@@ -1190,7 +1159,7 @@ _bt_pagedel(Relation rel, Buffer buf)
 						(errcode(ERRCODE_INDEX_CORRUPTED),
 					errmsg("index \"%s\" contains a half-dead internal page",
 						   RelationGetRelationName(rel)),
-						 errhint("This can be caused by an interrupt VACUUM in version 9.3 or older, before upgrade. Please REINDEX it.")));
+						 errhint("This can be caused by an interrupted VACUUM in version 9.3 or older, before upgrade. Please REINDEX it.")));
 			_bt_relbuf(rel, buf);
 			return ndeleted;
 		}
@@ -1272,6 +1241,7 @@ _bt_pagedel(Relation rel, Buffer buf)
 					lbuf = _bt_getbuf(rel, leftsib, BT_READ);
 					lpage = BufferGetPage(lbuf);
 					lopaque = (BTPageOpaque) PageGetSpecialPointer(lpage);
+
 					/*
 					 * If the left sibling is split again by another backend,
 					 * after we released the lock, we know that the first
@@ -1293,7 +1263,7 @@ _bt_pagedel(Relation rel, Buffer buf)
 				itup_scankey = _bt_mkscankey(rel, targetkey);
 				/* find the leftmost leaf page containing this key */
 				stack = _bt_search(rel, rel->rd_rel->relnatts, itup_scankey,
-								   false, &lbuf, BT_READ);
+								   false, &lbuf, BT_READ, NULL);
 				/* don't need a pin on the page */
 				_bt_relbuf(rel, lbuf);
 
@@ -1320,9 +1290,10 @@ _bt_pagedel(Relation rel, Buffer buf)
 		rightsib_empty = false;
 		while (P_ISHALFDEAD(opaque))
 		{
+			/* will check for interrupts, once lock is released */
 			if (!_bt_unlink_halfdead_page(rel, buf, &rightsib_empty))
 			{
-				_bt_relbuf(rel, buf);
+				/* _bt_unlink_halfdead_page already released buffer */
 				return ndeleted;
 			}
 			ndeleted++;
@@ -1331,6 +1302,12 @@ _bt_pagedel(Relation rel, Buffer buf)
 		rightsib = opaque->btpo_next;
 
 		_bt_relbuf(rel, buf);
+
+		/*
+		 * Check here, as calling loops will have locks held, preventing
+		 * interrupts from being processed.
+		 */
+		CHECK_FOR_INTERRUPTS();
 
 		/*
 		 * The page has now been deleted. If its right sibling is completely
@@ -1384,11 +1361,11 @@ _bt_mark_page_halfdead(Relation rel, Buffer leafbuf, BTStack stack)
 	leafrightsib = opaque->btpo_next;
 
 	/*
-	 * Before attempting to lock the parent page, check that the right
-	 * sibling is not in half-dead state.  A half-dead right sibling would
-	 * have no downlink in the parent, which would be highly confusing later
-	 * when we delete the downlink that follows the current page's downlink.
-	 * (I believe the deletion would work correctly, but it would fail the
+	 * Before attempting to lock the parent page, check that the right sibling
+	 * is not in half-dead state.  A half-dead right sibling would have no
+	 * downlink in the parent, which would be highly confusing later when we
+	 * delete the downlink that follows the current page's downlink. (I
+	 * believe the deletion would work correctly, but it would fail the
 	 * cross-check we make that the following downlink points to the right
 	 * sibling of the delete page.)
 	 */
@@ -1495,33 +1472,26 @@ _bt_mark_page_halfdead(Relation rel, Buffer leafbuf, BTStack stack)
 	{
 		xl_btree_mark_page_halfdead xlrec;
 		XLogRecPtr	recptr;
-		XLogRecData rdata[2];
 
-		xlrec.target.node = rel->rd_node;
-		ItemPointerSet(&(xlrec.target.tid), BufferGetBlockNumber(topparent), topoff);
+		xlrec.poffset = topoff;
 		xlrec.leafblk = leafblkno;
 		if (target != leafblkno)
 			xlrec.topparent = target;
 		else
 			xlrec.topparent = InvalidBlockNumber;
 
+		XLogBeginInsert();
+		XLogRegisterBuffer(0, leafbuf, REGBUF_WILL_INIT);
+		XLogRegisterBuffer(1, topparent, REGBUF_STANDARD);
+
 		page = BufferGetPage(leafbuf);
 		opaque = (BTPageOpaque) PageGetSpecialPointer(page);
 		xlrec.leftblk = opaque->btpo_prev;
 		xlrec.rightblk = opaque->btpo_next;
 
-		rdata[0].data = (char *) &xlrec;
-		rdata[0].len = SizeOfBtreeMarkPageHalfDead;
-		rdata[0].buffer = InvalidBuffer;
-		rdata[0].next = &(rdata[1]);
+		XLogRegisterData((char *) &xlrec, SizeOfBtreeMarkPageHalfDead);
 
-		rdata[1].data = NULL;
-		rdata[1].len = 0;
-		rdata[1].buffer = topparent;
-		rdata[1].buffer_std = true;
-		rdata[1].next = NULL;
-
-		recptr = XLogInsert(RM_BTREE_ID, XLOG_BTREE_MARK_PAGE_HALFDEAD, rdata);
+		recptr = XLogInsert(RM_BTREE_ID, XLOG_BTREE_MARK_PAGE_HALFDEAD);
 
 		page = BufferGetPage(topparent);
 		PageSetLSN(page, recptr);
@@ -1546,6 +1516,11 @@ _bt_mark_page_halfdead(Relation rel, Buffer leafbuf, BTStack stack)
  * Returns 'false' if the page could not be unlinked (shouldn't happen).
  * If the (new) right sibling of the page is empty, *rightsib_empty is set
  * to true.
+ *
+ * Must hold pin and lock on leafbuf at entry (read or write doesn't matter).
+ * On success exit, we'll be holding pin and write lock.  On failure exit,
+ * we'll release both pin and lock before returning (we define it that way
+ * to avoid having to reacquire a lock we already released).
  */
 static bool
 _bt_unlink_halfdead_page(Relation rel, Buffer leafbuf, bool *rightsib_empty)
@@ -1569,7 +1544,6 @@ _bt_unlink_halfdead_page(Relation rel, Buffer leafbuf, bool *rightsib_empty)
 	int			targetlevel;
 	ItemPointer leafhikey;
 	BlockNumber nextchild;
-	BlockNumber topblkno;
 
 	page = BufferGetPage(leafbuf);
 	opaque = (BTPageOpaque) PageGetSpecialPointer(page);
@@ -1587,17 +1561,24 @@ _bt_unlink_halfdead_page(Relation rel, Buffer leafbuf, bool *rightsib_empty)
 	LockBuffer(leafbuf, BUFFER_LOCK_UNLOCK);
 
 	/*
+	 * Check here, as calling loops will have locks held, preventing
+	 * interrupts from being processed.
+	 */
+	CHECK_FOR_INTERRUPTS();
+
+	/*
 	 * If the leaf page still has a parent pointing to it (or a chain of
 	 * parents), we don't unlink the leaf page yet, but the topmost remaining
-	 * parent in the branch.
+	 * parent in the branch.  Set 'target' and 'buf' to reference the page
+	 * actually being unlinked.
 	 */
 	if (ItemPointerIsValid(leafhikey))
 	{
-		topblkno = ItemPointerGetBlockNumber(leafhikey);
-		target = topblkno;
+		target = ItemPointerGetBlockNumber(leafhikey);
+		Assert(target != leafblkno);
 
 		/* fetch the block number of the topmost parent's left sibling */
-		buf = _bt_getbuf(rel, topblkno, BT_READ);
+		buf = _bt_getbuf(rel, target, BT_READ);
 		page = BufferGetPage(buf);
 		opaque = (BTPageOpaque) PageGetSpecialPointer(page);
 		leftsib = opaque->btpo_prev;
@@ -1611,11 +1592,10 @@ _bt_unlink_halfdead_page(Relation rel, Buffer leafbuf, bool *rightsib_empty)
 	}
 	else
 	{
-		topblkno = InvalidBlockNumber;
 		target = leafblkno;
 
 		buf = leafbuf;
-		leftsib = opaque->btpo_prev;
+		leftsib = leafleftsib;
 		targetlevel = 0;
 	}
 
@@ -1644,10 +1624,30 @@ _bt_unlink_halfdead_page(Relation rel, Buffer leafbuf, bool *rightsib_empty)
 			/* step right one page */
 			leftsib = opaque->btpo_next;
 			_bt_relbuf(rel, lbuf);
+
+			/*
+			 * It'd be good to check for interrupts here, but it's not easy to
+			 * do so because a lock is always held. This block isn't
+			 * frequently reached, so hopefully the consequences of not
+			 * checking interrupts aren't too bad.
+			 */
+
 			if (leftsib == P_NONE)
 			{
-				elog(LOG, "no left sibling (concurrent deletion?) in \"%s\"",
+				elog(LOG, "no left sibling (concurrent deletion?) of block %u in \"%s\"",
+					 target,
 					 RelationGetRelationName(rel));
+				if (target != leafblkno)
+				{
+					/* we have only a pin on target, but pin+lock on leafbuf */
+					ReleaseBuffer(buf);
+					_bt_relbuf(rel, leafbuf);
+				}
+				else
+				{
+					/* we have only a pin on leafbuf */
+					ReleaseBuffer(leafbuf);
+				}
 				return false;
 			}
 			lbuf = _bt_getbuf(rel, leftsib, BT_WRITE);
@@ -1696,9 +1696,11 @@ _bt_unlink_halfdead_page(Relation rel, Buffer leafbuf, bool *rightsib_empty)
 			elog(ERROR, "half-dead page changed status unexpectedly in block %u of index \"%s\"",
 				 target, RelationGetRelationName(rel));
 
-		/* remember the next child down in the branch. */
+		/* remember the next non-leaf child down in the branch. */
 		itemid = PageGetItemId(page, P_FIRSTDATAKEY(opaque));
 		nextchild = ItemPointerGetBlockNumber(&((IndexTuple) PageGetItem(page, itemid))->t_tid);
+		if (nextchild == leafblkno)
+			nextchild = InvalidBlockNumber;
 	}
 
 	/*
@@ -1784,7 +1786,7 @@ _bt_unlink_halfdead_page(Relation rel, Buffer leafbuf, bool *rightsib_empty)
 	 */
 	if (target != leafblkno)
 	{
-		if (nextchild == leafblkno)
+		if (nextchild == InvalidBlockNumber)
 			ItemPointerSetInvalid(leafhikey);
 		else
 			ItemPointerSet(leafhikey, nextchild, P_HIKEY);
@@ -1829,63 +1831,44 @@ _bt_unlink_halfdead_page(Relation rel, Buffer leafbuf, bool *rightsib_empty)
 		xl_btree_metadata xlmeta;
 		uint8		xlinfo;
 		XLogRecPtr	recptr;
-		XLogRecData rdata[4];
-		XLogRecData *nextrdata;
 
-		xlrec.node = rel->rd_node;
+		XLogBeginInsert();
+
+		XLogRegisterBuffer(0, buf, REGBUF_WILL_INIT);
+		if (BufferIsValid(lbuf))
+			XLogRegisterBuffer(1, lbuf, REGBUF_STANDARD);
+		XLogRegisterBuffer(2, rbuf, REGBUF_STANDARD);
+		if (target != leafblkno)
+			XLogRegisterBuffer(3, leafbuf, REGBUF_WILL_INIT);
 
 		/* information on the unlinked block */
-		xlrec.deadblk = target;
 		xlrec.leftsib = leftsib;
 		xlrec.rightsib = rightsib;
 		xlrec.btpo_xact = opaque->btpo.xact;
 
 		/* information needed to recreate the leaf block (if not the target) */
-		xlrec.leafblk = leafblkno;
 		xlrec.leafleftsib = leafleftsib;
 		xlrec.leafrightsib = leafrightsib;
 		xlrec.topparent = nextchild;
 
-		rdata[0].data = (char *) &xlrec;
-		rdata[0].len = SizeOfBtreeUnlinkPage;
-		rdata[0].buffer = InvalidBuffer;
-		rdata[0].next = nextrdata = &(rdata[1]);
+		XLogRegisterData((char *) &xlrec, SizeOfBtreeUnlinkPage);
 
 		if (BufferIsValid(metabuf))
 		{
+			XLogRegisterBuffer(4, metabuf, REGBUF_WILL_INIT);
+
 			xlmeta.root = metad->btm_root;
 			xlmeta.level = metad->btm_level;
 			xlmeta.fastroot = metad->btm_fastroot;
 			xlmeta.fastlevel = metad->btm_fastlevel;
 
-			nextrdata->data = (char *) &xlmeta;
-			nextrdata->len = sizeof(xl_btree_metadata);
-			nextrdata->buffer = InvalidBuffer;
-			nextrdata->next = nextrdata + 1;
-			nextrdata++;
+			XLogRegisterBufData(4, (char *) &xlmeta, sizeof(xl_btree_metadata));
 			xlinfo = XLOG_BTREE_UNLINK_PAGE_META;
 		}
 		else
 			xlinfo = XLOG_BTREE_UNLINK_PAGE;
 
-		nextrdata->data = NULL;
-		nextrdata->len = 0;
-		nextrdata->buffer = rbuf;
-		nextrdata->buffer_std = true;
-		nextrdata->next = NULL;
-
-		if (BufferIsValid(lbuf))
-		{
-			nextrdata->next = nextrdata + 1;
-			nextrdata++;
-			nextrdata->data = NULL;
-			nextrdata->len = 0;
-			nextrdata->buffer = lbuf;
-			nextrdata->buffer_std = true;
-			nextrdata->next = NULL;
-		}
-
-		recptr = XLogInsert(RM_BTREE_ID, xlinfo, rdata);
+		recptr = XLogInsert(RM_BTREE_ID, xlinfo);
 
 		if (BufferIsValid(metabuf))
 		{

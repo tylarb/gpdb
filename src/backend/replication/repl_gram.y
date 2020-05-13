@@ -3,7 +3,7 @@
  *
  * repl_gram.y				- Parser for the replication commands
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -72,13 +72,17 @@ Node *replication_parse_result;
 %token K_EXCLUDE
 %token K_MAX_RATE
 %token K_WAL
+%token K_TABLESPACE_MAP
 %token K_TIMELINE
 %token K_PHYSICAL
 %token K_LOGICAL
 %token K_SLOT
+%token K_RESERVE_WAL
 
 %type <node>	command
-%type <node>	base_backup start_replication start_logical_replication create_replication_slot drop_replication_slot identify_system timeline_history
+%type <node>	base_backup start_replication start_logical_replication
+				create_replication_slot drop_replication_slot identify_system
+				timeline_history
 %type <list>	base_backup_opt_list
 %type <defelt>	base_backup_opt
 %type <uintval>	opt_timeline
@@ -86,6 +90,7 @@ Node *replication_parse_result;
 %type <defelt>	plugin_opt_elem
 %type <node>	plugin_opt_arg
 %type <str>		opt_slot
+%type <boolval>	opt_reserve_wal
 
 %%
 
@@ -120,12 +125,14 @@ identify_system:
 			;
 
 /*
- * BASE_BACKUP [LABEL '<label>'] [PROGRESS] [FAST] [WAL] [NOWAIT] [MAX_RATE %d]
+ * BASE_BACKUP [LABEL '<label>'] [PROGRESS] [FAST] [WAL] [NOWAIT]
+ * [MAX_RATE %d] [TABLESPACE_MAP]
  */
 base_backup:
 			K_BASE_BACKUP base_backup_opt_list
 				{
-					BaseBackupCmd *cmd = (BaseBackupCmd *) makeNode(BaseBackupCmd);
+					BaseBackupCmd *cmd =
+						(BaseBackupCmd *) makeNode(BaseBackupCmd);
 					cmd->options = $2;
 					$$ = (Node *) cmd;
 				}
@@ -169,6 +176,11 @@ base_backup_opt:
 				  $$ = makeDefElem("max_rate",
 								   (Node *)makeInteger($2));
 				}
+			| K_TABLESPACE_MAP
+				{
+				  $$ = makeDefElem("tablespace_map",
+								   (Node *)makeInteger(TRUE));
+				}
 			| K_EXCLUDE SCONST
 				{
 				  $$ = makeDefElem("exclude",
@@ -177,13 +189,14 @@ base_backup_opt:
 			;
 
 create_replication_slot:
-			/* CREATE_REPLICATION_SLOT slot PHYSICAL */
-			K_CREATE_REPLICATION_SLOT IDENT K_PHYSICAL
+			/* CREATE_REPLICATION_SLOT slot PHYSICAL RESERVE_WAL */
+			K_CREATE_REPLICATION_SLOT IDENT K_PHYSICAL opt_reserve_wal
 				{
 					CreateReplicationSlotCmd *cmd;
 					cmd = makeNode(CreateReplicationSlotCmd);
 					cmd->kind = REPLICATION_KIND_PHYSICAL;
 					cmd->slotname = $2;
+					cmd->reserve_wal = $4;
 					$$ = (Node *) cmd;
 				}
 			/* CREATE_REPLICATION_SLOT slot LOGICAL plugin */
@@ -232,7 +245,7 @@ start_logical_replication:
 				{
 					StartReplicationCmd *cmd;
 					cmd = makeNode(StartReplicationCmd);
-					cmd->kind = REPLICATION_KIND_LOGICAL;;
+					cmd->kind = REPLICATION_KIND_LOGICAL;
 					cmd->slotname = $3;
 					cmd->startpoint = $5;
 					cmd->options = $6;
@@ -262,6 +275,11 @@ timeline_history:
 opt_physical:
 			K_PHYSICAL
 			| /* EMPTY */
+			;
+
+opt_reserve_wal:
+			K_RESERVE_WAL					{ $$ = true; }
+			| /* EMPTY */					{ $$ = false; }
 			;
 
 opt_slot:

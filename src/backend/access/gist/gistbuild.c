@@ -4,7 +4,7 @@
  *	  build algorithm for GiST indexes implementation.
  *
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -18,6 +18,7 @@
 
 #include "access/genam.h"
 #include "access/gist_private.h"
+#include "access/xloginsert.h"
 #include "catalog/index.h"
 #include "miscadmin.h"
 #include "optimizer/cost.h"
@@ -108,12 +109,9 @@ static BlockNumber gistGetParent(GISTBuildState *buildstate, BlockNumber child);
  * but switches to more efficient buffering build algorithm after a certain
  * number of tuples (unless buffering mode is disabled).
  */
-Datum
-gistbuild(PG_FUNCTION_ARGS)
+IndexBuildResult *
+gistbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 {
-	Relation	heap = (Relation) PG_GETARG_POINTER(0);
-	Relation	index = (Relation) PG_GETARG_POINTER(1);
-	IndexInfo  *indexInfo = (IndexInfo *) PG_GETARG_POINTER(2);
 	IndexBuildResult *result;
 	double		reltuples;
 	GISTBuildState buildstate;
@@ -182,14 +180,11 @@ gistbuild(PG_FUNCTION_ARGS)
 	if (RelationNeedsWAL(index))
 	{
 		XLogRecPtr	recptr;
-		XLogRecData rdata;
 
-		rdata.data = (char *) &(index->rd_node);
-		rdata.len = sizeof(RelFileNode);
-		rdata.buffer = InvalidBuffer;
-		rdata.next = NULL;
+		XLogBeginInsert();
+		XLogRegisterBuffer(0, buffer, REGBUF_WILL_INIT);
 
-		recptr = XLogInsert(RM_GIST_ID, XLOG_GIST_CREATE_INDEX, &rdata);
+		recptr = XLogInsert(RM_GIST_ID, XLOG_GIST_CREATE_INDEX);
 		PageSetLSN(page, recptr);
 	}
 	else
@@ -234,7 +229,7 @@ gistbuild(PG_FUNCTION_ARGS)
 	result->heap_tuples = reltuples;
 	result->index_tuples = (double) buildstate.indtuples;
 
-	PG_RETURN_POINTER(result);
+	return result;
 }
 
 /*
@@ -1144,12 +1139,10 @@ gistInitParentMap(GISTBuildState *buildstate)
 	hashCtl.keysize = sizeof(BlockNumber);
 	hashCtl.entrysize = sizeof(ParentMapEntry);
 	hashCtl.hcxt = CurrentMemoryContext;
-	hashCtl.hash = oid_hash;
 	buildstate->parentMap = hash_create("gistbuild parent map",
 										1024,
 										&hashCtl,
-										HASH_ELEM | HASH_CONTEXT
-										| HASH_FUNCTION);
+									  HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
 }
 
 static void

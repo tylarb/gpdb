@@ -4,7 +4,7 @@
  *	Catalog routines used by pg_dump; long ago these were shared
  *	by another dump tool, but not anymore.
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -13,12 +13,16 @@
  *
  *-------------------------------------------------------------------------
  */
+#include "postgres_fe.h"
+
 #include "pg_backup_archiver.h"
 #include "pg_backup_utils.h"
+#include "pg_dump.h"
 
 #include <ctype.h>
 
 #include "catalog/pg_class.h"
+#include "fe_utils/string_utils.h"
 
 
 /*
@@ -37,11 +41,11 @@ static int	numCatalogIds = 0;
 
 /*
  * These variables are static to avoid the notational cruft of having to pass
- * them into findTableByOid() and friends.  For each of these arrays, we
- * build a sorted-by-OID index array immediately after it's built, and then
- * we use binary search in findTableByOid() and friends.  (qsort'ing the base
- * arrays themselves would be simpler, but it doesn't work because pg_dump.c
- * may have already established pointers between items.)
+ * them into findTableByOid() and friends.  For each of these arrays, we build
+ * a sorted-by-OID index array immediately after the objects are fetched,
+ * and then we use binary search in findTableByOid() and friends.  (qsort'ing
+ * the object arrays themselves would be simpler, but it doesn't work because
+ * pg_dump.c may have already established pointers between items.)
  */
 static DumpableObject **tblinfoindex;
 static DumpableObject **typinfoindex;
@@ -50,6 +54,7 @@ static DumpableObject **oprinfoindex;
 static DumpableObject **collinfoindex;
 static DumpableObject **nspinfoindex;
 static DumpableObject **extinfoindex;
+static DumpableObject **binaryupgradeinfoindex;
 static int	numTables;
 static int	numTypes;
 static int	numFuncs;
@@ -65,7 +70,7 @@ static int	numextmembers;
 
 static void flagInhTables(TableInfo *tbinfo, int numTables,
 			  InhInfo *inhinfo, int numInherits);
-static void flagInhAttrs(TableInfo *tblinfo, int numTables);
+static void flagInhAttrs(DumpOptions *dopt, TableInfo *tblinfo, int numTables);
 static DumpableObject **buildIndexArray(void *objArray, int numObjs,
 				Size objSize);
 static int	DOCatalogIdCompare(const void *p1, const void *p2);
@@ -95,6 +100,8 @@ getSchemaData(Archive *fout, int *numTablesPtr)
 	int			numRules;
 	int			numProcLangs;
 	int			numCasts;
+	int			numTransforms;
+	int			numAccessMethods;
 	int			numOpclasses;
 	int			numOpfamilies;
 	int			numConversions;
@@ -109,6 +116,17 @@ getSchemaData(Archive *fout, int *numTablesPtr)
 
 	/* GPDB specific variables */
 	int			numExtProtocols;
+
+	if (fout->dopt->binary_upgrade)
+	{
+		BinaryUpgradeInfo *binfo;
+
+		if (g_verbose)
+			write_msg(NULL, "identifying required binary upgrade calls\n");
+
+		binfo = getBinaryUpgradeObjects();
+		binaryupgradeinfoindex = buildIndexArray(binfo, 1, sizeof(BinaryUpgradeInfo));
+	}
 
 	/*
 	 * We must read extensions and extension membership info first, because
@@ -181,6 +199,10 @@ getSchemaData(Archive *fout, int *numTablesPtr)
 	}
 
 	if (g_verbose)
+		write_msg(NULL, "reading user-defined access methods\n");
+	getAccessMethods(fout, &numAccessMethods);
+
+	if (g_verbose)
 		write_msg(NULL, "reading user-defined operator classes\n");
 	getOpclasses(fout, &numOpclasses);
 
@@ -230,6 +252,10 @@ getSchemaData(Archive *fout, int *numTablesPtr)
 	getCasts(fout, &numCasts);
 
 	if (g_verbose)
+		write_msg(NULL, "reading transforms\n");
+	getTransforms(fout, &numTransforms);
+
+	if (g_verbose)
 		write_msg(NULL, "reading table inheritance information\n");
 	inhinfo = getInherits(fout, &numInherits);
 
@@ -253,7 +279,7 @@ getSchemaData(Archive *fout, int *numTablesPtr)
 
 	if (g_verbose)
 		write_msg(NULL, "flagging inherited columns in subtables\n");
-	flagInhAttrs(tblinfo, numTables);
+	flagInhAttrs(fout->dopt, tblinfo, numTables);
 
 	if (g_verbose)
 		write_msg(NULL, "reading indexes\n");
@@ -270,6 +296,10 @@ getSchemaData(Archive *fout, int *numTablesPtr)
 	if (g_verbose)
 		write_msg(NULL, "reading rewrite rules\n");
 	getRules(fout, &numRules);
+
+	if (g_verbose)
+		write_msg(NULL, "reading policies\n");
+	getPolicies(fout, tblinfo, numTables);
 
 	*numTablesPtr = numTables;
 	return tblinfo;
@@ -299,9 +329,16 @@ flagInhTables(TableInfo *tblinfo, int numTables,
 		/* Some kinds never have parents */
 		if (tblinfo[i].relkind == RELKIND_SEQUENCE ||
 			tblinfo[i].relkind == RELKIND_VIEW ||
-			tblinfo[i].relkind == RELKIND_MATVIEW ||
-			tblinfo[i].relstorage == RELSTORAGE_EXTERNAL ||
-			tblinfo[i].relstorage == RELSTORAGE_FOREIGN)
+			tblinfo[i].relkind == RELKIND_MATVIEW)
+			continue;
+
+		/*
+		 * FIXME: In PostgreSQL, foreign tables can be inherited. But
+		 * pg_dump chokes on external tables, if an external table is
+		 * used as a partition, and a column has attislocal=false.
+		 */
+		if (tblinfo[i].relkind == RELKIND_FOREIGN_TABLE ||
+			tblinfo[i].relstorage == 'x' /* RELSTORAGE_EXTERNAL */)
 			continue;
 
 		/* Don't bother computing anything for non-target tables, either */
@@ -332,7 +369,7 @@ flagInhTables(TableInfo *tblinfo, int numTables,
  * modifies tblinfo
  */
 static void
-flagInhAttrs(TableInfo *tblinfo, int numTables)
+flagInhAttrs(DumpOptions *dopt, TableInfo *tblinfo, int numTables)
 {
 	int			i,
 				j,
@@ -347,9 +384,16 @@ flagInhAttrs(TableInfo *tblinfo, int numTables)
 		/* Some kinds never have parents */
 		if (tbinfo->relkind == RELKIND_SEQUENCE ||
 			tbinfo->relkind == RELKIND_VIEW ||
-			tbinfo->relkind == RELKIND_MATVIEW ||
-			tbinfo->relstorage == RELSTORAGE_EXTERNAL ||
-			tbinfo->relstorage == RELSTORAGE_FOREIGN)
+			tbinfo->relkind == RELKIND_MATVIEW)
+			continue;
+
+		/*
+		 * FIXME: In PostgreSQL, foreign tables can be inherited. But
+		 * pg_dump chokes on external tables, if an external table is
+		 * used as a partition, and a column has attislocal=false.
+		 */
+		if (tblinfo[i].relkind == RELKIND_FOREIGN_TABLE ||
+			tblinfo[i].relstorage == 'x' /* RELSTORAGE_EXTERNAL */)
 			continue;
 
 		/* Don't bother computing anything for non-target tables, either */
@@ -411,7 +455,7 @@ flagInhAttrs(TableInfo *tblinfo, int numTables)
 				attrDef->adef_expr = strdup("NULL");
 
 				/* Will column be dumped explicitly? */
-				if (shouldPrintColumn(tbinfo, j))
+				if (shouldPrintColumn(dopt, tbinfo, j))
 				{
 					attrDef->separate = false;
 					/* No dependency needed: NULL cannot have dependencies */
@@ -445,7 +489,7 @@ AssignDumpId(DumpableObject *dobj)
 	dobj->dumpId = ++lastDumpId;
 	dobj->name = NULL;			/* must be set later */
 	dobj->namespace = NULL;		/* may be set later */
-	dobj->dump = true;			/* default assumption */
+	dobj->dump = DUMP_COMPONENT_ALL;	/* default assumption */
 	dobj->ext_member = false;	/* default assumption */
 	dobj->dependencies = NULL;
 	dobj->nDeps = 0;
@@ -572,7 +616,7 @@ findObjectByCatalogId(CatalogId catalogId)
  *
  * Returns NULL for unknown OID
  */
-DumpableObject *
+static DumpableObject *
 findObjectByOid(Oid oid, DumpableObject **indexArray, int numObjs)
 {
 	DumpableObject **low;
@@ -994,104 +1038,4 @@ strInArray(const char *pattern, char **arr, int arr_size)
 			return i;
 	}
 	return -1;
-}
-
-
-/*
- * Support for simple list operations
- */
-
-void
-simple_oid_list_append(SimpleOidList *list, Oid val)
-{
-	SimpleOidListCell *cell;
-
-	cell = (SimpleOidListCell *) pg_malloc(sizeof(SimpleOidListCell));
-	cell->next = NULL;
-	cell->val = val;
-
-	if (list->tail)
-		list->tail->next = cell;
-	else
-		list->head = cell;
-	list->tail = cell;
-}
-
-bool
-simple_oid_list_member(SimpleOidList *list, Oid val)
-{
-	SimpleOidListCell *cell;
-
-	for (cell = list->head; cell; cell = cell->next)
-	{
-		if (cell->val == val)
-			return true;
-	}
-	return false;
-}
-
-/*
- * MPP-1890
- *
- * If the user explicitly DROP'ed a CHECK constraint on a child but it
- * still exists on the parent when they dump and restore that constraint
- * will exist on the child since it will again inherit it from the
- * parent. Therefore we look here for constraints that exist on the
- * parent but not on the child and mark them to be dropped from the
- * child after the child table is defined.
- *
- * Loop through each parent and for each parent constraint see if it
- * exists on the child as well. If it doesn't it means that the child
- * dropped it. Mark it.
- */
-void
-DetectChildConstraintDropped(TableInfo *tbinfo, PQExpBuffer q)
-{
-	TableInfo  *parent;
-	TableInfo **parents = tbinfo->parents;
-	int			j,
-				k,
-				l;
-	int			numParents = tbinfo->numParents;
-
-	for (k = 0; k < numParents; k++)
-	{
-		parent = parents[k];
-
-		/* for each CHECK constraint of this parent */
-		for (l = 0; l < parent->ncheck; l++)
-		{
-			ConstraintInfo *pconstr = &(parent->checkexprs[l]);
-			ConstraintInfo *cconstr;
-			bool		constr_on_child = false;
-
-			/* for each child CHECK constraint */
-			for (j = 0; j < tbinfo->ncheck; j++)
-			{
-				cconstr = &(tbinfo->checkexprs[j]);
-
-				if (strcmp(pconstr->dobj.name, cconstr->dobj.name) == 0)
-				{
-					/* parent constr exists on child. hence wasn't dropped */
-					constr_on_child = true;
-					break;
-				}
-
-			}
-
-			/* this parent constr is not on child, issue a DROP for it */
-			if (!constr_on_child)
-			{
-				appendPQExpBuffer(q, "ALTER TABLE %s.",
-								  fmtId(tbinfo->dobj.namespace->dobj.name));
-				appendPQExpBuffer(q, "%s ",
-								  fmtId(tbinfo->dobj.name));
-				appendPQExpBuffer(q, "DROP CONSTRAINT %s;\n",
-								  fmtId(pconstr->dobj.name));
-
-				constr_on_child = false;
-			}
-		}
-	}
-
 }

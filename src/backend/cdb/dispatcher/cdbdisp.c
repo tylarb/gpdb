@@ -1,4 +1,3 @@
-
 /*-------------------------------------------------------------------------
  *
  * cdbdisp.c
@@ -16,7 +15,6 @@
  */
 
 #include "postgres.h"
-#include <limits.h>
 
 #include "storage/ipc.h"		/* For proc_exit_inprogress */
 #include "tcop/tcopprot.h"
@@ -34,27 +32,13 @@
 
 static int numNonExtendedDispatcherState = 0;
 
-typedef struct dispatcher_handle_t
-{
-	struct CdbDispatcherState *dispatcherState;
-
-	ResourceOwner owner;	/* owner of this handle */
-	struct dispatcher_handle_t *next;
-	struct dispatcher_handle_t *prev;
-} dispatcher_handle_t;
-
-static dispatcher_handle_t *open_dispatcher_handles;
+dispatcher_handle_t *open_dispatcher_handles;
 static void cleanup_dispatcher_handle(dispatcher_handle_t *h);
 
 static dispatcher_handle_t *find_dispatcher_handle(CdbDispatcherState *ds);
 static dispatcher_handle_t *allocate_dispatcher_handle(void);
 static void destroy_dispatcher_handle(dispatcher_handle_t *h);
 static char * segmentsListToString(const char *prefix, List *segments);
-
-/*
- * default directed-dispatch parameters: don't direct anything.
- */
-CdbDispatchDirectDesc default_dispatch_direct_desc = {false, 0, {0}};
 
 static DispatcherInternalFuncs *pDispatchFuncs = &DispatcherAsyncFuncs;
 
@@ -90,19 +74,11 @@ cdbdisp_dispatchToGang(struct CdbDispatcherState *ds,
 					   struct Gang *gp,
 					   int sliceIndex)
 {
-	struct CdbDispatchResults *dispatchResults = ds->primaryResults;
-
 	Assert(Gp_role == GP_ROLE_DISPATCH);
 	Assert(gp && gp->size > 0);
-	Assert(dispatchResults && dispatchResults->resultArray);
+	Assert(ds->primaryResults && ds->primaryResults->resultArray);
 
 	(pDispatchFuncs->dispatchToGang) (ds, gp, sliceIndex);
-
-	/*
-	 * If dtmPreCommand says we need two phase commit, record those segments
-	 * who actually get involved in current global transaction
-	 */
-	addToGxactTwophaseSegments(gp);
 }
 
 /*
@@ -170,9 +146,12 @@ cdbdisp_getDispatchResults(struct CdbDispatcherState *ds, ErrorData **qeError)
 		 * likely to output the errors on NULL return, add an error message to
 		 * aid debugging.
 		 */
-		*qeError = ereport_and_return(ERROR,
-									  (errcode(ERRCODE_INTERNAL_ERROR),
-									   errmsg("no dispatcher state")));
+		if (errstart(ERROR, __FILE__, __LINE__, PG_FUNCNAME_MACRO, TEXTDOMAIN))
+			*qeError = errfinish_and_return(errcode(ERRCODE_INTERNAL_ERROR),
+											errmsg("no dispatcher state"));
+		else
+			pg_unreachable();
+
 		return NULL;
 	}
 
@@ -271,7 +250,10 @@ CdbDispatchHandleError(struct CdbDispatcherState *ds)
 		{
 			cdbdisp_getDispatchResults(ds, &error);
 			if (error != NULL)
+			{
+				FlushErrorState();
 				ReThrowError(error);
+			}
 		}
 		PG_CATCH();
 		{
@@ -312,8 +294,11 @@ cdbdisp_makeDispatcherState(bool isExtendedQuery)
 	}
 
 	handle = allocate_dispatcher_handle();
-	handle->dispatcherState->destroyGang = false;
+	handle->dispatcherState->forceDestroyGang = false;
 	handle->dispatcherState->isExtendedQuery = isExtendedQuery;
+#ifdef USE_ASSERT_CHECKING
+	handle->dispatcherState->isGangDestroying = false;
+#endif
 	handle->dispatcherState->allocatedGangs = NIL;
 	handle->dispatcherState->largestGangSize = 0;
 
@@ -353,6 +338,11 @@ cdbdisp_destroyDispatcherState(CdbDispatcherState *ds)
 
 	if (!ds)
 		return;
+#ifdef USE_ASSERT_CHECKING
+	/* Disallow reentrance. */
+	Assert (!ds->isGangDestroying);
+	ds->isGangDestroying = true;
+#endif
 
 	if (!ds->isExtendedQuery)
 	{
@@ -374,12 +364,17 @@ cdbdisp_destroyDispatcherState(CdbDispatcherState *ds)
 		results->resultArray = NULL;
 	}
 
-	/* Recycle or destroy gang accordingly */
+	/*
+	 * Recycle or destroy gang accordingly.
+	 *
+	 * We must recycle them in the reverse order of AllocateGang() to restore
+	 * the original order of the idle gangs.
+	 */
 	foreach(lc, ds->allocatedGangs)
 	{
 		Gang *gp = lfirst(lc);
 
-		RecycleGang(gp, ds->destroyGang);
+		RecycleGang(gp, ds->forceDestroyGang);
 	}
 
 	ds->allocatedGangs = NIL;
@@ -527,10 +522,7 @@ AtAbort_DispatcherState(void)
 	 * reset session and drop temp files
 	 */
 	if (currentGxactWriterGangLost())
-	{
-		DisconnectAndDestroyAllGangs(true);
-		CheckForResetSession();
-	}
+		ResetAllGangs();
 }
 
 void
@@ -564,28 +556,6 @@ cdbdisp_cleanupDispatcherHandle(const struct ResourceOwnerData *owner)
 		{
 			cleanup_dispatcher_handle(curr);
 		}
-	}
-}
-
-/*
- * Called by CdbDispatchSetCommand(), SET command can not be dispatched
- * to named portal (like CURSOR). On the one hand, it might be in a busy
- * status, on the other hand, SET command should not affect running CURSOR
- * like 'search_path' etc; 
- *
- * Meanwhile when a dispatcher state of named portal is destroyed, its
- * gang should not be recycled because its guc was not set, so need to
- * mark those gangs destroyed when dispatcher state is destroyed.
- */
-void
-cdbdisp_markNamedPortalGangsDestroyed(void)
-{
-	dispatcher_handle_t *head = open_dispatcher_handles;
-	while (head != NULL)
-	{
-		if (!head->dispatcherState->isExtendedQuery)
-			head->dispatcherState->destroyGang = true;
-		head = head->next;
 	}
 }
 

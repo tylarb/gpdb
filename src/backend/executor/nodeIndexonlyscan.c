@@ -3,7 +3,7 @@
  * nodeIndexonlyscan.c
  *	  Routines to support index-only scans
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -85,9 +85,9 @@ IndexOnlyNext(IndexOnlyScanState *node)
 		 * which all tuples are known visible to everybody.  In any case,
 		 * we'll use the index tuple not the heap tuple as the data source.
 		 *
-		 * Note on Memory Ordering Effects: visibilitymap_test does not lock
-		 * the visibility map buffer, and therefore the result we read here
-		 * could be slightly stale.  However, it can't be stale enough to
+		 * Note on Memory Ordering Effects: visibilitymap_get_status does not
+		 * lock the visibility map buffer, and therefore the result we read
+		 * here could be slightly stale.  However, it can't be stale enough to
 		 * matter.
 		 *
 		 * We need to detect clearing a VM bit due to an insert right away,
@@ -106,17 +106,17 @@ IndexOnlyNext(IndexOnlyScanState *node)
 		 * away, because the tuple is still visible until the deleting
 		 * transaction commits or the statement ends (if it's our
 		 * transaction). In either case, the lock on the VM buffer will have
-		 * been released (acting as a write barrier) after clearing the
-		 * bit. And for us to have a snapshot that includes the deleting
+		 * been released (acting as a write barrier) after clearing the bit.
+		 * And for us to have a snapshot that includes the deleting
 		 * transaction (making the tuple invisible), we must have acquired
 		 * ProcArrayLock after that time, acting as a read barrier.
 		 *
 		 * It's worth going through this complexity to avoid needing to lock
 		 * the VM buffer, which could cause significant contention.
 		 */
-		if (!visibilitymap_test(scandesc->heapRelation,
-								ItemPointerGetBlockNumber(tid),
-								&node->ioss_VMBuffer))
+		if (!VM_ALL_VISIBLE(scandesc->heapRelation,
+							ItemPointerGetBlockNumber(tid),
+							&node->ioss_VMBuffer))
 		{
 			/*
 			 * Rats, we have to visit the heap to check visibility.
@@ -164,6 +164,19 @@ IndexOnlyNext(IndexOnlyScanState *node)
 				continue;
 			}
 		}
+
+		/*
+		 * We don't currently support rechecking ORDER BY distances.  (In
+		 * principle, if the index can support retrieval of the originally
+		 * indexed value, it should be able to produce an exact distance
+		 * calculation too.  So it's not clear that adding code here for
+		 * recheck/re-sort would be worth the trouble.  But we should at least
+		 * throw an error if someone tries it.)
+		 */
+		if (scandesc->numberOfOrderBys > 0 && scandesc->xs_recheckorderby)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("lossy distance functions are not supported in index-only scans")));
 
 		/*
 		 * Predicate locks for index-only scans must be acquired at the page
@@ -441,10 +454,12 @@ ExecInitIndexOnlyScan(IndexOnlyScan *node, EState *estate, int eflags)
 	ExecAssignScanType(&indexstate->ss, tupDesc);
 
 	/*
-	 * Initialize result tuple type and projection info.
+	 * Initialize result tuple type and projection info.  The node's
+	 * targetlist will contain Vars with varno = INDEX_VAR, referencing the
+	 * scan tuple.
 	 */
 	ExecAssignResultTypeFromTL(&indexstate->ss.ps);
-	ExecAssignScanProjectionInfo(&indexstate->ss);
+	ExecAssignScanProjectionInfoWithVarno(&indexstate->ss, INDEX_VAR);
 
 	/*
 	 * If we are just doing EXPLAIN (ie, aren't going to run the plan), stop

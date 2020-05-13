@@ -4,7 +4,7 @@
  *	  Display type names "nicely".
  *
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -21,8 +21,6 @@
 #include "catalog/namespace.h"
 #include "catalog/pg_type.h"
 #include "utils/builtins.h"
-#include "utils/datetime.h"
-#include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
 #include "utils/numeric.h"
 #include "utils/syscache.h"
@@ -98,6 +96,10 @@ format_type_be(Oid type_oid)
 	return format_type_internal(type_oid, -1, false, false, false);
 }
 
+/*
+ * This version returns a name that is always qualified (unless it's one
+ * of the SQL-keyword type names, such as TIMESTAMP WITH TIME ZONE).
+ */
 char *
 format_type_be_qualified(Oid type_oid)
 {
@@ -113,6 +115,19 @@ format_type_with_typemod(Oid type_oid, int32 typemod)
 	return format_type_internal(type_oid, typemod, true, false, false);
 }
 
+/*
+ * This version allows a nondefault typemod to be specified, and forces
+ * qualification of normal type names.
+ */
+char *
+format_type_with_typemod_qualified(Oid type_oid, int32 typemod)
+{
+	return format_type_internal(type_oid, typemod, true, false, true);
+}
+
+/*
+ * Common workhorse.
+ */
 static char *
 format_type_internal(Oid type_oid, int32 typemod,
 					 bool typemod_given, bool allow_invalid,
@@ -307,7 +322,7 @@ format_type_internal(Oid type_oid, int32 typemod,
 		if (!force_qualify && TypeIsVisible(type_oid))
 			nspname = NULL;
 		else
-			nspname = get_namespace_name(typeform->typnamespace);
+			nspname = get_namespace_name_or_temp(typeform->typnamespace);
 
 		typname = NameStr(typeform->typname);
 

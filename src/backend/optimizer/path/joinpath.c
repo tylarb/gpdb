@@ -5,7 +5,7 @@
  *
  * Portions Copyright (c) 2005-2008, Greenplum inc
  * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -19,38 +19,38 @@
 #include <math.h>
 
 #include "executor/executor.h"
+#include "foreign/fdwapi.h"
 #include "optimizer/cost.h"
 #include "optimizer/pathnode.h"
 #include "optimizer/paths.h"
 #include "optimizer/planmain.h"
+#include "optimizer/tlist.h"
+#include "utils/lsyscache.h"
 
 #include "executor/nodeHash.h"                  /* ExecHashRowSize() */
 #include "cdb/cdbpath.h"                        /* cdbpath_rows() */
 
+/* Hook for plugins to get control in add_paths_to_joinrel() */
+set_join_pathlist_hook_type set_join_pathlist_hook = NULL;
 
 #define PATH_PARAM_BY_REL(path, rel)  \
 	((path)->param_info && bms_overlap(PATH_REQ_OUTER(path), (rel)->relids))
 
 static void sort_inner_and_outer(PlannerInfo *root, RelOptInfo *joinrel,
 					 RelOptInfo *outerrel, RelOptInfo *innerrel,
-					 List *restrictlist, List *redistribution_clauses,
-					 List *mergeclause_list,
-					 JoinType jointype, SpecialJoinInfo *sjinfo,
-					 Relids param_source_rels, Relids extra_lateral_rels);
+					 JoinType jointype, JoinPathExtraData *extra);
 static void match_unsorted_outer(PlannerInfo *root, RelOptInfo *joinrel,
 					 RelOptInfo *outerrel, RelOptInfo *innerrel,
-					 List *restrictlist, List *redistribution_clauses,
-					 List *mergeclause_list,
-					 JoinType jointype, SpecialJoinInfo *sjinfo,
-					 SemiAntiJoinFactors *semifactors,
-					 Relids param_source_rels, Relids extra_lateral_rels);
+					 JoinType jointype, JoinPathExtraData *extra);
+static void consider_parallel_nestloop(PlannerInfo *root,
+						   RelOptInfo *joinrel,
+						   RelOptInfo *outerrel,
+						   RelOptInfo *innerrel,
+						   JoinType jointype,
+						   JoinPathExtraData *extra);
 static void hash_inner_and_outer(PlannerInfo *root, RelOptInfo *joinrel,
 					 RelOptInfo *outerrel, RelOptInfo *innerrel,
-					 List *restrictlist,
-					 JoinType jointype, SpecialJoinInfo *sjinfo,
-					 SemiAntiJoinFactors *semifactors,
-					 Relids param_source_rels, Relids extra_lateral_rels,
-					 List *redistribution_clauses /*CDB*/);
+					 JoinType jointype, JoinPathExtraData *extra);
 static List *select_mergejoin_clauses(PlannerInfo *root,
 						 RelOptInfo *joinrel,
 						 RelOptInfo *outerrel,
@@ -97,22 +97,36 @@ add_paths_to_joinrel(PlannerInfo *root,
 					 SpecialJoinInfo *sjinfo,
 					 List *restrictlist)
 {
-	List	   *mergeclause_list = NIL;
-	List	   *redistribution_clauses = NIL;
+	JoinPathExtraData extra;
 	bool		mergejoin_allowed = true;
-	SemiAntiJoinFactors semifactors;
-	Relids		param_source_rels = NULL;
-	Relids		extra_lateral_rels = NULL;
 	ListCell   *lc;
 
-    Assert(outerrel->pathlist &&
-           outerrel->cheapest_total_path);
-    Assert(innerrel->pathlist &&
-           innerrel->cheapest_total_path);
+	extra.restrictlist = restrictlist;
+	extra.mergeclause_list = NIL;
+	extra.sjinfo = sjinfo;
+	extra.param_source_rels = NULL;
+	extra.redistribution_clauses = NIL;
 
-	/* Don't consider paths that have WorkTableScan as inner rel */
+	Assert(outerrel->pathlist &&
+		   outerrel->cheapest_total_path);
+	Assert(innerrel->pathlist &&
+		   innerrel->cheapest_total_path);
+
+	/*
+	 * Don't consider paths that have WorkTableScan as inner rel. If the outer
+	 * rel has a WorkTableScan as well, we won't be able to produce a usable
+	 * join so we need to error out.  This case can happen when to RECURSIVE
+	 * clauses are joined. RECURSIVE_CTE_FIXME: Revisit this when we gain
+	 * rescannable motions.
+	 */
 	if (innerrel->cheapest_startup_path && cdbpath_contains_wts(innerrel->cheapest_startup_path))
+	{
+		if (outerrel->cheapest_startup_path && cdbpath_contains_wts(outerrel->cheapest_startup_path))
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("joining nested RECURSIVE clauses is not supported")));
 		return;
+	}
 	if (cdbpath_contains_wts(innerrel->cheapest_total_path))
 		return;
 
@@ -124,7 +138,7 @@ add_paths_to_joinrel(PlannerInfo *root,
 	 *
 	 * CDB: Always build mergeclause_list.  We need it for motion planning.
 	 */
-	redistribution_clauses = select_cdb_redistribute_clauses(root,
+	extra.redistribution_clauses = select_cdb_redistribute_clauses(root,
 															 joinrel,
 															 outerrel,
 															 innerrel,
@@ -138,18 +152,19 @@ add_paths_to_joinrel(PlannerInfo *root,
 	if (jointype == JOIN_SEMI || jointype == JOIN_ANTI)
 		compute_semi_anti_join_factors(root, outerrel, innerrel,
 									   jointype, sjinfo, restrictlist,
-									   &semifactors);
+									   &extra.semifactors);
 
 	/*
 	 * Decide whether it's sensible to generate parameterized paths for this
 	 * joinrel, and if so, which relations such paths should require.  There
-	 * is no need to create a parameterized result path unless there is a join
-	 * order restriction that prevents joining one of our input rels directly
-	 * to the parameter source rel instead of joining to the other input rel.
-	 * This restriction reduces the number of parameterized paths we have to
-	 * deal with at higher join levels, without compromising the quality of
-	 * the resulting plan.  We express the restriction as a Relids set that
-	 * must overlap the parameterization of any proposed join path.
+	 * is usually no need to create a parameterized result path unless there
+	 * is a join order restriction that prevents joining one of our input rels
+	 * directly to the parameter source rel instead of joining to the other
+	 * input rel.  (But see allow_star_schema_join().)	This restriction
+	 * reduces the number of parameterized paths we have to deal with at
+	 * higher join levels, without compromising the quality of the resulting
+	 * plan.  We express the restriction as a Relids set that must overlap the
+	 * parameterization of any proposed join path.
 	 */
 	foreach(lc, root->join_info_list)
 	{
@@ -164,91 +179,43 @@ add_paths_to_joinrel(PlannerInfo *root,
 		 */
 		if (bms_overlap(joinrel->relids, sjinfo->min_righthand) &&
 			!bms_overlap(joinrel->relids, sjinfo->min_lefthand))
-			param_source_rels = bms_join(param_source_rels,
-										 bms_difference(root->all_baserels,
+			extra.param_source_rels = bms_join(extra.param_source_rels,
+										   bms_difference(root->all_baserels,
 													 sjinfo->min_righthand));
 
 		/* full joins constrain both sides symmetrically */
 		if (sjinfo->jointype == JOIN_FULL &&
 			bms_overlap(joinrel->relids, sjinfo->min_lefthand) &&
 			!bms_overlap(joinrel->relids, sjinfo->min_righthand))
-			param_source_rels = bms_join(param_source_rels,
-										 bms_difference(root->all_baserels,
+			extra.param_source_rels = bms_join(extra.param_source_rels,
+										   bms_difference(root->all_baserels,
 													  sjinfo->min_lefthand));
 	}
 
 	/*
-	 * However, when a LATERAL subquery is involved, we have to be a bit
-	 * laxer, because there will simply not be any paths for the joinrel that
-	 * aren't parameterized by whatever the subquery is parameterized by,
-	 * unless its parameterization is resolved within the joinrel.  Hence, add
-	 * to param_source_rels anything that is laterally referenced in either
-	 * input and is not in the join already.
+	 * However, when a LATERAL subquery is involved, there will simply not be
+	 * any paths for the joinrel that aren't parameterized by whatever the
+	 * subquery is parameterized by, unless its parameterization is resolved
+	 * within the joinrel.  So we might as well allow additional dependencies
+	 * on whatever residual lateral dependencies the joinrel will have.
 	 */
-	foreach(lc, root->lateral_info_list)
-	{
-		LateralJoinInfo *ljinfo = (LateralJoinInfo *) lfirst(lc);
-
-		if (bms_is_subset(ljinfo->lateral_rhs, joinrel->relids))
-			param_source_rels = bms_join(param_source_rels,
-										 bms_difference(ljinfo->lateral_lhs,
-														joinrel->relids));
-	}
-
-	/*
-	 * Another issue created by LATERAL references is that PlaceHolderVars
-	 * that need to be computed at this join level might contain lateral
-	 * references to rels not in the join, meaning that the paths for the join
-	 * would need to be marked as parameterized by those rels, independently
-	 * of all other considerations.  Set extra_lateral_rels to the set of such
-	 * rels.  This will not affect our decisions as to which paths to
-	 * generate; we merely add these rels to their required_outer sets.
-	 */
-	foreach(lc, root->placeholder_list)
-	{
-		PlaceHolderInfo *phinfo = (PlaceHolderInfo *) lfirst(lc);
-
-		/* PHVs without lateral refs can be skipped over quickly */
-		if (phinfo->ph_lateral == NULL)
-			continue;
-		/* Is it due to be evaluated at this join, and not in either input? */
-		if (bms_is_subset(phinfo->ph_eval_at, joinrel->relids) &&
-			!bms_is_subset(phinfo->ph_eval_at, outerrel->relids) &&
-			!bms_is_subset(phinfo->ph_eval_at, innerrel->relids))
-		{
-			/* Yes, remember its lateral rels */
-			extra_lateral_rels = bms_add_members(extra_lateral_rels,
-												 phinfo->ph_lateral);
-		}
-	}
-
-	/*
-	 * Make sure extra_lateral_rels doesn't list anything within the join, and
-	 * that it's NULL if empty.  (This allows us to use bms_add_members to add
-	 * it to required_outer below, while preserving the property that
-	 * required_outer is exactly NULL if empty.)
-	 */
-	extra_lateral_rels = bms_del_members(extra_lateral_rels, joinrel->relids);
-	if (bms_is_empty(extra_lateral_rels))
-		extra_lateral_rels = NULL;
+	extra.param_source_rels = bms_add_members(extra.param_source_rels,
+											  joinrel->lateral_relids);
 
 	/*
 	 * 1. Consider mergejoin paths where both relations must be explicitly
 	 * sorted.  Skip this if we can't mergejoin.
 	 */
-	mergeclause_list = select_mergejoin_clauses(root,
-												joinrel,
-												outerrel,
-												innerrel,
-												restrictlist,
-												jointype,
-												&mergejoin_allowed);
+	extra.mergeclause_list = select_mergejoin_clauses(root,
+													  joinrel,
+													  outerrel,
+													  innerrel,
+													  restrictlist,
+													  jointype,
+													  &mergejoin_allowed);
 	if (mergejoin_allowed && jointype != JOIN_LASJ_NOTIN)
 		sort_inner_and_outer(root, joinrel, outerrel, innerrel,
-							 restrictlist, redistribution_clauses,
-							 mergeclause_list, jointype,
-							 sjinfo,
-							 param_source_rels, extra_lateral_rels);
+							 jointype, &extra);
 
 	/*
 	 * 2. Consider paths where the outer relation need not be explicitly
@@ -259,10 +226,7 @@ add_paths_to_joinrel(PlannerInfo *root,
 	 */
 	if (mergejoin_allowed)
 		match_unsorted_outer(root, joinrel, outerrel, innerrel,
-							 restrictlist, redistribution_clauses,
-							 mergeclause_list, jointype,
-							 sjinfo, &semifactors,
-							 param_source_rels, extra_lateral_rels);
+							 jointype, &extra);
 
 #ifdef NOT_USED
 
@@ -279,27 +243,66 @@ add_paths_to_joinrel(PlannerInfo *root,
 	 */
 	if (mergejoin_allowed)
 		match_unsorted_inner(root, joinrel, outerrel, innerrel,
-							 restrictlist, redistribution_clauses,
-							 mergeclause_list, jointype,
-							 sjinfo, &semifactors,
-							 param_source_rels, extra_lateral_rels);
+							 jointype, &extra);
 #endif
 
 	/*
 	 * 4. Consider paths where both outer and inner relations must be hashed
 	 * before being joined.  As above, disregard enable_hashjoin for full
 	 * joins, because there may be no other alternative.
-     *
-	 * We consider both the cheapest-total-cost and cheapest-startup-cost
-	 * outer paths.  There's no need to consider any but the
-	 * cheapest-total-cost inner path, however.
 	 */
-	if (root->config->enable_hashjoin || jointype == JOIN_FULL)
+	if (enable_hashjoin || jointype == JOIN_FULL)
 		hash_inner_and_outer(root, joinrel, outerrel, innerrel,
-							 restrictlist, jointype,
-							 sjinfo, &semifactors,
-							 param_source_rels, extra_lateral_rels,
-							 redistribution_clauses);
+							 jointype, &extra);
+
+	/*
+	 * 5. If inner and outer relations are foreign tables (or joins) belonging
+	 * to the same server and assigned to the same user to check access
+	 * permissions as, give the FDW a chance to push down joins.
+	 */
+	if (joinrel->fdwroutine &&
+		joinrel->fdwroutine->GetForeignJoinPaths)
+		joinrel->fdwroutine->GetForeignJoinPaths(root, joinrel,
+												 outerrel, innerrel,
+												 jointype, &extra);
+
+	/*
+	 * 6. Finally, give extensions a chance to manipulate the path list.
+	 */
+	if (set_join_pathlist_hook)
+		set_join_pathlist_hook(root, joinrel, outerrel, innerrel,
+							   jointype, &extra);
+}
+
+/*
+ * We override the param_source_rels heuristic to accept nestloop paths in
+ * which the outer rel satisfies some but not all of the inner path's
+ * parameterization.  This is necessary to get good plans for star-schema
+ * scenarios, in which a parameterized path for a large table may require
+ * parameters from multiple small tables that will not get joined directly to
+ * each other.  We can handle that by stacking nestloops that have the small
+ * tables on the outside; but this breaks the rule the param_source_rels
+ * heuristic is based on, namely that parameters should not be passed down
+ * across joins unless there's a join-order-constraint-based reason to do so.
+ * So we ignore the param_source_rels restriction when this case applies.
+ *
+ * allow_star_schema_join() returns TRUE if the param_source_rels restriction
+ * should be overridden, ie, it's okay to perform this join.
+ */
+static inline bool
+allow_star_schema_join(PlannerInfo *root,
+					   Path *outer_path,
+					   Path *inner_path)
+{
+	Relids		innerparams = PATH_REQ_OUTER(inner_path);
+	Relids		outerrelids = outer_path->parent->relids;
+
+	/*
+	 * It's a star-schema case if the outer rel provides some but not all of
+	 * the inner rel's parameterization.
+	 */
+	return (bms_overlap(innerparams, outerrelids) &&
+			bms_nonempty_difference(innerparams, outerrelids));
 }
 
 /*
@@ -310,40 +313,36 @@ add_paths_to_joinrel(PlannerInfo *root,
 static void
 try_nestloop_path(PlannerInfo *root,
 				  RelOptInfo *joinrel,
-				  JoinType orig_jointype,	/* CDB */
-				  JoinType jointype,
-				  SpecialJoinInfo *sjinfo,
-				  SemiAntiJoinFactors *semifactors,
-				  Relids param_source_rels,
-				  Relids extra_lateral_rels,
 				  Path *outer_path,
 				  Path *inner_path,
-				  List *restrict_clauses,
-				  List *redistribution_clauses,    /*CDB*/
-				  List *pathkeys)
+				  List *pathkeys,
+				  JoinType jointype,
+				  JoinType orig_jointype,	/* CDB */
+				  JoinPathExtraData *extra)
 {
 	Relids		required_outer;
 	JoinCostWorkspace workspace;
 
 	/*
 	 * Check to see if proposed path is still parameterized, and reject if the
-	 * parameterization wouldn't be sensible.
+	 * parameterization wouldn't be sensible --- unless allow_star_schema_join
+	 * says to allow it anyway.  Also, we must reject if have_dangerous_phv
+	 * doesn't like the look of it, which could only happen if the nestloop is
+	 * still parameterized.
 	 */
 	required_outer = calc_nestloop_required_outer(outer_path,
 												  inner_path);
 	if (required_outer &&
-		!bms_overlap(required_outer, param_source_rels))
+		((!bms_overlap(required_outer, extra->param_source_rels) &&
+		  !allow_star_schema_join(root, outer_path, inner_path)) ||
+		 have_dangerous_phv(root,
+							outer_path->parent->relids,
+							PATH_REQ_OUTER(inner_path))))
 	{
 		/* Waste no memory when we reject a path here */
 		bms_free(required_outer);
 		return;
 	}
-
-	/*
-	 * Independently of that, add parameterization needed for any
-	 * PlaceHolderVars that need to be computed at the join.
-	 */
-	required_outer = bms_add_members(required_outer, extra_lateral_rels);
 
 	/*
 	 * Do a precheck to quickly eliminate obviously-inferior paths.  We
@@ -356,23 +355,24 @@ try_nestloop_path(PlannerInfo *root,
 	 */
 	initial_cost_nestloop(root, &workspace, jointype,
 						  outer_path, inner_path,
-						  sjinfo, semifactors);
+						  extra->sjinfo, &extra->semifactors);
 
 	if (add_path_precheck(joinrel,
 						  workspace.startup_cost, workspace.total_cost,
 						  pathkeys, required_outer))
 	{
-		cdb_add_join_path(root, joinrel, orig_jointype, required_outer, (JoinPath *)
+		add_path(joinrel, (Path *)
 				 create_nestloop_path(root,
 									  joinrel,
 									  jointype,
+									  orig_jointype,
 									  &workspace,
-									  sjinfo,
-									  semifactors,
+									  extra->sjinfo,
+									  &extra->semifactors,
 									  outer_path,
 									  inner_path,
-									  restrict_clauses,
-									  redistribution_clauses,
+									  extra->restrictlist,
+									  extra->redistribution_clauses,
 									  pathkeys,
 									  required_outer));
 	}
@@ -384,6 +384,65 @@ try_nestloop_path(PlannerInfo *root,
 }
 
 /*
+ * try_partial_nestloop_path
+ *	  Consider a partial nestloop join path; if it appears useful, push it into
+ *	  the joinrel's partial_pathlist via add_partial_path().
+ */
+static void
+try_partial_nestloop_path(PlannerInfo *root,
+						  RelOptInfo *joinrel,
+						  Path *outer_path,
+						  Path *inner_path,
+						  List *pathkeys,
+						  JoinType jointype,
+						  JoinType orig_jointype,
+						  JoinPathExtraData *extra)
+{
+	JoinCostWorkspace workspace;
+
+	/*
+	 * If the inner path is parameterized, the parameterization must be fully
+	 * satisfied by the proposed outer path.  Parameterized partial paths are
+	 * not supported.  The caller should already have verified that no
+	 * extra_lateral_rels are required here.
+	 */
+	Assert(bms_is_empty(joinrel->lateral_relids));
+	if (inner_path->param_info != NULL)
+	{
+		Relids		inner_paramrels = inner_path->param_info->ppi_req_outer;
+
+		if (!bms_is_subset(inner_paramrels, outer_path->parent->relids))
+			return;
+	}
+
+	/*
+	 * Before creating a path, get a quick lower bound on what it is likely to
+	 * cost.  Bail out right away if it looks terrible.
+	 */
+	initial_cost_nestloop(root, &workspace, jointype,
+						  outer_path, inner_path,
+						  extra->sjinfo, &extra->semifactors);
+	if (!add_partial_path_precheck(joinrel, workspace.total_cost, pathkeys))
+		return;
+
+	/* Might be good enough to be worth trying, so let's try it. */
+	add_partial_path(joinrel, (Path *)
+					 create_nestloop_path(root,
+										  joinrel,
+										  jointype,
+										  orig_jointype,
+										  &workspace,
+										  extra->sjinfo,
+										  &extra->semifactors,
+										  outer_path,
+										  inner_path,
+										  extra->restrictlist,
+										  extra->redistribution_clauses,
+										  pathkeys,
+										  NULL));
+}
+
+/*
  * try_mergejoin_path
  *	  Consider a merge join path; if it appears useful, push it into
  *	  the joinrel's pathlist via add_path().
@@ -391,19 +450,15 @@ try_nestloop_path(PlannerInfo *root,
 static void
 try_mergejoin_path(PlannerInfo *root,
 				   RelOptInfo *joinrel,
-				   JoinType orig_jointype,
-				   JoinType jointype,
-				   SpecialJoinInfo *sjinfo,
-				   Relids param_source_rels,
-				   Relids extra_lateral_rels,
 				   Path *outer_path,
 				   Path *inner_path,
-				   List *restrict_clauses,
 				   List *pathkeys,
 				   List *mergeclauses,
-				   List *redistribution_clauses,
 				   List *outersortkeys,
-				   List *innersortkeys)
+				   List *innersortkeys,
+				   JoinType jointype,
+				   JoinType orig_jointype,
+				   JoinPathExtraData *extra)
 {
 	Relids		required_outer;
 	JoinCostWorkspace workspace;
@@ -415,18 +470,12 @@ try_mergejoin_path(PlannerInfo *root,
 	required_outer = calc_non_nestloop_required_outer(outer_path,
 													  inner_path);
 	if (required_outer &&
-		!bms_overlap(required_outer, param_source_rels))
+		!bms_overlap(required_outer, extra->param_source_rels))
 	{
 		/* Waste no memory when we reject a path here */
 		bms_free(required_outer);
 		return;
 	}
-
-	/*
-	 * Independently of that, add parameterization needed for any
-	 * PlaceHolderVars that need to be computed at the join.
-	 */
-	required_outer = bms_add_members(required_outer, extra_lateral_rels);
 
 	/*
 	 * If the given paths are already well enough ordered, we can skip doing
@@ -445,25 +494,26 @@ try_mergejoin_path(PlannerInfo *root,
 	initial_cost_mergejoin(root, &workspace, jointype, mergeclauses,
 						   outer_path, inner_path,
 						   outersortkeys, innersortkeys,
-						   sjinfo);
+						   extra->sjinfo);
 
 	if (add_path_precheck(joinrel,
 						  workspace.startup_cost, workspace.total_cost,
 						  pathkeys, required_outer))
 	{
-		cdb_add_join_path(root, joinrel, orig_jointype, required_outer, (JoinPath *)
+		add_path(joinrel, (Path *)
 				 create_mergejoin_path(root,
 									   joinrel,
 									   jointype,
+									   orig_jointype,
 									   &workspace,
-									   sjinfo,
+									   extra->sjinfo,
 									   outer_path,
 									   inner_path,
-									   restrict_clauses,
+									   extra->restrictlist,
 									   pathkeys,
 									   required_outer,
 									   mergeclauses,
-									   redistribution_clauses,
+									   extra->redistribution_clauses,
 									   outersortkeys,
 									   innersortkeys));
 	}
@@ -482,17 +532,12 @@ try_mergejoin_path(PlannerInfo *root,
 static void
 try_hashjoin_path(PlannerInfo *root,
 				  RelOptInfo *joinrel,
-				  JoinType orig_jointype,
-				  JoinType jointype,
-				  SpecialJoinInfo *sjinfo,
-				  SemiAntiJoinFactors *semifactors,
-				  Relids param_source_rels,
-				  Relids extra_lateral_rels,
 				  Path *outer_path,
 				  Path *inner_path,
-				  List *restrict_clauses,
-				  List *redistribution_clauses,    /*CDB*/
-				  List *hashclauses)
+				  List *hashclauses,
+				  JoinType jointype,
+				  JoinType orig_jointype,
+				  JoinPathExtraData *extra)
 {
 	Relids		required_outer;
 	JoinCostWorkspace workspace;
@@ -504,7 +549,7 @@ try_hashjoin_path(PlannerInfo *root,
 	required_outer = calc_non_nestloop_required_outer(outer_path,
 													  inner_path);
 	if (required_outer &&
-		!bms_overlap(required_outer, param_source_rels))
+		!bms_overlap(required_outer, extra->param_source_rels))
 	{
 		/* Waste no memory when we reject a path here */
 		bms_free(required_outer);
@@ -512,35 +557,30 @@ try_hashjoin_path(PlannerInfo *root,
 	}
 
 	/*
-	 * Independently of that, add parameterization needed for any
-	 * PlaceHolderVars that need to be computed at the join.
-	 */
-	required_outer = bms_add_members(required_outer, extra_lateral_rels);
-
-	/*
 	 * See comments in try_nestloop_path().  Also note that hashjoin paths
 	 * never have any output pathkeys, per comments in create_hashjoin_path.
 	 */
 	initial_cost_hashjoin(root, &workspace, jointype, hashclauses,
 						  outer_path, inner_path,
-						  sjinfo, semifactors);
+						  extra->sjinfo, &extra->semifactors);
 
 	if (add_path_precheck(joinrel,
 						  workspace.startup_cost, workspace.total_cost,
 						  NIL, required_outer))
 	{
-		cdb_add_join_path(root, joinrel, orig_jointype, required_outer, (JoinPath *)
+		add_path(joinrel, (Path *)
 				 create_hashjoin_path(root,
 									  joinrel,
 									  jointype,
+									  orig_jointype,
 									  &workspace,
-									  sjinfo,
-									  semifactors,
+									  extra->sjinfo,
+									  &extra->semifactors,
 									  outer_path,
 									  inner_path,
-									  restrict_clauses,
+									  extra->restrictlist,
 									  required_outer,
-									  redistribution_clauses,
+									  extra->redistribution_clauses,
 									  hashclauses));
 	}
 	else
@@ -548,6 +588,65 @@ try_hashjoin_path(PlannerInfo *root,
 		/* Waste no memory when we reject a path here */
 		bms_free(required_outer);
 	}
+}
+
+/*
+ * try_partial_hashjoin_path
+ *	  Consider a partial hashjoin join path; if it appears useful, push it into
+ *	  the joinrel's partial_pathlist via add_partial_path().
+ */
+static void
+try_partial_hashjoin_path(PlannerInfo *root,
+						  RelOptInfo *joinrel,
+						  Path *outer_path,
+						  Path *inner_path,
+						  List *hashclauses,
+						  JoinType jointype,
+						  JoinType orig_jointype,
+						  JoinPathExtraData *extra)
+{
+	JoinCostWorkspace workspace;
+
+	/*
+	 * If the inner path is parameterized, the parameterization must be fully
+	 * satisfied by the proposed outer path.  Parameterized partial paths are
+	 * not supported.  The caller should already have verified that no
+	 * extra_lateral_rels are required here.
+	 */
+	Assert(bms_is_empty(joinrel->lateral_relids));
+	if (inner_path->param_info != NULL)
+	{
+		Relids		inner_paramrels = inner_path->param_info->ppi_req_outer;
+
+		if (!bms_is_empty(inner_paramrels))
+			return;
+	}
+
+	/*
+	 * Before creating a path, get a quick lower bound on what it is likely to
+	 * cost.  Bail out right away if it looks terrible.
+	 */
+	initial_cost_hashjoin(root, &workspace, jointype, hashclauses,
+						  outer_path, inner_path,
+						  extra->sjinfo, &extra->semifactors);
+	if (!add_partial_path_precheck(joinrel, workspace.total_cost, NIL))
+		return;
+
+	/* Might be good enough to be worth trying, so let's try it. */
+	add_partial_path(joinrel, (Path *)
+					 create_hashjoin_path(root,
+										  joinrel,
+										  jointype,
+										  orig_jointype,
+										  &workspace,
+										  extra->sjinfo,
+										  &extra->semifactors,
+										  outer_path,
+										  inner_path,
+										  extra->restrictlist,
+										  NULL,
+										  extra->redistribution_clauses,
+										  hashclauses));
 }
 
 /*
@@ -589,27 +688,16 @@ clause_sides_match_join(RestrictInfo *rinfo, RelOptInfo *outerrel,
  * 'joinrel' is the join relation
  * 'outerrel' is the outer join relation
  * 'innerrel' is the inner join relation
- * 'restrictlist' contains all of the RestrictInfo nodes for restriction
- *		clauses that apply to this join
- * 'mergeclause_list' is a list of RestrictInfo nodes for available
- *		mergejoin clauses in this join
  * 'jointype' is the type of join to do
- * 'sjinfo' is extra info about the join for selectivity estimation
- * 'param_source_rels' are OK targets for parameterization of result paths
- * 'extra_lateral_rels' are additional parameterization for result paths
+ * 'extra' contains additional input values
  */
 static void
 sort_inner_and_outer(PlannerInfo *root,
 					 RelOptInfo *joinrel,
 					 RelOptInfo *outerrel,
 					 RelOptInfo *innerrel,
-					 List *restrictlist,
-					 List *redistribution_clauses,
-					 List *mergeclause_list,
 					 JoinType jointype,
-					 SpecialJoinInfo *sjinfo,
-					 Relids param_source_rels,
-					 Relids extra_lateral_rels)
+					 JoinPathExtraData *extra)
 {
 	Path	   *outer_path;
 	Path	   *inner_path;
@@ -653,14 +741,14 @@ sort_inner_and_outer(PlannerInfo *root,
 	if (jointype == JOIN_UNIQUE_OUTER)
 	{
 		outer_path = (Path *) create_unique_path(root, outerrel,
-												 outer_path, sjinfo);
+												 outer_path, extra->sjinfo);
 		Assert(outer_path);
 		jointype = JOIN_INNER;
 	}
 	else if (jointype == JOIN_UNIQUE_INNER)
 	{
 		inner_path = (Path *) create_unique_path(root, innerrel,
-												 inner_path, sjinfo);
+												 inner_path, extra->sjinfo);
 		Assert(inner_path);
 		jointype = JOIN_INNER;
 	}
@@ -694,7 +782,7 @@ sort_inner_and_outer(PlannerInfo *root,
 	 * exactly as-is as well as making variants.
 	 */
 	all_pathkeys = select_outer_pathkeys_for_merge(root,
-												   mergeclause_list,
+												   extra->mergeclause_list,
 												   joinrel);
 
 	foreach(l, all_pathkeys)
@@ -714,13 +802,13 @@ sort_inner_and_outer(PlannerInfo *root,
 			outerkeys = all_pathkeys;	/* no work at first one... */
 
 		/* Sort the mergeclauses into the corresponding ordering */
-		cur_mergeclauses = find_mergeclauses_for_pathkeys(root,
-														  outerkeys,
-														  true,
-														  mergeclause_list);
+		cur_mergeclauses =
+			find_mergeclauses_for_outer_pathkeys(root,
+												 outerkeys,
+												 extra->mergeclause_list);
 
 		/* Should have used them all... */
-		Assert(list_length(cur_mergeclauses) == list_length(mergeclause_list));
+		Assert(list_length(cur_mergeclauses) == list_length(extra->mergeclause_list));
 
 		/* Build sort pathkeys for the inner side */
 		innerkeys = make_inner_pathkeys_for_merge(root,
@@ -740,19 +828,15 @@ sort_inner_and_outer(PlannerInfo *root,
 		 */
 		try_mergejoin_path(root,
 						   joinrel,
-						   save_jointype,
-						   jointype,
-						   sjinfo,
-						   param_source_rels,
-						   extra_lateral_rels,
 						   outer_path,
 						   inner_path,
-						   restrictlist,
 						   merge_pathkeys,
 						   cur_mergeclauses,
-						   redistribution_clauses,
 						   outerkeys,
-						   innerkeys);
+						   innerkeys,
+						   jointype,
+						   save_jointype,
+						   extra);
 	}
 }
 
@@ -783,29 +867,16 @@ sort_inner_and_outer(PlannerInfo *root,
  * 'joinrel' is the join relation
  * 'outerrel' is the outer join relation
  * 'innerrel' is the inner join relation
- * 'restrictlist' contains all of the RestrictInfo nodes for restriction
- *		clauses that apply to this join
- * 'mergeclause_list' is a list of RestrictInfo nodes for available
- *		mergejoin clauses in this join
  * 'jointype' is the type of join to do
- * 'sjinfo' is extra info about the join for selectivity estimation
- * 'semifactors' contains valid data if jointype is SEMI or ANTI
- * 'param_source_rels' are OK targets for parameterization of result paths
- * 'extra_lateral_rels' are additional parameterization for result paths
+ * 'extra' contains additional input values
  */
 static void
 match_unsorted_outer(PlannerInfo *root,
 					 RelOptInfo *joinrel,
 					 RelOptInfo *outerrel,
 					 RelOptInfo *innerrel,
-					 List *restrictlist,
-					 List *redistribution_clauses,
-					 List *mergeclause_list,
 					 JoinType jointype,
-					 SpecialJoinInfo *sjinfo,
-					 SemiAntiJoinFactors *semifactors,
-					 Relids param_source_rels,
-					 Relids extra_lateral_rels)
+					 JoinPathExtraData *extra)
 {
 	JoinType	save_jointype = jointype;
 	bool		nestjoinOK;
@@ -871,7 +942,7 @@ match_unsorted_outer(PlannerInfo *root,
 		if (inner_cheapest_total == NULL)
 			return;
 		inner_cheapest_total = (Path *)
-			create_unique_path(root, innerrel, inner_cheapest_total, sjinfo);
+			create_unique_path(root, innerrel, inner_cheapest_total, extra->sjinfo);
 		Assert(inner_cheapest_total);
 	}
 	else if (nestjoinOK)
@@ -915,7 +986,7 @@ match_unsorted_outer(PlannerInfo *root,
 			if (outerpath != outerrel->cheapest_total_path)
 				continue;
 			outerpath = (Path *) create_unique_path(root, outerrel,
-													outerpath, sjinfo);
+													outerpath, extra->sjinfo);
 			Assert(outerpath);
 		}
 
@@ -935,17 +1006,12 @@ match_unsorted_outer(PlannerInfo *root,
 			 */
 			try_nestloop_path(root,
 							  joinrel,
-							  save_jointype,
-							  jointype,
-							  sjinfo,
-							  semifactors,
-							  param_source_rels,
-							  extra_lateral_rels,
 							  outerpath,
 							  inner_cheapest_total,
-							  restrictlist,
-							  redistribution_clauses,
-							  merge_pathkeys);
+							  merge_pathkeys,
+							  jointype,
+							  save_jointype,
+							  extra);
 		}
 		else if (nestjoinOK)
 		{
@@ -963,34 +1029,24 @@ match_unsorted_outer(PlannerInfo *root,
 
 				try_nestloop_path(root,
 								  joinrel,
-								  save_jointype,
-								  jointype,
-								  sjinfo,
-								  semifactors,
-								  param_source_rels,
-								  extra_lateral_rels,
 								  outerpath,
 								  innerpath,
-								  restrictlist,
-								  redistribution_clauses,
-								  merge_pathkeys);
+								  merge_pathkeys,
+								  jointype,
+								  save_jointype,
+								  extra);
 			}
 
 			/* Also consider materialized form of the cheapest inner path */
 			if (matpath != NULL)
 				try_nestloop_path(root,
 								  joinrel,
-								  save_jointype,
-								  jointype,
-								  sjinfo,
-								  semifactors,
-								  param_source_rels,
-								  extra_lateral_rels,
 								  outerpath,
 								  matpath,
-								  restrictlist,
-								  redistribution_clauses,
-								  merge_pathkeys);
+								  merge_pathkeys,
+								  jointype,
+								  save_jointype,
+								  extra);
 		}
 
 		/* Can't do anything else if outer path needs to be unique'd */
@@ -1002,10 +1058,10 @@ match_unsorted_outer(PlannerInfo *root,
 			continue;
 
 		/* Look for useful mergeclauses (if any) */
-		mergeclauses = find_mergeclauses_for_pathkeys(root,
-													  outerpath->pathkeys,
-													  true,
-													  mergeclause_list);
+		mergeclauses =
+			find_mergeclauses_for_outer_pathkeys(root,
+												 outerpath->pathkeys,
+												 extra->mergeclause_list);
 
 		/*
 		 * Done with this outer path if no chance for a mergejoin.
@@ -1023,7 +1079,7 @@ match_unsorted_outer(PlannerInfo *root,
 			else
 				continue;
 		}
-		if (useallclauses && list_length(mergeclauses) != list_length(mergeclause_list))
+		if (useallclauses && list_length(mergeclauses) != list_length(extra->mergeclause_list))
 			continue;
 
 		/* The merge join executor code doesn't support LASJ_NOTIN */
@@ -1043,19 +1099,15 @@ match_unsorted_outer(PlannerInfo *root,
 		 */
 		try_mergejoin_path(root,
 						   joinrel,
-						   save_jointype,
-						   jointype,
-						   sjinfo,
-						   param_source_rels,
-						   extra_lateral_rels,
 						   outerpath,
 						   inner_cheapest_total,
-						   restrictlist,
 						   merge_pathkeys,
 						   mergeclauses,
-						   redistribution_clauses,
 						   NIL,
-						   innersortkeys);
+						   innersortkeys,
+						   jointype,
+						   save_jointype,
+						   extra);
 
 		/* Can't do anything else if inner path needs to be unique'd */
 		if (save_jointype == JOIN_UNIQUE_INNER)
@@ -1134,29 +1186,24 @@ match_unsorted_outer(PlannerInfo *root,
 				if (sortkeycnt < num_sortkeys)
 				{
 					newclauses =
-						find_mergeclauses_for_pathkeys(root,
-													   trialsortkeys,
-													   false,
-													   mergeclauses);
+						trim_mergeclauses_for_inner_pathkeys(root,
+															 mergeclauses,
+															 trialsortkeys);
 					Assert(newclauses != NIL);
 				}
 				else
 					newclauses = mergeclauses;
 				try_mergejoin_path(root,
 								   joinrel,
-								   save_jointype,
-								   jointype,
-								   sjinfo,
-								   param_source_rels,
-								   extra_lateral_rels,
 								   outerpath,
 								   innerpath,
-								   restrictlist,
 								   merge_pathkeys,
 								   newclauses,
-								   redistribution_clauses,
 								   NIL,
-								   NIL);
+								   NIL,
+								   jointype,
+								   save_jointype,
+								   extra);
 				cheapest_total_inner = innerpath;
 			}
 			/* Same on the basis of cheapest startup cost ... */
@@ -1181,10 +1228,9 @@ match_unsorted_outer(PlannerInfo *root,
 						if (sortkeycnt < num_sortkeys)
 						{
 							newclauses =
-								find_mergeclauses_for_pathkeys(root,
-															   trialsortkeys,
-															   false,
-															   mergeclauses);
+								trim_mergeclauses_for_inner_pathkeys(root,
+																mergeclauses,
+															  trialsortkeys);
 							Assert(newclauses != NIL);
 						}
 						else
@@ -1192,19 +1238,15 @@ match_unsorted_outer(PlannerInfo *root,
 					}
 					try_mergejoin_path(root,
 									   joinrel,
-									   save_jointype,
-									   jointype,
-									   sjinfo,
-									   param_source_rels,
-									   extra_lateral_rels,
 									   outerpath,
 									   innerpath,
-									   restrictlist,
 									   merge_pathkeys,
 									   newclauses,
-									   redistribution_clauses,
 									   NIL,
-									   NIL);
+									   NIL,
+									   jointype,
+									   save_jointype,
+									   extra);
 				}
 				cheapest_startup_inner = innerpath;
 			}
@@ -1214,6 +1256,94 @@ match_unsorted_outer(PlannerInfo *root,
 			 */
 			if (useallclauses)
 				break;
+		}
+	}
+
+	/*
+	 * If the joinrel is parallel-safe and the join type supports nested
+	 * loops, we may be able to consider a partial nestloop plan.  However, we
+	 * can't handle JOIN_UNIQUE_OUTER, because the outer path will be partial,
+	 * and therefore we won't be able to properly guarantee uniqueness.  Nor
+	 * can we handle extra_lateral_rels, since partial paths must not be
+	 * parameterized.
+	 */
+	if (joinrel->consider_parallel && nestjoinOK &&
+		save_jointype != JOIN_UNIQUE_OUTER &&
+		bms_is_empty(joinrel->lateral_relids))
+		consider_parallel_nestloop(root, joinrel, outerrel, innerrel,
+								   save_jointype, extra);
+}
+
+/*
+ * consider_parallel_nestloop
+ *	  Try to build partial paths for a joinrel by joining a partial path for the
+ *	  outer relation to a complete path for the inner relation.
+ *
+ * 'joinrel' is the join relation
+ * 'outerrel' is the outer join relation
+ * 'innerrel' is the inner join relation
+ * 'jointype' is the type of join to do
+ * 'extra' contains additional input values
+ */
+static void
+consider_parallel_nestloop(PlannerInfo *root,
+						   RelOptInfo *joinrel,
+						   RelOptInfo *outerrel,
+						   RelOptInfo *innerrel,
+						   JoinType jointype,
+						   JoinPathExtraData *extra)
+{
+	JoinType	save_jointype = jointype;
+	ListCell   *lc1;
+
+	if (jointype == JOIN_UNIQUE_INNER)
+		jointype = JOIN_INNER;
+
+	foreach(lc1, outerrel->partial_pathlist)
+	{
+		Path	   *outerpath = (Path *) lfirst(lc1);
+		List	   *pathkeys;
+		ListCell   *lc2;
+
+		/* Figure out what useful ordering any paths we create will have. */
+		pathkeys = build_join_pathkeys(root, joinrel, jointype,
+									   outerpath->pathkeys);
+
+		/*
+		 * Try the cheapest parameterized paths; only those which will produce
+		 * an unparameterized path when joined to this outerrel will survive
+		 * try_partial_nestloop_path.  The cheapest unparameterized path is
+		 * also in this list.
+		 */
+		foreach(lc2, innerrel->cheapest_parameterized_paths)
+		{
+			Path	   *innerpath = (Path *) lfirst(lc2);
+
+			/* Can't join to an inner path that is not parallel-safe */
+			if (!innerpath->parallel_safe)
+				continue;
+
+			/*
+			 * Like match_unsorted_outer, we only consider a single nestloop
+			 * path when the jointype is JOIN_UNIQUE_INNER.  But we have to
+			 * scan cheapest_parameterized_paths to find the one we want to
+			 * consider, because cheapest_total_path might not be
+			 * parallel-safe.
+			 */
+			if (save_jointype == JOIN_UNIQUE_INNER)
+			{
+				if (!bms_is_empty(PATH_REQ_OUTER(innerpath)))
+					continue;
+				innerpath = (Path *) create_unique_path(root, innerrel,
+														innerpath,
+														extra->sjinfo);
+				Assert(innerpath);
+			}
+
+			try_partial_nestloop_path(root, joinrel, outerpath, innerpath,
+									  pathkeys, jointype,
+									  save_jointype,
+									  extra);
 		}
 	}
 }
@@ -1226,26 +1356,16 @@ match_unsorted_outer(PlannerInfo *root,
  * 'joinrel' is the join relation
  * 'outerrel' is the outer join relation
  * 'innerrel' is the inner join relation
- * 'restrictlist' contains all of the RestrictInfo nodes for restriction
- *		clauses that apply to this join
  * 'jointype' is the type of join to do
- * 'sjinfo' is extra info about the join for selectivity estimation
- * 'semifactors' contains valid data if jointype is SEMI or ANTI
- * 'param_source_rels' are OK targets for parameterization of result paths
- * 'extra_lateral_rels' are additional parameterization for result paths
+ * 'extra' contains additional input values
  */
 static void
 hash_inner_and_outer(PlannerInfo *root,
 					 RelOptInfo *joinrel,
 					 RelOptInfo *outerrel,
 					 RelOptInfo *innerrel,
-					 List *restrictlist,
 					 JoinType jointype,
-					 SpecialJoinInfo *sjinfo,
-					 SemiAntiJoinFactors *semifactors,
-					 Relids param_source_rels,
-					 Relids extra_lateral_rels,
-					 List *redistribution_clauses     /*CDB*/)
+					 JoinPathExtraData *extra)
 {
 	bool		isouterjoin = IS_OUTER_JOIN(jointype);
 	List	   *hashclauses;
@@ -1263,7 +1383,7 @@ hash_inner_and_outer(PlannerInfo *root,
 	 * usable with this pair of sub-relations.
 	 */
 	hashclauses = NIL;
-	foreach(l, restrictlist)
+	foreach(l, extra->restrictlist)
 	{
 		RestrictInfo *restrictinfo = (RestrictInfo *) lfirst(l);
 
@@ -1282,7 +1402,7 @@ hash_inner_and_outer(PlannerInfo *root,
 		 * If processing an outer join, only use its own join clauses for
 		 * hashing.  For inner joins we need not be so picky.
 		 */
-		if (isouterjoin && restrictinfo->is_pushed_down)
+		if (isouterjoin && RINFO_IS_PUSHED_DOWN(restrictinfo, joinrel->relids))
 			continue;
 
 		if (!restrictinfo->can_join ||
@@ -1325,59 +1445,44 @@ hash_inner_and_outer(PlannerInfo *root,
 		{
 			cheapest_total_outer = (Path *)
 				create_unique_path(root, outerrel,
-								   cheapest_total_outer, sjinfo);
+								   cheapest_total_outer, extra->sjinfo);
 			Assert(cheapest_total_outer);
 			jointype = JOIN_INNER;
 			try_hashjoin_path(root,
 							  joinrel,
-							  save_jointype,
-							  jointype,
-							  sjinfo,
-							  semifactors,
-							  param_source_rels,
-							  extra_lateral_rels,
 							  cheapest_total_outer,
 							  cheapest_total_inner,
-							  restrictlist,
-							  redistribution_clauses,
-							  hashclauses);
+							  hashclauses,
+							  jointype,
+							  save_jointype,
+							  extra);
 			/* no possibility of cheap startup here */
 		}
 		else if (jointype == JOIN_UNIQUE_INNER)
 		{
 			cheapest_total_inner = (Path *)
 				create_unique_path(root, innerrel,
-								   cheapest_total_inner, sjinfo);
+								   cheapest_total_inner, extra->sjinfo);
 			Assert(cheapest_total_inner);
 			jointype = JOIN_INNER;
 			try_hashjoin_path(root,
 							  joinrel,
-							  save_jointype,
-							  jointype,
-							  sjinfo,
-							  semifactors,
-							  param_source_rels,
-							  extra_lateral_rels,
 							  cheapest_total_outer,
 							  cheapest_total_inner,
-							  restrictlist,
-							  redistribution_clauses,
-							  hashclauses);
+							  hashclauses,
+							  jointype,
+							  save_jointype,
+							  extra);
 			if (cheapest_startup_outer != NULL &&
 				cheapest_startup_outer != cheapest_total_outer)
 				try_hashjoin_path(root,
 								  joinrel,
-								  save_jointype,
-								  jointype,
-								  sjinfo,
-								  semifactors,
-								  param_source_rels,
-								  extra_lateral_rels,
 								  cheapest_startup_outer,
 								  cheapest_total_inner,
-								  restrictlist,
-								  redistribution_clauses,
-								  hashclauses);
+								  hashclauses,
+								  jointype,
+								  save_jointype,
+								  extra);
 		}
 		else
 		{
@@ -1394,17 +1499,12 @@ hash_inner_and_outer(PlannerInfo *root,
 			if (cheapest_startup_outer != NULL)
 				try_hashjoin_path(root,
 								  joinrel,
-								  save_jointype,
-								  jointype,
-								  sjinfo,
-								  semifactors,
-								  param_source_rels,
-								  extra_lateral_rels,
 								  cheapest_startup_outer,
 								  cheapest_total_inner,
-								  restrictlist,
-								  redistribution_clauses,
-								  hashclauses);
+								  hashclauses,
+								  jointype,
+								  save_jointype,
+								  extra);
 
 			foreach(lc1, outerrel->cheapest_parameterized_paths)
 			{
@@ -1434,19 +1534,69 @@ hash_inner_and_outer(PlannerInfo *root,
 
 					try_hashjoin_path(root,
 									  joinrel,
-									  save_jointype,
-									  jointype,
-									  sjinfo,
-									  semifactors,
-									  param_source_rels,
-									  extra_lateral_rels,
 									  outerpath,
 									  innerpath,
-									  restrictlist,
-									  redistribution_clauses,
-									  hashclauses);
+									  hashclauses,
+									  jointype,
+									  save_jointype,
+									  extra);
 				}
 			}
+		}
+
+		/*
+		 * If the joinrel is parallel-safe, we may be able to consider a
+		 * partial hash join.  However, we can't handle JOIN_UNIQUE_OUTER,
+		 * because the outer path will be partial, and therefore we won't be
+		 * able to properly guarantee uniqueness.  Similarly, we can't handle
+		 * JOIN_FULL and JOIN_RIGHT, because they can produce false null
+		 * extended rows.  Also, the resulting path must not be parameterized.
+		 */
+		if (joinrel->consider_parallel &&
+			jointype != JOIN_UNIQUE_OUTER &&
+			jointype != JOIN_FULL &&
+			jointype != JOIN_RIGHT &&
+			outerrel->partial_pathlist != NIL &&
+			bms_is_empty(joinrel->lateral_relids))
+		{
+			Path	   *cheapest_partial_outer;
+			Path	   *cheapest_safe_inner = NULL;
+
+			cheapest_partial_outer =
+				(Path *) linitial(outerrel->partial_pathlist);
+
+			/*
+			 * Normally, given that the joinrel is parallel-safe, the cheapest
+			 * total inner path will also be parallel-safe, but if not, we'll
+			 * have to search cheapest_parameterized_paths for the cheapest
+			 * unparameterized inner path.
+			 */
+			if (cheapest_total_inner->parallel_safe)
+				cheapest_safe_inner = cheapest_total_inner;
+			else
+			{
+				ListCell   *lc;
+
+				foreach(lc, innerrel->cheapest_parameterized_paths)
+				{
+					Path	   *innerpath = (Path *) lfirst(lc);
+
+					if (innerpath->parallel_safe &&
+						bms_is_empty(PATH_REQ_OUTER(innerpath)))
+					{
+						cheapest_safe_inner = innerpath;
+						break;
+					}
+				}
+			}
+
+			if (cheapest_safe_inner != NULL)
+				try_partial_hashjoin_path(root, joinrel,
+										  cheapest_partial_outer,
+										  cheapest_safe_inner,
+										  hashclauses, jointype,
+										  save_jointype,
+										  extra);
 		}
 	}
 }
@@ -1497,7 +1647,7 @@ select_mergejoin_clauses(PlannerInfo *root,
 		 * we don't set have_nonmergeable_joinclause here because pushed-down
 		 * clauses will become otherquals not joinquals.)
 		 */
-		if (isouterjoin && restrictinfo->is_pushed_down)
+		if (isouterjoin && RINFO_IS_PUSHED_DOWN(restrictinfo, joinrel->relids))
 			continue;
 
 		/* Check that clause is a mergeable operator clause */
@@ -1515,6 +1665,9 @@ select_mergejoin_clauses(PlannerInfo *root,
 			continue;			/* not mergejoinable */
 		}
 
+		if (!OidIsValid(get_commutator(((OpExpr *)(restrictinfo->clause))->opno)))
+			continue;
+
 		/*
 		 * Check if clause has the form "outer op inner" or "inner op outer".
 		 */
@@ -1527,7 +1680,7 @@ select_mergejoin_clauses(PlannerInfo *root,
 		/*
 		 * Insist that each side have a non-redundant eclass.  This
 		 * restriction is needed because various bits of the planner expect
-		 * that each clause in a merge be associatable with some pathkey in a
+		 * that each clause in a merge be associable with some pathkey in a
 		 * canonical pathkey list, but redundant eclasses can't appear in
 		 * canonical sort orderings.  (XXX it might be worth relaxing this,
 		 * but not enough time to address it for 8.3.)

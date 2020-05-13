@@ -16,7 +16,7 @@
  *
  * Portions Copyright (c) 2005-2010, Greenplum inc
  * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *	src/backend/parser/analyze.c
@@ -27,6 +27,7 @@
 #include "postgres.h"
 
 #include "access/sysattr.h"
+#include "catalog/pg_am.h"
 #include "catalog/pg_type.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
@@ -47,11 +48,14 @@
 #include "parser/parse_target.h"
 #include "parser/parsetree.h"
 #include "rewrite/rewriteManip.h"
+#include "utils/guc.h"
 #include "utils/rel.h"
 
+#include "cdb/cdbhash.h"
 #include "cdb/cdbvars.h"
 #include "cdb/cdbutil.h"
 #include "catalog/gp_policy.h"
+#include "commands/defrem.h"
 #include "access/htup_details.h"
 #include "optimizer/clauses.h"
 #include "optimizer/tlist.h"
@@ -69,11 +73,13 @@ typedef struct
 {
 	List *subtlist; /* target list for subquery */
 	List *subgroupClause; /* group clause for subquery */
+	List *subgroupingSets; /* grouping sets for subquery */
 	List *windowClause; /* window clause for outer query*/
 
 	/* Scratch area for init_grouped_window context and map_sgr_mutator.
 	 */
-	Index *sgr_map;
+	Index  *sgr_map;
+	int		sgr_map_size;
 
 	/* Scratch area for grouped_window_mutator and var_for_gw_expr.
 	 */
@@ -89,13 +95,21 @@ typedef struct
 	List	  **leafinfos;
 } setop_types_ctx;
 
+typedef struct QueryNodeSearchContext
+{
+	bool       found;
+} QueryNodeSearchContext;
+
 /* Hook for plugins to get control at end of parse analysis */
 post_parse_analyze_hook_type post_parse_analyze_hook = NULL;
 
 static Query *transformDeleteStmt(ParseState *pstate, DeleteStmt *stmt);
 static Query *transformInsertStmt(ParseState *pstate, InsertStmt *stmt);
 static List *transformInsertRow(ParseState *pstate, List *exprlist,
-				   List *stmtcols, List *icolumns, List *attrnos);
+				   List *stmtcols, List *icolumns, List *attrnos,
+				   bool strip_indirection);
+static OnConflictExpr *transformOnConflictClause(ParseState *pstate,
+						  OnConflictClause *onConflictClause);
 static int	count_rowexpr_columns(ParseState *pstate, Node *expr);
 static Query *transformSelectStmt(ParseState *pstate, SelectStmt *stmt);
 static Query *transformValuesClause(ParseState *pstate, SelectStmt *stmt);
@@ -112,6 +126,8 @@ static void determineRecursiveColTypes(ParseState *pstate,
 						   Node *larg, List *nrtargetlist);
 static Query *transformUpdateStmt(ParseState *pstate, UpdateStmt *stmt);
 static List *transformReturningList(ParseState *pstate, List *returningList);
+static List *transformUpdateTargetList(ParseState *pstate,
+						  List *targetList);
 static Query *transformDeclareCursorStmt(ParseState *pstate,
 						   DeclareCursorStmt *stmt);
 static Query *transformExplainStmt(ParseState *pstate,
@@ -120,7 +136,11 @@ static Query *transformCreateTableAsStmt(ParseState *pstate,
 						   CreateTableAsStmt *stmt);
 static void transformLockingClause(ParseState *pstate, Query *qry,
 					   LockingClause *lc, bool pushedDown);
+#ifdef RAW_EXPRESSION_COVERAGE_TEST
+static bool test_raw_expression_coverage(Node *node, void *context);
+#endif
 
+/* GPDB definitions follow */
 static int get_distkey_by_name(char *key, IntoClause *into, Query *qry, bool *found);
 static void setQryDistributionPolicy(IntoClause *into, Query *qry);
 
@@ -133,6 +153,9 @@ static Node *grouped_window_mutator(Node *node, void *context);
 static Alias *make_replacement_alias(Query *qry, const char *aname);
 static char *generate_positional_name(AttrNumber attrno);
 static List*generate_alternate_vars(Var *var, grouped_window_ctx *ctx);
+static bool checkCanOptSelectLockingClause(SelectStmt *stmt);
+static bool queryNodeSearch(Node *node, void *context);
+static void sanity_check_on_conflict_update_set_distkey(Oid relid, List *onconflict_set);
 
 /*
  * parse_analyze
@@ -237,9 +260,31 @@ parse_sub_analyze(Node *parseTree, ParseState *parentParseState,
 Query *
 transformTopLevelStmt(ParseState *pstate, Node *parseTree)
 {
+	Query *q;
+
 	if (IsA(parseTree, SelectStmt))
 	{
 		SelectStmt *stmt = (SelectStmt *) parseTree;
+
+		/*
+		 * Greenplum specific behavior:
+		 * The implementation of select statement with locking clause
+		 * (for update | no key update | share | key share) in postgres
+		 * is to hold RowShareLock on tables during parsing stage, and
+		 * generate a LockRows plan node for executor to lock the tuples.
+		 * It is not easy to lock tuples in Greenplum database, since
+		 * tuples may be fetched through motion nodes.
+		 *
+		 * But when Global Deadlock Detector is enabled, and the select
+		 * statement with locking clause contains only one table, we are
+		 * sure that there are no motions. For such simple cases, we could
+		 * make the behavior just the same as Postgres.
+		 *
+		 * For extended protocal (like jdbc), we do not try to do such
+		 * optimization since these queries will be considered as cursor
+		 * and dispatched to reader gangs.
+		 */
+		pstate->p_canOptSelectLockingClause = checkCanOptSelectLockingClause(stmt);
 
 		/* If it's a set-operation tree, drill down to leftmost SelectStmt */
 		while (stmt && stmt->op != SETOP_NONE)
@@ -266,7 +311,10 @@ transformTopLevelStmt(ParseState *pstate, Node *parseTree)
 		}
 	}
 
-	return transformStmt(pstate, parseTree);
+	q = transformStmt(pstate, parseTree);
+	q->canOptSelectLockingClause = pstate->p_canOptSelectLockingClause;
+
+	return q;
 }
 
 /*
@@ -277,6 +325,25 @@ Query *
 transformStmt(ParseState *pstate, Node *parseTree)
 {
 	Query	   *result;
+
+	/*
+	 * We apply RAW_EXPRESSION_COVERAGE_TEST testing to basic DML statements;
+	 * we can't just run it on everything because raw_expression_tree_walker()
+	 * doesn't claim to handle utility statements.
+	 */
+#ifdef RAW_EXPRESSION_COVERAGE_TEST
+	switch (nodeTag(parseTree))
+	{
+		case T_SelectStmt:
+		case T_InsertStmt:
+		case T_UpdateStmt:
+		case T_DeleteStmt:
+			(void) test_raw_expression_coverage(parseTree, NULL);
+			break;
+		default:
+			break;
+	}
+#endif   /* RAW_EXPRESSION_COVERAGE_TEST */
 
 	switch (nodeTag(parseTree))
 	{
@@ -414,6 +481,18 @@ transformDeleteStmt(ParseState *pstate, DeleteStmt *stmt)
 		qry->hasRecursive = stmt->withClause->recursive;
 		qry->cteList = transformWithClause(pstate, stmt->withClause);
 		qry->hasModifyingCTE = pstate->p_hasModifyingCTE;
+
+		/*
+		 * Since GPDB currently only support a single writer gang, only one
+		 * writable clause is permitted per CTE. Once we get flexible gangs
+		 * with more than one writer gang we can lift this restriction.
+		 */
+		if (pstate->p_hasModifyingCTE)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("writable CTE queries cannot be themselves writable"),
+					 errdetail("Greenplum Database currently only support CTEs with one writable clause, called in a non-writable context."),
+					 errhint("Rewrite the query to only include one writable clause.")));
 	}
 
 	/* set up range table with just the result rel */
@@ -457,12 +536,15 @@ transformDeleteStmt(ParseState *pstate, DeleteStmt *stmt)
 	qry->hasWindowFuncs = pstate->p_hasWindowFuncs;
 	qry->hasAggs = pstate->p_hasAggs;
 	qry->hasFuncsWithExecRestrictions = pstate->p_hasFuncsWithExecRestrictions;
-	if (pstate->p_hasAggs)
-		parseCheckAggregates(pstate, qry);
+
 	if (pstate->p_hasTblValueExpr)
 		parseCheckTableFunctions(pstate, qry);
 
 	assign_query_collations(pstate, qry);
+
+	/* this must be done after collations, for reliable comparison of exprs */
+	if (pstate->p_hasAggs)
+		parseCheckAggregates(pstate, qry);
 
 	return qry;
 }
@@ -487,12 +569,15 @@ transformInsertStmt(ParseState *pstate, InsertStmt *stmt)
 	ListCell   *icols;
 	ListCell   *attnos;
 	ListCell   *lc;
+	bool		isOnConflictUpdate;
+	AclMode		targetPerms;
 
 	/* There can't be any outer WITH to worry about */
 	Assert(pstate->p_ctenamespace == NIL);
 
 	qry->commandType = CMD_INSERT;
 	pstate->p_is_insert = true;
+	pstate->p_is_on_conflict_update = false;
 
 	/* process the WITH clause independently of all else */
 	if (stmt->withClause)
@@ -500,7 +585,22 @@ transformInsertStmt(ParseState *pstate, InsertStmt *stmt)
 		qry->hasRecursive = stmt->withClause->recursive;
 		qry->cteList = transformWithClause(pstate, stmt->withClause);
 		qry->hasModifyingCTE = pstate->p_hasModifyingCTE;
+
+		/*
+		 * Since GPDB currently only support a single writer gang, only one
+		 * writable clause is permitted per CTE. Once we get flexible gangs
+		 * with more than one writer gang we can lift this restriction.
+		 */
+		if (pstate->p_hasModifyingCTE)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("writable CTE queries cannot be themselves writable"),
+					 errdetail("Greenplum Database currently only support CTEs with one writable clause, called in a non-writable context."),
+					 errhint("Rewrite the query to only include one writable clause.")));
 	}
+
+	isOnConflictUpdate = (stmt->onConflictClause &&
+						stmt->onConflictClause->action == ONCONFLICT_UPDATE);
 
 	/*
 	 * We have three cases to deal with: DEFAULT VALUES (selectStmt == NULL),
@@ -541,13 +641,24 @@ transformInsertStmt(ParseState *pstate, InsertStmt *stmt)
 	}
 
 	/*
+	 * Greenplum specific behavior.
+	 * conflict update may lock tuples on segments and behaves like
+	 * update. So we might consider if to upgrade lockmode for this
+	 * case.
+	 */
+	pstate->p_is_on_conflict_update = isOnConflictUpdate;
+
+	/*
 	 * Must get write lock on INSERT target table before scanning SELECT, else
 	 * we will grab the wrong kind of initial lock if the target table is also
 	 * mentioned in the SELECT part.  Note that the target table is not added
 	 * to the joinlist or namespace.
 	 */
+	targetPerms = ACL_INSERT;
+	if (isOnConflictUpdate)
+		targetPerms |= ACL_UPDATE;
 	qry->resultRelation = setTargetTable(pstate, stmt->relation,
-										 false, false, ACL_INSERT);
+										 false, false, targetPerms);
 
 	/* Validate stmt->cols list, or build default list if no list given */
 	icolumns = checkInsertTargets(pstate, stmt->cols, &attrnos);
@@ -620,18 +731,41 @@ transformInsertStmt(ParseState *pstate, InsertStmt *stmt)
 		 * separate from the subquery's tlist because we may add columns,
 		 * insert datatype coercions, etc.)
 		 *
-		 * Const and Param nodes of type UNKNOWN in the SELECT's targetlist
-		 * no longer need special treatment here.  They'll be assigned proper
-         * types later by coerce_type() upon assignment to the target columns.
-		 * Otherwise this fails:  INSERT INTO foo SELECT 'bar', ... FROM baz
+		 * HACK: unknown-type constants and params in the SELECT's targetlist
+		 * are copied up as-is rather than being referenced as subquery
+		 * outputs.  This is to ensure that when we try to coerce them to
+		 * the target column's datatype, the right things happen (see
+		 * special cases in coerce_type).  Otherwise, this fails:
+		 *		INSERT INTO foo SELECT 'bar', ... FROM baz
 		 *----------
 		 */
-		expandRTE(rte, rtr->rtindex, 0, -1, false, NULL, &exprList);
+		exprList = NIL;
+		foreach(lc, selectQuery->targetList)
+		{
+			TargetEntry *tle = (TargetEntry *) lfirst(lc);
+			Expr	   *expr;
+
+			if (tle->resjunk)
+				continue;
+			if (tle->expr &&
+				(IsA(tle->expr, Const) ||IsA(tle->expr, Param)) &&
+				exprType((Node *) tle->expr) == UNKNOWNOID)
+				expr = tle->expr;
+			else
+			{
+				Var		   *var = makeVarFromTargetEntry(rtr->rtindex, tle);
+
+				var->location = exprLocation((Node *) tle->expr);
+				expr = (Expr *) var;
+			}
+			exprList = lappend(exprList, expr);
+		}
 
 		/* Prepare row for assignment to target table */
 		exprList = transformInsertRow(pstate, exprList,
 									  stmt->cols,
-									  icolumns, attrnos);
+									  icolumns, attrnos,
+									  false);
 	}
 	else if (list_length(selectStmt->valuesLists) > 1)
 	{
@@ -675,10 +809,20 @@ transformInsertStmt(ParseState *pstate, InsertStmt *stmt)
 											exprLocation((Node *) sublist))));
 			}
 
-			/* Prepare row for assignment to target table */
+			/*
+			 * Prepare row for assignment to target table.  We process any
+			 * indirection on the target column specs normally but then strip
+			 * off the resulting field/array assignment nodes, since we don't
+			 * want the parsed statement to contain copies of those in each
+			 * VALUES row.  (It's annoying to have to transform the
+			 * indirection specs over and over like this, but avoiding it
+			 * would take some really messy refactoring of
+			 * transformAssignmentIndirection.)
+			 */
 			sublist = transformInsertRow(pstate, sublist,
 										 stmt->cols,
-										 icolumns, attrnos);
+										 icolumns, attrnos,
+										 true);
 
 			/*
 			 * We must assign collations now because assign_query_collations
@@ -729,6 +873,14 @@ transformInsertStmt(ParseState *pstate, InsertStmt *stmt)
 		 * Generate list of Vars referencing the RTE
 		 */
 		expandRTE(rte, rtr->rtindex, 0, -1, false, NULL, &exprList);
+
+		/*
+		 * Re-apply any indirection on the target column specs to the Vars
+		 */
+		exprList = transformInsertRow(pstate, exprList,
+									  stmt->cols,
+									  icolumns, attrnos,
+									  false);
 	}
 	else
 	{
@@ -751,7 +903,8 @@ transformInsertStmt(ParseState *pstate, InsertStmt *stmt)
 		/* Prepare row for assignment to target table */
 		exprList = transformInsertRow(pstate, exprList,
 									  stmt->cols,
-									  icolumns, attrnos);
+									  icolumns, attrnos,
+									  false);
 	}
 
 	/*
@@ -779,12 +932,28 @@ transformInsertStmt(ParseState *pstate, InsertStmt *stmt)
 							  false);
 		qry->targetList = lappend(qry->targetList, tle);
 
-		rte->modifiedCols = bms_add_member(rte->modifiedCols,
+		rte->insertedCols = bms_add_member(rte->insertedCols,
 							  attr_num - FirstLowInvalidHeapAttributeNumber);
 
 		icols = lnext(icols);
 		attnos = lnext(attnos);
 	}
+
+	/* Process ON CONFLICT, if any. */
+	if (stmt->onConflictClause)
+		qry->onConflict = transformOnConflictClause(pstate,
+													stmt->onConflictClause);
+
+	/*
+	 * Greenplum specific behavior.
+	 * OnConflictUpdate may modify the distkey of the table,
+	 * this can lead to wrong data distribution. Add a check
+	 * here and raise error for such case.
+	 * This fixes the github issue: https://github.com/greenplum-db/gpdb/issues/9444
+	 */
+	if (isOnConflictUpdate)
+		sanity_check_on_conflict_update_set_distkey(rte->relid,
+													qry->onConflict->onConflictSet);
 
 	/*
 	 * If we have a RETURNING clause, we need to add the target relation to
@@ -816,12 +985,17 @@ transformInsertStmt(ParseState *pstate, InsertStmt *stmt)
 /*
  * Prepare an INSERT row for assignment to the target table.
  *
- * The row might be either a VALUES row, or variables referencing a
- * sub-SELECT output.
+ * exprlist: transformed expressions for source values; these might come from
+ * a VALUES row, or be Vars referencing a sub-SELECT or VALUES RTE output.
+ * stmtcols: original target-columns spec for INSERT (we just test for NIL)
+ * icolumns: effective target-columns spec (list of ResTarget)
+ * attrnos: integer column numbers (must be same length as icolumns)
+ * strip_indirection: if true, remove any field/array assignment nodes
  */
 static List *
 transformInsertRow(ParseState *pstate, List *exprlist,
-				   List *stmtcols, List *icolumns, List *attrnos)
+				   List *stmtcols, List *icolumns, List *attrnos,
+				   bool strip_indirection)
 {
 	List	   *result;
 	ListCell   *lc;
@@ -886,6 +1060,29 @@ transformInsertRow(ParseState *pstate, List *exprlist,
 									 lfirst_int(attnos),
 									 col->indirection,
 									 col->location);
+
+		if (strip_indirection)
+		{
+			while (expr)
+			{
+				if (IsA(expr, FieldStore))
+				{
+					FieldStore *fstore = (FieldStore *) expr;
+
+					expr = (Expr *) linitial(fstore->newvals);
+				}
+				else if (IsA(expr, ArrayRef))
+				{
+					ArrayRef   *aref = (ArrayRef *) expr;
+
+					if (aref->refassgnexpr == NULL)
+						break;
+					expr = aref->refassgnexpr;
+				}
+				else
+					break;
+			}
+		}
 
 		result = lappend(result, expr);
 
@@ -960,6 +1157,7 @@ transformGroupedWindows(ParseState *pstate, Query *qry)
 
 	subq->returningList = NIL;
 	subq->groupClause = qry->groupClause; /* before windowing */
+	subq->groupingSets = qry->groupingSets; /* before windowing */
 	subq->havingQual = qry->havingQual; /* before windowing */
 	subq->windowClause = NIL; /* by construction */
 	subq->distinctClause = NIL; /* after windowing */
@@ -988,7 +1186,6 @@ transformGroupedWindows(ParseState *pstate, Query *qry)
 	/* Default?
 	 * rte->inh = 0;
 	 * rte->checkAsUser = 0;
-	 * rte->pseudocols = 0;
 	*/
 
 	/* Make a reference to the new range table entry .
@@ -1004,7 +1201,7 @@ transformGroupedWindows(ParseState *pstate, Query *qry)
 
     /* Begin rewriting the outer query in place.
      */
-	qry->hasAggs = false; /* by constuction */
+	qry->hasAggs = false; /* by construction */
 	/* qry->hasSubLinks -- reevaluate later. */
 
 	/* Core of outer query input table expression: */
@@ -1015,6 +1212,7 @@ transformGroupedWindows(ParseState *pstate, Query *qry)
 	/* qry->targetList -- to be mutated from Q to Q' below */
 
 	qry->groupClause = NIL; /* by construction */
+	qry->groupingSets = NIL; /* by construction */
 	qry->havingQual = NULL; /* by construction */
 
 	/* Mutate the Q target list and windowClauses for use in Q' and, at the
@@ -1029,6 +1227,7 @@ transformGroupedWindows(ParseState *pstate, Query *qry)
 	 */
 	subq->targetList = ctx.subtlist;
 	subq->groupClause = ctx.subgroupClause;
+	subq->groupingSets = ctx.subgroupingSets;
 
 	/* We always need an eref, but we shouldn't really need a filled in alias.
 	 * However, view deparse (or at least the fix for MPP-2189) wants one.
@@ -1037,7 +1236,7 @@ transformGroupedWindows(ParseState *pstate, Query *qry)
 	rte->eref = copyObject(alias);
 	rte->alias = alias;
 
-	/* Accomodate depth change in new subquery, Q''.
+	/* Accommodate depth change in new subquery, Q''.
 	 */
 	IncrementVarSublevelsUpInTransformGroupedWindows((Node*)subq, 1, 1);
 
@@ -1089,6 +1288,7 @@ init_grouped_window_context(grouped_window_ctx *ctx, Query *qry)
 
 	ctx->subtlist = NIL;
 	ctx->subgroupClause = NIL;
+	ctx->subgroupingSets = NIL;
 
 	/* Set up scratch space.
 	 */
@@ -1098,6 +1298,7 @@ init_grouped_window_context(grouped_window_ctx *ctx, Query *qry)
 	/* Map input = outer query sortgroupref values to subquery values while building the
 	 * subquery target list prefix. */
 	ctx->sgr_map = palloc0((maxsgr+1)*sizeof(ctx->sgr_map[0]));
+	ctx->sgr_map_size = maxsgr + 1;
 	foreach (lc, grp_tles)
 	{
 	    TargetEntry *tle;
@@ -1120,6 +1321,7 @@ init_grouped_window_context(grouped_window_ctx *ctx, Query *qry)
 
 	/* Revise grouping into ctx->subgroupClause */
 	ctx->subgroupClause = (List*)map_sgr_mutator((Node*)qry->groupClause, ctx);
+	ctx->subgroupingSets = (List *) map_sgr_mutator((Node *) qry->groupingSets, ctx);
 }
 
 
@@ -1127,9 +1329,10 @@ init_grouped_window_context(grouped_window_ctx *ctx, Query *qry)
 static void
 discard_grouped_window_context(grouped_window_ctx *ctx)
 {
-    ctx->subtlist = NIL;
-    ctx->subgroupClause = NIL;
-    ctx->tle = NULL;
+	ctx->subtlist = NIL;
+	ctx->subgroupClause = NIL;
+	ctx->subgroupingSets = NIL;
+	ctx->tle = NULL;
 	if (ctx->sgr_map)
 		pfree(ctx->sgr_map);
 	ctx->sgr_map = NULL;
@@ -1216,6 +1419,24 @@ map_sgr_mutator(Node *node, void *context)
 		}
 		return (Node*)new_lst;
 	}
+	else if (IsA(node, IntList))
+	{
+		ListCell *lc;
+		List *new_lst = NIL;
+
+		foreach ( lc, (List *) node)
+		{
+			int			sortgroupref = lfirst_int(lc);
+
+			if (sortgroupref < 0 || sortgroupref >= ctx->sgr_map_size)
+				elog(ERROR, "sortgroupref %d out of bounds", sortgroupref);
+
+			sortgroupref = ctx->sgr_map[sortgroupref];
+
+			new_lst = lappend_int(new_lst, sortgroupref);
+		}
+		return (Node *) new_lst;
+	}
 	else if (IsA(node, SortGroupClause))
 	{
 		SortGroupClause *g = (SortGroupClause *) node;
@@ -1224,16 +1445,20 @@ map_sgr_mutator(Node *node, void *context)
 		new_g->tleSortGroupRef = ctx->sgr_map[g->tleSortGroupRef];
 		return (Node*)new_g;
 	}
-	else if (IsA(node, GroupingClause))
+	else if (IsA(node, GroupingSet))
 	{
-		GroupingClause *gc = (GroupingClause*)node;
-		GroupingClause *new_gc = makeNode(GroupingClause);
-		memcpy(new_gc, gc, sizeof(GroupingClause));
-		new_gc->groupsets = (List*)map_sgr_mutator((Node*)gc->groupsets, ctx);
-		return (Node*)new_gc;
-	}
+		GroupingSet *gset = (GroupingSet *) node;
+		GroupingSet *newgset = (GroupingSet *) node;
 
-	return NULL; /* Never happens */
+		newgset = makeNode(GroupingSet);
+		newgset->kind = gset->kind;
+		newgset->content = (List *) map_sgr_mutator((Node *) gset->content, context);
+		newgset->location = gset->location;
+
+		return (Node *) newgset;
+	}
+	else
+		elog(ERROR, "unexpected node type %d", nodeTag(node));
 }
 
 
@@ -1314,12 +1539,21 @@ static Node* grouped_window_mutator(Node *node, void *context)
 		ctx->tle = NULL;
 		result = (Node*)new_tle;
 	}
-	else if (IsA(node, Aggref) ||
-			 IsA(node, GroupingFunc) ||
-			 IsA(node, GroupId) )
+	else if (IsA(node, Aggref))
 	{
 		/* Aggregation expression */
 		result = (Node*) var_for_gw_expr(ctx, node, true);
+	}
+	else if (IsA(node, GroupingFunc))
+	{
+		GroupingFunc *gfunc = (GroupingFunc *) node;
+		GroupingFunc *newgfunc;
+
+		newgfunc = (GroupingFunc *) copyObject((Node *) gfunc);
+
+		newgfunc->refs = (List *) map_sgr_mutator((Node *) newgfunc->refs, ctx);
+
+		result = (Node *) var_for_gw_expr(ctx, (Node *) newgfunc, true);
 	}
 	else if (IsA(node, Var))
 	{
@@ -1518,6 +1752,139 @@ generate_alternate_vars(Var *invar, grouped_window_ctx *ctx)
 }
 
 /*
+ * transformSelectStmt -
+ *	  transforms an OnConflictClause in an INSERT
+ */
+static OnConflictExpr *
+transformOnConflictClause(ParseState *pstate,
+						  OnConflictClause *onConflictClause)
+{
+	List	   *arbiterElems;
+	Node	   *arbiterWhere;
+	Oid			arbiterConstraint;
+	List	   *onConflictSet = NIL;
+	Node	   *onConflictWhere = NULL;
+	RangeTblEntry *exclRte = NULL;
+	int			exclRelIndex = 0;
+	List	   *exclRelTlist = NIL;
+	OnConflictExpr *result;
+
+	/* Process the arbiter clause, ON CONFLICT ON (...) */
+	transformOnConflictArbiter(pstate, onConflictClause, &arbiterElems,
+							   &arbiterWhere, &arbiterConstraint);
+
+	/* Process DO UPDATE */
+	if (onConflictClause->action == ONCONFLICT_UPDATE)
+	{
+		Relation	targetrel = pstate->p_target_relation;
+		Var		   *var;
+		TargetEntry *te;
+		int			attno;
+
+		/*
+		 * All INSERT expressions have been parsed, get ready for potentially
+		 * existing SET statements that need to be processed like an UPDATE.
+		 */
+		pstate->p_is_insert = false;
+
+		/*
+		 * Add range table entry for the EXCLUDED pseudo relation; relkind is
+		 * set to composite to signal that we're not dealing with an actual
+		 * relation.
+		 */
+		exclRte = addRangeTableEntryForRelation(pstate,
+												targetrel,
+												makeAlias("excluded", NIL),
+												false, false);
+		exclRte->relkind = RELKIND_COMPOSITE_TYPE;
+		exclRelIndex = list_length(pstate->p_rtable);
+
+		/*
+		 * Build a targetlist for the EXCLUDED pseudo relation. Have to be
+		 * careful to use resnos that correspond to attnos of the underlying
+		 * relation.
+		 */
+		Assert(pstate->p_next_resno == 1);
+		for (attno = 0; attno < targetrel->rd_rel->relnatts; attno++)
+		{
+			Form_pg_attribute attr = targetrel->rd_att->attrs[attno];
+			char	   *name;
+
+			if (attr->attisdropped)
+			{
+				/*
+				 * can't use atttypid here, but it doesn't really matter what
+				 * type the Const claims to be.
+				 */
+				var = (Var *) makeNullConst(INT4OID, -1, InvalidOid);
+				name = "";
+			}
+			else
+			{
+				var = makeVar(exclRelIndex, attno + 1,
+							  attr->atttypid, attr->atttypmod,
+							  attr->attcollation,
+							  0);
+				var->location = -1;
+
+				name = NameStr(attr->attname);
+			}
+
+			Assert(pstate->p_next_resno == attno + 1);
+			te = makeTargetEntry((Expr *) var,
+								 pstate->p_next_resno++,
+								 name,
+								 false);
+
+			/* don't require select access yet */
+			exclRelTlist = lappend(exclRelTlist, te);
+		}
+
+		/*
+		 * Additionally add a whole row tlist entry for EXCLUDED. That's
+		 * really only needed for ruleutils' benefit, which expects to find
+		 * corresponding entries in child tlists. Alternatively we could do
+		 * this only when required, but that doesn't seem worth the trouble.
+		 */
+		var = makeVar(exclRelIndex, InvalidAttrNumber,
+					  RelationGetRelid(targetrel),
+					  -1, InvalidOid, 0);
+		te = makeTargetEntry((Expr *) var, 0, NULL, true);
+		exclRelTlist = lappend(exclRelTlist, te);
+
+		/*
+		 * Add EXCLUDED and the target RTE to the namespace, so that they can
+		 * be used in the UPDATE statement.
+		 */
+		addRTEtoQuery(pstate, exclRte, false, true, true);
+		addRTEtoQuery(pstate, pstate->p_target_rangetblentry,
+					  false, true, true);
+
+		onConflictSet =
+			transformUpdateTargetList(pstate, onConflictClause->targetList);
+
+		onConflictWhere = transformWhereClause(pstate,
+											   onConflictClause->whereClause,
+											   EXPR_KIND_WHERE, "WHERE");
+	}
+
+	/* Finally, build ON CONFLICT DO [NOTHING | UPDATE] expression */
+	result = makeNode(OnConflictExpr);
+
+	result->action = onConflictClause->action;
+	result->arbiterElems = arbiterElems;
+	result->arbiterWhere = arbiterWhere;
+	result->constraint = arbiterConstraint;
+	result->onConflictSet = onConflictSet;
+	result->onConflictWhere = onConflictWhere;
+	result->exclRelIndex = exclRelIndex;
+	result->exclRelTlist = exclRelTlist;
+
+	return result;
+}
+
+
+/*
  * count_rowexpr_columns -
  *	  get number of columns contained in a ROW() expression;
  *	  return -1 if expression isn't a RowExpr or a Var referencing one.
@@ -1596,10 +1963,7 @@ transformSelectStmt(ParseState *pstate, SelectStmt *stmt)
 	/* make FOR UPDATE/FOR SHARE info available to addRangeTableEntry */
 	pstate->p_locking_clause = stmt->lockingClause;
 
-	/*
-	 * Put WINDOW clause data into pstate so that window references know
-	 * about them.
-	 */
+	/* make WINDOW info available for window functions, too */
 	pstate->p_windowdefs = stmt->windowClause;
 
 	/* process the FROM clause */
@@ -1620,13 +1984,6 @@ transformSelectStmt(ParseState *pstate, SelectStmt *stmt)
 	qry->havingQual = transformWhereClause(pstate, stmt->havingClause,
 										   EXPR_KIND_HAVING, "HAVING");
 
-    /*
-     * CDB: Untyped Const or Param nodes in a subquery in the FROM clause
-     * might have been assigned proper types when we transformed the WHERE
-     * clause, targetlist, etc.  Bring targetlist Var types up to date.
-     */
-    fixup_unknown_vars_in_targetlist(pstate, qry->targetList);
-
 	/*
 	 * Transform sorting/grouping stuff.  Do ORDER BY first because both
 	 * transformGroupClause and transformDistinctClause need the results. Note
@@ -1642,6 +1999,7 @@ transformSelectStmt(ParseState *pstate, SelectStmt *stmt)
 
 	qry->groupClause = transformGroupClause(pstate,
 											stmt->groupClause,
+											&qry->groupingSets,
 											&qry->targetList,
 											qry->sortClause,
 											EXPR_KIND_GROUP_BY,
@@ -1668,13 +2026,15 @@ transformSelectStmt(ParseState *pstate, SelectStmt *stmt)
 	else if (linitial(stmt->distinctClause) == NULL)
 	{
 		/* We had SELECT DISTINCT */
-		if (!pstate->p_hasAggs && !pstate->p_hasWindowFuncs && qry->groupClause == NIL &&
+		if (!pstate->p_hasAggs && !pstate->p_hasWindowFuncs &&
+			qry->groupClause == NIL && qry->groupingSets == NIL &&
 			qry->targetList != NIL)
 		{
 			/*
-			 * MPP-15040
-			 * turn distinct clause into grouping clause to make both sort-based
-			 * and hash-based grouping implementations viable plan options
+			 * GPDB: We convert the DISTINCT to an equivalent GROUP BY, when
+			 * possible, because the planner can generate smarter plans for
+			 * GROUP BY. In particular, the "pre-unique" optimization has not
+			 * been implemented for DISTINCT.
 			 */
 			qry->distinctClause = transformDistinctToGroupBy(pstate,
 															 &qry->targetList,
@@ -1711,8 +2071,6 @@ transformSelectStmt(ParseState *pstate, SelectStmt *stmt)
 												   pstate->p_windowdefs,
 												   &qry->targetList);
 
-	processExtendedGrouping(pstate, qry->havingQual, qry->windowClause, qry->targetList);
-
 	qry->rtable = pstate->p_rtable;
 	qry->jointree = makeFromExpr(pstate->p_joinlist, qual);
 
@@ -1720,8 +2078,6 @@ transformSelectStmt(ParseState *pstate, SelectStmt *stmt)
 	qry->hasWindowFuncs = pstate->p_hasWindowFuncs;
 	qry->hasFuncsWithExecRestrictions = pstate->p_hasFuncsWithExecRestrictions;
 	qry->hasAggs = pstate->p_hasAggs;
-	if (pstate->p_hasAggs || qry->groupClause || qry->havingQual)
-		parseCheckAggregates(pstate, qry);
 
 	if (pstate->p_hasTblValueExpr)
 		parseCheckTableFunctions(pstate, qry);
@@ -1732,14 +2088,25 @@ transformSelectStmt(ParseState *pstate, SelectStmt *stmt)
 							   (LockingClause *) lfirst(l), false);
 	}
 
+	assign_query_collations(pstate, qry);
+
+	/* this must be done after collations, for reliable comparison of exprs */
+	if (pstate->p_hasAggs || qry->groupClause || qry->groupingSets || qry->havingQual)
+		parseCheckAggregates(pstate, qry);
+
 	/*
 	 * If the query mixes window functions and aggregates, we need to
 	 * transform it such that the grouped query appears as a subquery
+	 *
+	 * This must be done after collations. Because it, specifically the
+	 * grouped_window_mutator() it called, will replace some expressions with
+	 * Var and set the varcollid with the replaced expressions' original
+	 * collations, which are from assign_query_collations().
+	 *
+	 * Note: assign_query_collations() doesn't handle Var's collation.
 	 */
 	if (qry->hasWindowFuncs && (qry->groupClause || qry->hasAggs))
 		transformGroupedWindows(pstate, qry);
-
-	assign_query_collations(pstate, qry);
 
 	return qry;
 }
@@ -2131,11 +2498,6 @@ transformSetOperationStmt(ParseState *pstate, SelectStmt *stmt)
 	}
 
 	/*
-	 * Coerce the UNKNOWN type for target entries to its right type here.
-	 */
-	fixup_unknown_vars_in_setop(pstate, sostmt);
-
-	/*
 	 * As a first step towards supporting sort clauses that are expressions
 	 * using the output columns, generate a namespace entry that makes the
 	 * output columns visible.  A Join RTE node is handy for this, since we
@@ -2200,8 +2562,6 @@ transformSetOperationStmt(ParseState *pstate, SelectStmt *stmt)
 	qry->hasWindowFuncs = pstate->p_hasWindowFuncs;
 	qry->hasFuncsWithExecRestrictions = pstate->p_hasFuncsWithExecRestrictions;
 	qry->hasAggs = pstate->p_hasAggs;
-	if (pstate->p_hasAggs || qry->groupClause || qry->havingQual)
-		parseCheckAggregates(pstate, qry);
 
 	if (pstate->p_hasTblValueExpr)
 		parseCheckTableFunctions(pstate, qry);
@@ -2213,6 +2573,10 @@ transformSetOperationStmt(ParseState *pstate, SelectStmt *stmt)
 	}
 
 	assign_query_collations(pstate, qry);
+
+	/* this must be done after collations, for reliable comparison of exprs */
+	if (pstate->p_hasAggs || qry->groupClause || qry->groupingSets || qry->havingQual)
+		parseCheckAggregates(pstate, qry);
 
 	return qry;
 }
@@ -2492,30 +2856,31 @@ transformSetOperationTree_internal(ParseState *pstate, SelectStmt *stmt,
 				setop_types->ncols = numCols;
 				setop_types->leafinfos = (List **) palloc0(setop_types->ncols * sizeof(List *));
 			}
-			i = 0;
-			foreach(tl, selectQuery->targetList)
+
+			/*
+			 * It's possible that this leaf query has a different number
+			 * of columns than the previous ones. That's an error, but
+			 * we don't throw it here because we don't have the context
+			 * needed for a good error message. We don't know which
+			 * operation of the setop tree is the one where the number
+			 * of columns between the left and right branches differ.
+			 * Therefore, just return here as if nothing happened, and
+			 * we'll catch that error in the parent instead.
+			 */
+			if (numCols == setop_types->ncols)
 			{
-				TargetEntry *tle = (TargetEntry *) lfirst(tl);
+				i = 0;
+				foreach(tl, selectQuery->targetList)
+				{
+					TargetEntry *tle = (TargetEntry *) lfirst(tl);
 
-				if (tle->resjunk)
-					continue;
+					if (tle->resjunk)
+						continue;
 
-				setop_types->leafinfos[i] = lappend(setop_types->leafinfos[i],
-													(Node *) tle->expr);
-				i++;
-
-				/*
-				 * It's possible that this leaf query has a differnet number
-				 * of columns than the previous ones. That's an error, but
-				 * we don't throw it here because we don't have the context
-				 * needed for a good error message. We don't know which
-				 * operation of the setop tree is the one where the number
-				 * of columns between the left and right branches differ.
-				 * Therefore, just return here as if nothing happened, and
-				 * we'll catch that error in the parent instead.
-				 */
-				if (i == setop_types->ncols)
-					break;
+					setop_types->leafinfos[i] = lappend(setop_types->leafinfos[i],
+														(Node *) tle->expr);
+					i++;
+				}
 			}
 		}
 
@@ -2927,13 +3292,11 @@ transformUpdateStmt(ParseState *pstate, UpdateStmt *stmt)
 {
 	Query	   *qry = makeNode(Query);
 	ParseNamespaceItem *nsitem;
-	RangeTblEntry *target_rte;
 	Node	   *qual;
-	ListCell   *origTargetList;
-	ListCell   *tl;
 
 	qry->commandType = CMD_UPDATE;
-	pstate->p_is_update = true;
+	pstate->p_is_insert = false;
+	pstate->p_is_on_conflict_update = false;
 
 	/* process the WITH clause independently of all else */
 	if (stmt->withClause)
@@ -2941,6 +3304,18 @@ transformUpdateStmt(ParseState *pstate, UpdateStmt *stmt)
 		qry->hasRecursive = stmt->withClause->recursive;
 		qry->cteList = transformWithClause(pstate, stmt->withClause);
 		qry->hasModifyingCTE = pstate->p_hasModifyingCTE;
+
+		/*
+		 * Since GPDB currently only support a single writer gang, only one
+		 * writable clause is permitted per CTE. Once we get flexible gangs
+		 * with more than one writer gang we can lift this restriction.
+		 */
+		if (pstate->p_hasModifyingCTE)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("writable CTE queries cannot be themselves writable"),
+					 errdetail("Greenplum Database currently only support CTEs with one writable clause, called in a non-writable context."),
+					 errhint("Rewrite the query to only include one writable clause.")));
 	}
 
 	qry->resultRelation = setTargetTable(pstate, stmt->relation,
@@ -2965,24 +3340,16 @@ transformUpdateStmt(ParseState *pstate, UpdateStmt *stmt)
 	nsitem->p_lateral_only = false;
 	nsitem->p_lateral_ok = true;
 
-	qry->targetList = transformTargetList(pstate, stmt->targetList,
-										  EXPR_KIND_UPDATE_SOURCE);
-
 	qual = transformWhereClause(pstate, stmt->whereClause,
 								EXPR_KIND_WHERE, "WHERE");
 
 	qry->returningList = transformReturningList(pstate, stmt->returningList);
 
-    /*
-     * CDB: Untyped Const or Param nodes in a subquery in the FROM clause
-     * could have been assigned proper types when we transformed the WHERE
-     * clause or targetlist above.  Bring targetlist Var types up to date.
-     */
-    if (stmt->fromClause)
-    {
-        fixup_unknown_vars_in_targetlist(pstate, qry->targetList);
-        fixup_unknown_vars_in_targetlist(pstate, qry->returningList);
-    }
+	/*
+	 * Now we are done with SELECT-like processing, and can get on with
+	 * transforming the target list to match the UPDATE target columns.
+	 */
+	qry->targetList = transformUpdateTargetList(pstate, stmt->targetList);
 
 	qry->rtable = pstate->p_rtable;
 	qry->jointree = makeFromExpr(pstate->p_joinlist, qual);
@@ -2990,10 +3357,25 @@ transformUpdateStmt(ParseState *pstate, UpdateStmt *stmt)
 	qry->hasSubLinks = pstate->p_hasSubLinks;
 	qry->hasFuncsWithExecRestrictions = pstate->p_hasFuncsWithExecRestrictions;
 
-	/*
-	 * Now we are done with SELECT-like processing, and can get on with
-	 * transforming the target list to match the UPDATE target columns.
-	 */
+	assign_query_collations(pstate, qry);
+
+	return qry;
+}
+
+/*
+ * transformUpdateTargetList -
+ *	handle SET clause in UPDATE/INSERT ... ON CONFLICT UPDATE
+ */
+static List *
+transformUpdateTargetList(ParseState *pstate, List *origTlist)
+{
+	List	   *tlist = NIL;
+	RangeTblEntry *target_rte;
+	ListCell   *orig_tl;
+	ListCell   *tl;
+
+	tlist = transformTargetList(pstate, origTlist,
+								EXPR_KIND_UPDATE_SOURCE);
 
 	/* Prepare to assign non-conflicting resnos to resjunk attributes */
 	if (pstate->p_next_resno <= pstate->p_target_relation->rd_rel->relnatts)
@@ -3001,9 +3383,9 @@ transformUpdateStmt(ParseState *pstate, UpdateStmt *stmt)
 
 	/* Prepare non-junk columns for assignment to target table */
 	target_rte = pstate->p_target_rangetblentry;
-	origTargetList = list_head(stmt->targetList);
+	orig_tl = list_head(origTlist);
 
-	foreach(tl, qry->targetList)
+	foreach(tl, tlist)
 	{
 		TargetEntry *tle = (TargetEntry *) lfirst(tl);
 		ResTarget  *origTarget;
@@ -3021,9 +3403,9 @@ transformUpdateStmt(ParseState *pstate, UpdateStmt *stmt)
 			tle->resname = NULL;
 			continue;
 		}
-		if (origTargetList == NULL)
+		if (orig_tl == NULL)
 			elog(ERROR, "UPDATE target count mismatch --- internal error");
-		origTarget = (ResTarget *) lfirst(origTargetList);
+		origTarget = (ResTarget *) lfirst(orig_tl);
 		Assert(IsA(origTarget, ResTarget));
 
 		attrno = attnameAttNum(pstate->p_target_relation,
@@ -3042,19 +3424,15 @@ transformUpdateStmt(ParseState *pstate, UpdateStmt *stmt)
 							  origTarget->location);
 
 		/* Mark the target column as requiring update permissions */
-		target_rte->modifiedCols = bms_add_member(target_rte->modifiedCols,
+		target_rte->updatedCols = bms_add_member(target_rte->updatedCols,
 								attrno - FirstLowInvalidHeapAttributeNumber);
 
-		origTargetList = lnext(origTargetList);
+		orig_tl = lnext(orig_tl);
 	}
-	if (origTargetList != NULL)
+	if (orig_tl != NULL)
 		elog(ERROR, "UPDATE target count mismatch --- internal error");
 
-	assign_query_collations(pstate, qry);
-
-	qry->needReshuffle = stmt->needReshuffle;
-
-	return qry;
+	return tlist;
 }
 
 /*
@@ -3119,6 +3497,8 @@ static Query *
 transformDeclareCursorStmt(ParseState *pstate, DeclareCursorStmt *stmt)
 {
 	Query	   *result;
+
+	pstate->p_is_on_conflict_update = false;
 
 	/*
 	 * Don't allow both SCROLL and NO SCROLL to be specified
@@ -3187,6 +3567,7 @@ transformDeclareCursorStmt(ParseState *pstate, DeclareCursorStmt *stmt)
 
 	return result;
 }
+
 
 /*
  * transformExplainStmt -
@@ -3291,21 +3672,32 @@ transformCreateTableAsStmt(ParseState *pstate, CreateTableAsStmt *stmt)
 	result->commandType = CMD_UTILITY;
 	result->utilityStmt = (Node *) stmt;
 
-	/* GPDB: Set isCTAS to be true as we know this query is for CTAS */
-	((Query*)stmt->query)->isCTAS = true;
+	/* GPDB: Set parentStmtType to PARENTSTMTTYPE_CTAS as we know this query is for CTAS */
+	((Query*)stmt->query)->parentStmtType = PARENTSTMTTYPE_CTAS;
 
-	if (stmt->into->distributedBy && Gp_role == GP_ROLE_DISPATCH)
+	/*
+	 * In binary upgrade mode, we need to create materialize view in utility mode. So we
+	 * should enable the setQryDistributionPolicy function in binary upgrade mode.
+	 */
+	if (stmt->into->distributedBy && (Gp_role == GP_ROLE_DISPATCH || IsBinaryUpgrade))
 		setQryDistributionPolicy(stmt->into, (Query *)stmt->query);
 
 	return result;
 }
 
 
-char *
+/*
+ * Produce a string representation of a LockClauseStrength value.
+ * This should only be applied to valid values (not LCS_NONE).
+ */
+const char *
 LCS_asString(LockClauseStrength strength)
 {
 	switch (strength)
 	{
+		case LCS_NONE:
+			Assert(false);
+			break;
 		case LCS_FORKEYSHARE:
 			return "FOR KEY SHARE";
 		case LCS_FORSHARE:
@@ -3326,6 +3718,8 @@ LCS_asString(LockClauseStrength strength)
 void
 CheckSelectLocking(Query *qry, LockClauseStrength strength)
 {
+	Assert(strength != LCS_NONE);		/* else caller error */
+
 	if (qry->setOperations)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
@@ -3401,7 +3795,7 @@ transformLockingClause(ParseState *pstate, Query *qry, LockingClause *lc,
 	allrels = makeNode(LockingClause);
 	allrels->lockedRels = NIL;	/* indicates all rels */
 	allrels->strength = lc->strength;
-	allrels->noWait = lc->noWait;
+	allrels->waitPolicy = lc->waitPolicy;
 
 	if (lockedRels == NIL)
 	{
@@ -3415,18 +3809,18 @@ transformLockingClause(ParseState *pstate, Query *qry, LockingClause *lc,
 			switch (rte->rtekind)
 			{
 				case RTE_RELATION:
-					if (get_rel_relstorage(rte->relid) == RELSTORAGE_EXTERNAL)
+					if (rel_is_external_table(rte->relid))
 						ereport(ERROR,
 								(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 								 errmsg("SELECT FOR UPDATE/SHARE cannot be applied to external tables")));
 
-					applyLockingClause(qry, i,
-									   lc->strength, lc->noWait, pushedDown);
+					applyLockingClause(qry, i, lc->strength, lc->waitPolicy,
+									   pushedDown);
 					rte->requiredPerms |= ACL_SELECT_FOR_UPDATE;
 					break;
 				case RTE_SUBQUERY:
-					applyLockingClause(qry, i,
-									   lc->strength, lc->noWait, pushedDown);
+					applyLockingClause(qry, i, lc->strength, lc->waitPolicy,
+									   pushedDown);
 
 					/*
 					 * FOR UPDATE/SHARE of subquery is propagated to all of
@@ -3472,19 +3866,17 @@ transformLockingClause(ParseState *pstate, Query *qry, LockingClause *lc,
 					switch (rte->rtekind)
 					{
 						case RTE_RELATION:
-							if (get_rel_relstorage(rte->relid) == RELSTORAGE_EXTERNAL)
+							if (rel_is_external_table(rte->relid))
 								ereport(ERROR,
 										(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 										 errmsg("SELECT FOR UPDATE/SHARE cannot be applied to external tables")));
-							applyLockingClause(qry, i,
-											   lc->strength, lc->noWait,
-											   pushedDown);
+							applyLockingClause(qry, i, lc->strength,
+											   lc->waitPolicy, pushedDown);
 							rte->requiredPerms |= ACL_SELECT_FOR_UPDATE;
 							break;
 						case RTE_SUBQUERY:
-							applyLockingClause(qry, i,
-											   lc->strength, lc->noWait,
-											   pushedDown);
+							applyLockingClause(qry, i, lc->strength,
+											   lc->waitPolicy, pushedDown);
 							/* see comment above */
 							transformLockingClause(pstate, rte->subquery,
 												   allrels, true);
@@ -3556,9 +3948,12 @@ transformLockingClause(ParseState *pstate, Query *qry, LockingClause *lc,
  */
 void
 applyLockingClause(Query *qry, Index rtindex,
-				   LockClauseStrength strength, bool noWait, bool pushedDown)
+				   LockClauseStrength strength, LockWaitPolicy waitPolicy,
+				   bool pushedDown)
 {
 	RowMarkClause *rc;
+
+	Assert(strength != LCS_NONE);		/* else caller error */
 
 	/* If it's an explicit clause, make sure hasForUpdate gets set */
 	if (!pushedDown)
@@ -3568,20 +3963,26 @@ applyLockingClause(Query *qry, Index rtindex,
 	if ((rc = get_parse_rowmark(qry, rtindex)) != NULL)
 	{
 		/*
-		 * If the same RTE is specified for more than one locking strength,
-		 * treat is as the strongest.  (Reasonable, since you can't take both
-		 * a shared and exclusive lock at the same time; it'll end up being
-		 * exclusive anyway.)
+		 * If the same RTE is specified with more than one locking strength,
+		 * use the strongest.  (Reasonable, since you can't take both a shared
+		 * and exclusive lock at the same time; it'll end up being exclusive
+		 * anyway.)
 		 *
-		 * We also consider that NOWAIT wins if it's specified both ways. This
-		 * is a bit more debatable but raising an error doesn't seem helpful.
-		 * (Consider for instance SELECT FOR UPDATE NOWAIT from a view that
-		 * internally contains a plain FOR UPDATE spec.)
+		 * Similarly, if the same RTE is specified with more than one lock
+		 * wait policy, consider that NOWAIT wins over SKIP LOCKED, which in
+		 * turn wins over waiting for the lock (the default).  This is a bit
+		 * more debatable but raising an error doesn't seem helpful. (Consider
+		 * for instance SELECT FOR UPDATE NOWAIT from a view that internally
+		 * contains a plain FOR UPDATE spec.)  Having NOWAIT win over SKIP
+		 * LOCKED is reasonable since the former throws an error in case of
+		 * coming across a locked tuple, which may be undesirable in some
+		 * cases but it seems better than silently returning inconsistent
+		 * results.
 		 *
 		 * And of course pushedDown becomes false if any clause is explicit.
 		 */
 		rc->strength = Max(rc->strength, strength);
-		rc->noWait |= noWait;
+		rc->waitPolicy = Max(rc->waitPolicy, waitPolicy);
 		rc->pushedDown &= pushedDown;
 		return;
 	}
@@ -3590,11 +3991,34 @@ applyLockingClause(Query *qry, Index rtindex,
 	rc = makeNode(RowMarkClause);
 	rc->rti = rtindex;
 	rc->strength = strength;
-	rc->noWait = noWait;
+	rc->waitPolicy = waitPolicy;
 	rc->pushedDown = pushedDown;
 	qry->rowMarks = lappend(qry->rowMarks, rc);
 }
 
+/*
+ * Coverage testing for raw_expression_tree_walker().
+ *
+ * When enabled, we run raw_expression_tree_walker() over every DML statement
+ * submitted to parse analysis.  Without this provision, that function is only
+ * applied in limited cases involving CTEs, and we don't really want to have
+ * to test everything inside as well as outside a CTE.
+ */
+#ifdef RAW_EXPRESSION_COVERAGE_TEST
+
+static bool
+test_raw_expression_coverage(Node *node, void *context)
+{
+	if (node == NULL)
+		return false;
+	return raw_expression_tree_walker(node,
+									  test_raw_expression_coverage,
+									  context);
+}
+
+#endif   /* RAW_EXPRESSION_COVERAGE_TEST */
+
+/* GPDB statics follow */
 /*
  * Get distribute key by name.
  *
@@ -3652,27 +4076,32 @@ get_distkey_by_name(char *key, IntoClause *into, Query *qry, bool *found)
  *
  * 2. If no DISTRIBUTED BY was given explicitly, we don't try to deduce a
  * default here. We delay that into the planner because we'll have more
- * information available at that point (see apply_motion()).
+ * information available at that point (see cdbllize_adjust_top_path()).
  */
 static void
 setQryDistributionPolicy(IntoClause *into, Query *qry)
 {
-	ListCell   *keys = NULL;
+	ListCell   *lc;
 	DistributedBy *dist;
 
-	Assert(Gp_role == GP_ROLE_DISPATCH);
+	/*
+	 * In binary upgrade mode, we need to create materialize view in utility mode. So we
+	 * should enable the setQryDistributionPolicy function in binary upgrade mode.
+	 */
+	Assert(Gp_role == GP_ROLE_DISPATCH || Gp_role == GP_ROLE_UTILITY);
 	Assert(into != NULL);
 	Assert(into->distributedBy != NULL);
 
 	dist = (DistributedBy *)into->distributedBy;
 
-	dist->numsegments = GP_POLICY_ALL_NUMSEGMENTS;
+	if (dist->numsegments < 0)
+		dist->numsegments = GP_POLICY_DEFAULT_NUMSEGMENTS();
 
 	/*
 	 * We have a DISTRIBUTED BY column list specified by the user
 	 * Process it now and set the distribution policy.
 	 */
-	if (list_length(dist->keys) > MaxPolicyAttributeNumber)
+	if (list_length(dist->keyCols) > MaxPolicyAttributeNumber)
 		ereport(ERROR,
 				(errcode(ERRCODE_TOO_MANY_COLUMNS),
 				 errmsg("number of distributed by columns exceeds limit (%d)",
@@ -3683,25 +4112,128 @@ setQryDistributionPolicy(IntoClause *into, Query *qry)
 	else
 	{
 		List	*policykeys = NIL;
-		foreach(keys, dist->keys)
+		List	*policyopclasses = NIL;
+
+		foreach(lc, dist->keyCols)
 		{
-			char	   *key = strVal(lfirst(keys));
+			IndexElem  *ielem = (IndexElem *) lfirst(lc);
 			bool		found = false;
-			int keyindex;
+			int			keyindex;
+			Oid			keytype;
+			Oid			keyopclass;
+			TargetEntry *tle;
 
-			keyindex = get_distkey_by_name(key, into, qry, &found);
-
+			keyindex = get_distkey_by_name(ielem->name, into, qry, &found);
 			if (!found)
 				ereport(ERROR,
 						(errcode(ERRCODE_UNDEFINED_COLUMN),
 						 errmsg("column \"%s\" named in DISTRIBUTED BY "
 								"clause does not exist",
-								key)));
+								ielem->name)));
+
+			tle = list_nth(qry->targetList, keyindex - 1);
+
+			keytype = exprType((Node *) tle->expr);
+			keyopclass = cdb_get_opclass_for_column_def(ielem->opclass,
+														keytype);
 
 			policykeys = lappend_int(policykeys, keyindex);
+			policyopclasses = lappend_oid(policyopclasses, keyopclass);
 		}
 
 		qry->intoPolicy = createHashPartitionedPolicy(policykeys,
+													  policyopclasses,
 													  dist->numsegments);
+	}
+}
+
+/*
+ * checkCanOptSelectLockingClause is used to test
+ * whether a select-statement containing locking clause
+ * can behave like Postgres. We have to know it before
+ * we acquire any locks on the tables.
+ */
+static bool
+checkCanOptSelectLockingClause(SelectStmt *stmt)
+{
+	QueryNodeSearchContext ctx = {false};
+
+	if (!IS_QUERY_DISPATCHER())
+		return false;
+
+	if (!gp_enable_global_deadlock_detector)
+		return false;
+
+	/*
+	 * The disableLockingOptimization field is set true
+	 * in exec_parse_message to mark queries that using extended
+	 * protocal.
+	 */
+	if (stmt->disableLockingOptimization)
+		return false;
+
+	/*
+	 * TODO: if future ORCA can emit LockRows plannode,
+	 * we should remove such restriction here.
+	 */
+	if (optimizer)
+		return false;
+
+	if (stmt->op != SETOP_NONE)
+		return false;
+
+	if (list_length(stmt->fromClause) != 1)
+		return false;
+
+	if (!IsA(linitial(stmt->fromClause), RangeVar))
+		return false;
+
+	if (!stmt->lockingClause)
+		return false;
+
+	(void) raw_expression_tree_walker(stmt->whereClause,
+									  queryNodeSearch, (void *)(&ctx));
+
+	if (ctx.found)
+		return false;
+
+	return true;
+}
+
+static bool
+queryNodeSearch(Node *node, void *context)
+{
+	if (IsA(node, Query))
+	{
+		((QueryNodeSearchContext *)context)->found = true;
+		return false;
+	}
+
+	return true;
+}
+
+static void
+sanity_check_on_conflict_update_set_distkey(Oid relid, List *onconflict_set)
+{
+	ListCell  *lc;
+	Bitmapset *dist_cols = NULL;
+	Bitmapset *conflict_update_cols = NULL;
+	GpPolicy  *policy = GpPolicyFetch(relid);
+
+	for (int i = 0; i < policy->nattrs; i++)
+		dist_cols = bms_add_member(dist_cols, policy->attrs[i]);
+
+	foreach(lc, onconflict_set)
+	{
+		TargetEntry *te = lfirst(lc);
+		conflict_update_cols = bms_add_member(conflict_update_cols,
+											  te->resno);
+	}
+
+	if (!bms_is_empty(bms_intersect(dist_cols, conflict_update_cols)))
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("modification of distribution columns in OnConflictUpdate is not supported")));
 	}
 }

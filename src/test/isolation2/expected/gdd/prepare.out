@@ -3,15 +3,15 @@ DROP TABLE IF EXISTS t0p;
 DROP
 CREATE TABLE t0p (id int, val int);
 CREATE
-INSERT INTO t0p (id, val) SELECT i, i FROM generate_series(1, 20) i;
-INSERT 20
+INSERT INTO t0p (id, val) SELECT i, i FROM generate_series(1, 100) i;
+INSERT 100
 
 DROP TABLE IF EXISTS t0r;
 DROP
 CREATE TABLE t0r (id int, val int, segid int) DISTRIBUTED REPLICATED;
 CREATE
 INSERT INTO t0r (id, val, segid) SELECT id, val, gp_segment_id from t0p;
-INSERT 20
+INSERT 100
 
 -- GDD tests rely on the data distribution, but depends on the number of
 -- the segments the distribution might be different.
@@ -41,52 +41,71 @@ CREATE OR REPLACE FUNCTION barrier() RETURNS void AS $$ SELECT pg_sleep(4) $$ LA
 CREATE
 
 -- verify the function
--- Data distribution is sensitive to the underlying hash algorithm.
-SELECT segid(0,1);
-segid
------
-4    
+-- Data distribution is sensitive to the underlying hash algorithm, we need each
+-- segment has enough tuples for test, 10 should be enough.
+SELECT segid(0,10) is not null;
+ ?column? 
+----------
+ t        
 (1 row)
-SELECT segid(0,2);
-segid
------
-7    
+SELECT segid(1,10) is not null;
+ ?column? 
+----------
+ t        
 (1 row)
-SELECT segid(1,1);
-segid
------
-2    
-(1 row)
-SELECT segid(1,2);
-segid
------
-5    
+SELECT segid(2,10) is not null;
+ ?column? 
+----------
+ t        
 (1 row)
 
+--enable GDD
 -- start_ignore
-! gpconfig -c gp_global_deadlock_detector_period -v 10;
-20180313:15:24:17:085127 gpconfig:zlv:gpadmin-[INFO]:-completed successfully with parameters '-c gp_global_deadlock_detector_period -v 10'
+! gpconfig -c gp_enable_global_deadlock_detector -v on;
+20200424:15:49:54:048653 gpconfig:zlv:gpadmin-[INFO]:-completed successfully with parameters '-c gp_enable_global_deadlock_detector -v on'
 
-! gpstop -u;
-20180313:15:24:17:085283 gpstop:zlv:gpadmin-[INFO]:-Starting gpstop with args: -u
-20180313:15:24:17:085283 gpstop:zlv:gpadmin-[INFO]:-Gathering information and validating the environment...
-20180313:15:24:17:085283 gpstop:zlv:gpadmin-[INFO]:-Obtaining Greenplum Master catalog information
-20180313:15:24:17:085283 gpstop:zlv:gpadmin-[INFO]:-Obtaining Segment details from master...
-20180313:15:24:17:085283 gpstop:zlv:gpadmin-[INFO]:-Greenplum Version: 'postgres (Greenplum Database) 6.0.0-alpha.0+dev.3836.g671368b build dev-oss'
-20180313:15:24:17:085283 gpstop:zlv:gpadmin-[INFO]:-Signalling all postmaster processes to reload
-. 
+! gpconfig -c gp_global_deadlock_detector_period -v 5;
+20200424:15:49:56:049353 gpconfig:zlv:gpadmin-[INFO]:-completed successfully with parameters '-c gp_global_deadlock_detector_period -v 5'
+
+! gpstop -rai;
+20200424:15:49:56:050055 gpstop:zlv:gpadmin-[INFO]:-Starting gpstop with args: -rai
+20200424:15:49:56:050055 gpstop:zlv:gpadmin-[INFO]:-Gathering information and validating the environment...
+20200424:15:49:56:050055 gpstop:zlv:gpadmin-[INFO]:-Obtaining Greenplum Master catalog information
+20200424:15:49:56:050055 gpstop:zlv:gpadmin-[INFO]:-Obtaining Segment details from master...
+20200424:15:49:56:050055 gpstop:zlv:gpadmin-[INFO]:-Greenplum Version: 'postgres (Greenplum Database) 7.0.0-alpha.0+dev.6778.g000faed10b build dev'
+20200424:15:49:56:050055 gpstop:zlv:gpadmin-[INFO]:-Commencing Master instance shutdown with mode='immediate'
+20200424:15:49:56:050055 gpstop:zlv:gpadmin-[INFO]:-Master segment instance directory=/home/gpadmin/workspace/gpdb/gpAux/gpdemo/datadirs/qddir/demoDataDir-1
+20200424:15:49:56:050055 gpstop:zlv:gpadmin-[INFO]:-Attempting forceful termination of any leftover master process
+20200424:15:49:56:050055 gpstop:zlv:gpadmin-[INFO]:-Terminating processes for segment /home/gpadmin/workspace/gpdb/gpAux/gpdemo/datadirs/qddir/demoDataDir-1
+20200424:15:49:56:050055 gpstop:zlv:gpadmin-[INFO]:-Stopping master standby host zlv mode=immediate
+20200424:15:49:58:050055 gpstop:zlv:gpadmin-[INFO]:-Successfully shutdown standby process on zlv
+20200424:15:49:58:050055 gpstop:zlv:gpadmin-[INFO]:-Targeting dbid [2, 5, 3, 6, 4, 7] for shutdown
+20200424:15:49:58:050055 gpstop:zlv:gpadmin-[INFO]:-Commencing parallel primary segment instance shutdown, please wait...
+20200424:15:49:58:050055 gpstop:zlv:gpadmin-[INFO]:-0.00% of jobs completed
+20200424:15:49:59:050055 gpstop:zlv:gpadmin-[INFO]:-100.00% of jobs completed
+20200424:15:49:59:050055 gpstop:zlv:gpadmin-[INFO]:-Commencing parallel mirror segment instance shutdown, please wait...
+20200424:15:49:59:050055 gpstop:zlv:gpadmin-[INFO]:-0.00% of jobs completed
+20200424:15:50:00:050055 gpstop:zlv:gpadmin-[INFO]:-100.00% of jobs completed
+20200424:15:50:00:050055 gpstop:zlv:gpadmin-[INFO]:-----------------------------------------------------
+20200424:15:50:00:050055 gpstop:zlv:gpadmin-[INFO]:-   Segments stopped successfully      = 6
+20200424:15:50:00:050055 gpstop:zlv:gpadmin-[INFO]:-   Segments with errors during stop   = 0
+20200424:15:50:00:050055 gpstop:zlv:gpadmin-[INFO]:-----------------------------------------------------
+20200424:15:50:00:050055 gpstop:zlv:gpadmin-[INFO]:-Successfully shutdown 6 of 6 segment instances 
+20200424:15:50:00:050055 gpstop:zlv:gpadmin-[INFO]:-Database successfully shutdown with no errors reported
+20200424:15:50:00:050055 gpstop:zlv:gpadmin-[INFO]:-Cleaning up leftover shared memory
+20200424:15:50:01:050055 gpstop:zlv:gpadmin-[INFO]:-Restarting System...
 
 -- end_ignore
 
--- the new setting need some time to be loaded
-SELECT pg_sleep(2);
-pg_sleep
---------
-        
+-- Start new session on master to make sure it has fully completed
+-- recovery and up and running again.
+1: SHOW gp_enable_global_deadlock_detector;
+ gp_enable_global_deadlock_detector 
+------------------------------------
+ on                                 
 (1 row)
-
-SHOW gp_global_deadlock_detector_period;
-gp_global_deadlock_detector_period
-----------------------------------
-10s                               
+1: SHOW gp_global_deadlock_detector_period;
+ gp_global_deadlock_detector_period 
+------------------------------------
+ 5s                                 
 (1 row)

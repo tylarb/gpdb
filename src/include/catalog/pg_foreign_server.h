@@ -3,7 +3,7 @@
  * pg_foreign_server.h
  *	  definition of the system "foreign server" relation (pg_foreign_server)
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/catalog/pg_foreign_server.h
@@ -60,5 +60,10 @@ typedef FormData_pg_foreign_server *Form_pg_foreign_server;
 #define Anum_pg_foreign_server_srvversion		5
 #define Anum_pg_foreign_server_srvacl			6
 #define Anum_pg_foreign_server_srvoptions		7
+
+DATA(insert OID = 5105 ( pg_exttable_server	PGUID	5104	_null_ _null_ _null_ _null_ ));
+DESCR("special foreign server to mark external tables");
+#define PG_EXTTABLE_SERVER_OID 5105
+#define PG_EXTTABLE_SERVER_NAME "pg_exttable_server"
 
 #endif   /* PG_FOREIGN_SERVER_H */

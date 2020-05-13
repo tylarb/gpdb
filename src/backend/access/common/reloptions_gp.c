@@ -48,7 +48,8 @@ static relopt_bool boolRelOpts_gp[] =
 		{
 			SOPT_APPENDONLY,
 			"Append only storage parameter",
-			RELOPT_KIND_HEAP
+			RELOPT_KIND_HEAP,
+			AccessExclusiveLock
 		},
 		AO_DEFAULT_APPENDONLY,
 	},
@@ -56,7 +57,8 @@ static relopt_bool boolRelOpts_gp[] =
 		{
 			SOPT_CHECKSUM,
 			"Append table checksum",
-			RELOPT_KIND_HEAP
+			RELOPT_KIND_HEAP,
+			AccessExclusiveLock
 		},
 		AO_DEFAULT_CHECKSUM
 	},
@@ -70,7 +72,9 @@ static relopt_int intRelOpts_gp[] =
 		{
 			SOPT_FILLFACTOR,
 			"Packs bitmap index pages only to this percentage",
-			RELOPT_KIND_BITMAP
+			RELOPT_KIND_BITMAP,
+			ShareUpdateExclusiveLock	/* since it applies only to later
+										 * inserts */
 		},
 		BITMAP_DEFAULT_FILLFACTOR, BITMAP_MIN_FILLFACTOR, 100
 	},
@@ -78,7 +82,8 @@ static relopt_int intRelOpts_gp[] =
 		{
 			SOPT_BLOCKSIZE,
 			"AO tables block size in bytes",
-			RELOPT_KIND_HEAP
+			RELOPT_KIND_HEAP,
+			AccessExclusiveLock
 		},
 		AO_DEFAULT_BLOCKSIZE, MIN_APPENDONLY_BLOCK_SIZE, MAX_APPENDONLY_BLOCK_SIZE
 	},
@@ -86,17 +91,11 @@ static relopt_int intRelOpts_gp[] =
 		{
 			SOPT_COMPLEVEL,
 			"AO table compression level",
-			RELOPT_KIND_HEAP
+			RELOPT_KIND_HEAP,
+			ShareUpdateExclusiveLock	/* since it applies only to later
+										 * inserts */
 		},
 		AO_DEFAULT_COMPRESSLEVEL, AO_MIN_COMPRESSLEVEL, AO_MAX_COMPRESSLEVEL
-	},
-	{
-		{
-			SOPT_FILLFACTOR,
-			"Packs bitmap index pages only to this percentage",
-			RELOPT_KIND_BITMAP
-		},
-		HEAP_DEFAULT_FILLFACTOR, HEAP_MIN_FILLFACTOR, 100
 	},
 	/* list terminator */
 	{{NULL}}
@@ -114,15 +113,17 @@ static relopt_string stringRelOpts_gp[] =
 		{
 			SOPT_COMPTYPE,
 			"AO tables compression type",
-			RELOPT_KIND_HEAP
+			RELOPT_KIND_HEAP,
+			AccessExclusiveLock
 		},
 		0, true, NULL, ""
 	},
 	{
 		{
 			SOPT_ORIENTATION,
-				"AO tables orientation",
-				RELOPT_KIND_HEAP
+			"AO tables orientation",
+			RELOPT_KIND_HEAP,
+			AccessExclusiveLock
 		},
 		0, false, NULL, ""
 	},
@@ -157,6 +158,7 @@ initialize_reloptions_gp(void)
 						   (char *) boolRelOpts_gp[i].gen.name,
 						   (char *) boolRelOpts_gp[i].gen.desc,
 						   boolRelOpts_gp[i].default_val);
+		set_reloption_lockmode(boolRelOpts_gp[i].gen.name, boolRelOpts_gp[i].gen.lockmode);
 	}
 
 	for (i = 0; intRelOpts_gp[i].gen.name; i++)
@@ -167,6 +169,7 @@ initialize_reloptions_gp(void)
 						  intRelOpts_gp[i].default_val,
 						  intRelOpts_gp[i].min,
 						  intRelOpts_gp[i].max);
+		set_reloption_lockmode(intRelOpts_gp[i].gen.name, intRelOpts_gp[i].gen.lockmode);
 	}
 
 	for (i = 0; realRelOpts_gp[i].gen.name; i++)
@@ -176,6 +179,7 @@ initialize_reloptions_gp(void)
 						   (char *) realRelOpts_gp[i].gen.desc,
 						   realRelOpts_gp[i].default_val,
 						   realRelOpts_gp[i].min, realRelOpts_gp[i].max);
+		set_reloption_lockmode(realRelOpts_gp[i].gen.name, realRelOpts_gp[i].gen.lockmode);
 	}
 
 	for (i = 0; stringRelOpts_gp[i].gen.name; i++)
@@ -185,6 +189,7 @@ initialize_reloptions_gp(void)
 							 (char *) stringRelOpts_gp[i].gen.desc,
 							 NULL,
 							 stringRelOpts_gp[i].validate_cb);
+		set_reloption_lockmode(stringRelOpts_gp[i].gen.name, stringRelOpts_gp[i].gen.lockmode);
 	}
 }
 
@@ -222,7 +227,13 @@ accumAOStorageOpt(char *name, char *value,
 
 	initStringInfo(&buf);
 
-	if (pg_strcasecmp(SOPT_APPENDONLY, name) == 0)
+	/*
+	 * "appendoptimized" is a recognized alias for "appendonly", but it's a
+	 * thin alias in the sense that "appendonly" will be saved as the storage
+	 * option.
+	 */
+	if ((pg_strcasecmp(SOPT_APPENDONLY, name) == 0) ||
+		(pg_strcasecmp(SOPT_ALIAS_APPENDOPTIMIZED, name) == 0))
 	{
 		if (!parse_bool(value, &boolval))
 			ereport(ERROR,
@@ -343,12 +354,6 @@ currentAOStorageOptions(void)
 void
 setDefaultAOStorageOpts(StdRdOptions *copy)
 {
-	if (ao_storage_opts.compresstype)
-		ao_storage_opts.compresstype[0] = '\0';
-
-	if (ao_storage_opts.orientation)
-		ao_storage_opts.orientation[0] = '\0';
-
 	memcpy(&ao_storage_opts, copy, sizeof(ao_storage_opts));
 	if (pg_strcasecmp(copy->compresstype, "none") == 0)
 	{
@@ -582,11 +587,10 @@ Datum
 transformAOStdRdOptions(StdRdOptions *opts, Datum withOpts)
 {
 	char	   *strval;
-	char		intval[MAX_SOPT_VALUE_LEN];
 	Datum	   *withDatums = NULL;
+	Datum		d;
 	text	   *t;
-	int			len,
-				i,
+	int			i,
 				withLen,
 				soptLen,
 				nWithOpts = 0;
@@ -636,28 +640,22 @@ transformAOStdRdOptions(StdRdOptions *opts, Datum withOpts)
 				pg_strncasecmp(strval, SOPT_APPENDONLY, soptLen) == 0)
 			{
 				foundAO = true;
-				strval = opts->appendonly ? "true" : "false";
-				len = VARHDRSZ + strlen(SOPT_APPENDONLY) + 1 + strlen(strval);
-				/* +1 leaves room for sprintf's trailing null */
-				t = (text *) palloc(len + 1);
-				SET_VARSIZE(t, len);
-				sprintf(VARDATA(t), "%s=%s", SOPT_APPENDONLY, strval);
-				astate = accumArrayResult(astate, PointerGetDatum(t), false,
-										  TEXTOID, CurrentMemoryContext);
+				d = CStringGetTextDatum(psprintf("%s=%s",
+												 SOPT_APPENDONLY,
+												 (opts->appendonly ? "true" : "false"))),
+				astate = accumArrayResult(astate, d, false, TEXTOID,
+										  CurrentMemoryContext);
 			}
 			soptLen = strlen(SOPT_BLOCKSIZE);
 			if (withLen > soptLen &&
 				pg_strncasecmp(strval, SOPT_BLOCKSIZE, soptLen) == 0)
 			{
 				foundBlksz = true;
-				snprintf(intval, MAX_SOPT_VALUE_LEN, "%d", opts->blocksize);
-				len = VARHDRSZ + strlen(SOPT_BLOCKSIZE) + 1 + strlen(intval);
-				/* +1 leaves room for sprintf's trailing null */
-				t = (text *) palloc(len + 1);
-				SET_VARSIZE(t, len);
-				sprintf(VARDATA(t), "%s=%s", SOPT_BLOCKSIZE, intval);
-				astate = accumArrayResult(astate, PointerGetDatum(t), false,
-										  TEXTOID, CurrentMemoryContext);
+				d = CStringGetTextDatum(psprintf("%s=%d",
+												 SOPT_BLOCKSIZE,
+												 opts->blocksize));
+				astate = accumArrayResult(astate, d, false, TEXTOID,
+										  CurrentMemoryContext);
 			}
 			soptLen = strlen(SOPT_COMPTYPE);
 			if (withLen > soptLen &&
@@ -669,57 +667,44 @@ transformAOStdRdOptions(StdRdOptions *opts, Datum withOpts)
 				 * Record "none" as compresstype in reloptions if it was
 				 * explicitly specified in WITH clause.
 				 */
-				strval = (opts->compresstype[0]) ?
-					opts->compresstype : "none";
-				len = VARHDRSZ + strlen(SOPT_COMPTYPE) + 1 + strlen(strval);
-				/* +1 leaves room for sprintf's trailing null */
-				t = (text *) palloc(len + 1);
-				SET_VARSIZE(t, len);
-				sprintf(VARDATA(t), "%s=%s", SOPT_COMPTYPE, strval);
-				astate = accumArrayResult(astate, PointerGetDatum(t), false,
-										  TEXTOID, CurrentMemoryContext);
+				d = CStringGetTextDatum(psprintf("%s=%s",
+												 SOPT_COMPTYPE,
+												 (opts->compresstype[0] ? opts->compresstype : "none")));
+				astate = accumArrayResult(astate, d, false, TEXTOID,
+										  CurrentMemoryContext);
 			}
 			soptLen = strlen(SOPT_COMPLEVEL);
 			if (withLen > soptLen &&
 				pg_strncasecmp(strval, SOPT_COMPLEVEL, soptLen) == 0)
 			{
 				foundComplevel = true;
-				snprintf(intval, MAX_SOPT_VALUE_LEN, "%d", opts->compresslevel);
-				len = VARHDRSZ + strlen(SOPT_COMPLEVEL) + 1 + strlen(intval);
-				/* +1 leaves room for sprintf's trailing null */
-				t = (text *) palloc(len + 1);
-				SET_VARSIZE(t, len);
-				sprintf(VARDATA(t), "%s=%s", SOPT_COMPLEVEL, intval);
-				astate = accumArrayResult(astate, PointerGetDatum(t), false,
-										  TEXTOID, CurrentMemoryContext);
+				d = CStringGetTextDatum(psprintf("%s=%d",
+												 SOPT_COMPLEVEL,
+												 opts->compresslevel));
+				astate = accumArrayResult(astate, d, false, TEXTOID,
+										  CurrentMemoryContext);
 			}
 			soptLen = strlen(SOPT_CHECKSUM);
 			if (withLen > soptLen &&
 				pg_strncasecmp(strval, SOPT_CHECKSUM, soptLen) == 0)
 			{
 				foundChecksum = true;
-				strval = opts->checksum ? "true" : "false";
-				len = VARHDRSZ + strlen(SOPT_CHECKSUM) + 1 + strlen(strval);
-				/* +1 leaves room for sprintf's trailing null */
-				t = (text *) palloc(len + 1);
-				SET_VARSIZE(t, len);
-				sprintf(VARDATA(t), "%s=%s", SOPT_CHECKSUM, strval);
-				astate = accumArrayResult(astate, PointerGetDatum(t), false,
-										  TEXTOID, CurrentMemoryContext);
+				d = CStringGetTextDatum(psprintf("%s=%s",
+												 SOPT_CHECKSUM,
+												 (opts->checksum ? "true" : "false")));
+				astate = accumArrayResult(astate, d, false, TEXTOID,
+										  CurrentMemoryContext);
 			}
 			soptLen = strlen(SOPT_ORIENTATION);
 			if (withLen > soptLen &&
 				pg_strncasecmp(strval, SOPT_ORIENTATION, soptLen) == 0)
 			{
 				foundOrientation = true;
-				strval = opts->columnstore ? "column" : "row";
-				len = VARHDRSZ + strlen(SOPT_ORIENTATION) + 1 + strlen(strval);
-				/* +1 leaves room for sprintf's trailing null */
-				t = (text *) palloc(len + 1);
-				SET_VARSIZE(t, len);
-				sprintf(VARDATA(t), "%s=%s", SOPT_ORIENTATION, strval);
-				astate = accumArrayResult(astate, PointerGetDatum(t), false,
-										  TEXTOID, CurrentMemoryContext);
+				d = CStringGetTextDatum(psprintf("%s=%s",
+												 SOPT_ORIENTATION,
+												 (opts->columnstore ? "column" : "row")));
+				astate = accumArrayResult(astate, d, false, TEXTOID,
+										  CurrentMemoryContext);
 			}
 
 			/*
@@ -730,42 +715,30 @@ transformAOStdRdOptions(StdRdOptions *opts, Datum withOpts)
 			if (withLen > soptLen &&
 				pg_strncasecmp(strval, SOPT_FILLFACTOR, soptLen) == 0)
 			{
-				snprintf(intval, MAX_SOPT_VALUE_LEN, "%d", opts->fillfactor);
-				len = VARHDRSZ + strlen(SOPT_FILLFACTOR) + 1 + strlen(intval);
-				/* +1 leaves room for sprintf's trailing null */
-				t = (text *) palloc(len + 1);
-				SET_VARSIZE(t, len);
-				sprintf(VARDATA(t), "%s=%s", SOPT_FILLFACTOR, intval);
-				astate = accumArrayResult(astate, PointerGetDatum(t), false,
-										  TEXTOID, CurrentMemoryContext);
+				d = CStringGetTextDatum(psprintf("%s=%d",
+												 SOPT_FILLFACTOR,
+												 opts->fillfactor));
+				astate = accumArrayResult(astate, d, false, TEXTOID,
+										  CurrentMemoryContext);
 			}
 		}
 	}
+
 	/* Include options that are not defaults and not already included. */
 	if ((opts->appendonly != AO_DEFAULT_APPENDONLY) && !foundAO)
 	{
-		/* appendonly */
-		strval = opts->appendonly ? "true" : "false";
-		len = VARHDRSZ + strlen(SOPT_APPENDONLY) + 1 + strlen(strval);
-		/* +1 leaves room for sprintf's trailing null */
-		t = (text *) palloc(len + 1);
-		SET_VARSIZE(t, len);
-		sprintf(VARDATA(t), "%s=%s", SOPT_APPENDONLY, strval);
-		astate = accumArrayResult(astate, PointerGetDatum(t),
-								  false, TEXTOID,
+		d = CStringGetTextDatum(psprintf("%s=%s",
+										 SOPT_APPENDONLY,
+										 (opts->appendonly ? "true" : "false")));
+		astate = accumArrayResult(astate, d, false, TEXTOID,
 								  CurrentMemoryContext);
 	}
 	if ((opts->blocksize != AO_DEFAULT_BLOCKSIZE) && !foundBlksz)
 	{
-		/* blocksize */
-		snprintf(intval, MAX_SOPT_VALUE_LEN, "%d", opts->blocksize);
-		len = VARHDRSZ + strlen(SOPT_BLOCKSIZE) + 1 + strlen(intval);
-		/* +1 leaves room for sprintf's trailing null */
-		t = (text *) palloc(len + 1);
-		SET_VARSIZE(t, len);
-		sprintf(VARDATA(t), "%s=%s", SOPT_BLOCKSIZE, intval);
-		astate = accumArrayResult(astate, PointerGetDatum(t),
-								  false, TEXTOID,
+		d = CStringGetTextDatum(psprintf("%s=%d",
+										 SOPT_BLOCKSIZE,
+										 opts->blocksize));
+		astate = accumArrayResult(astate, d, false, TEXTOID,
 								  CurrentMemoryContext);
 	}
 
@@ -783,57 +756,38 @@ transformAOStdRdOptions(StdRdOptions *opts, Datum withOpts)
 							   pg_strcasecmp(opts->compresstype,
 											 AO_DEFAULT_COMPRESSTYPE) != 0))
 		{
-			/* compress type */
-			strval = opts->compresstype;
-			len = VARHDRSZ + strlen(SOPT_COMPTYPE) + 1 + strlen(strval);
-			/* +1 leaves room for sprintf's trailing null */
-			t = (text *) palloc(len + 1);
-			SET_VARSIZE(t, len);
-			sprintf(VARDATA(t), "%s=%s", SOPT_COMPTYPE, strval);
-			astate = accumArrayResult(astate, PointerGetDatum(t),
-									  false, TEXTOID,
+			d = CStringGetTextDatum(psprintf("%s=%s",
+											 SOPT_COMPTYPE,
+											 opts->compresstype));
+			astate = accumArrayResult(astate, d, false, TEXTOID,
 									  CurrentMemoryContext);
 		}
 		/* When compression is enabled, default compresslevel is 1. */
 		if ((opts->compresslevel != 1) &&
 			!foundComplevel)
 		{
-			/* compress level */
-			snprintf(intval, MAX_SOPT_VALUE_LEN, "%d", opts->compresslevel);
-			len = VARHDRSZ + strlen(SOPT_COMPLEVEL) + 1 + strlen(intval);
-			/* +1 leaves room for sprintf's trailing null */
-			t = (text *) palloc(len + 1);
-			SET_VARSIZE(t, len);
-			sprintf(VARDATA(t), "%s=%s", SOPT_COMPLEVEL, intval);
-			astate = accumArrayResult(astate, PointerGetDatum(t),
-									  false, TEXTOID,
+			d = CStringGetTextDatum(psprintf("%s=%d",
+											 SOPT_COMPLEVEL,
+											 opts->compresslevel));
+			astate = accumArrayResult(astate, d, false, TEXTOID,
 									  CurrentMemoryContext);
 		}
 	}
+
 	if ((opts->checksum != AO_DEFAULT_CHECKSUM) && !foundChecksum)
 	{
-		/* checksum */
-		strval = opts->checksum ? "true" : "false";
-		len = VARHDRSZ + strlen(SOPT_CHECKSUM) + 1 + strlen(strval);
-		/* +1 leaves room for sprintf's trailing null */
-		t = (text *) palloc(len + 1);
-		SET_VARSIZE(t, len);
-		sprintf(VARDATA(t), "%s=%s", SOPT_CHECKSUM, strval);
-		astate = accumArrayResult(astate, PointerGetDatum(t),
-								  false, TEXTOID,
+		d = CStringGetTextDatum(psprintf("%s=%s",
+										 SOPT_CHECKSUM,
+										 (opts->checksum ? "true" : "false")));
+		astate = accumArrayResult(astate, d, false, TEXTOID,
 								  CurrentMemoryContext);
 	}
 	if ((opts->columnstore != AO_DEFAULT_COLUMNSTORE) && !foundOrientation)
 	{
-		/* orientation */
-		strval = opts->columnstore ? "column" : "row";
-		len = VARHDRSZ + strlen(SOPT_ORIENTATION) + 1 + strlen(strval);
-		/* +1 leaves room for sprintf's trailing null */
-		t = (text *) palloc(len + 1);
-		SET_VARSIZE(t, len);
-		sprintf(VARDATA(t), "%s=%s", SOPT_ORIENTATION, strval);
-		astate = accumArrayResult(astate, PointerGetDatum(t),
-								  false, TEXTOID,
+		d = CStringGetTextDatum(psprintf("%s=%s",
+										 SOPT_ORIENTATION,
+										 (opts->columnstore ? "column" : "row")));
+		astate = accumArrayResult(astate, d, false, TEXTOID,
 								  CurrentMemoryContext);
 	}
 	return astate ?
@@ -884,8 +838,8 @@ validate_and_adjust_options(StdRdOptions *result,
 		if (!result->appendonly && validate)
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("invalid option 'blocksize' for base relation. "
-							"Only valid for Append Only relations")));
+					 errmsg("invalid option \"blocksize\" for base relation"),
+					 errhint("\"blocksize\" is only valid for Append Only relations, create an AO relation to use \"blocksize\".")));
 
 		result->blocksize = blocksize_opt->values.int_val;
 
@@ -896,8 +850,8 @@ validate_and_adjust_options(StdRdOptions *result,
 			if (validate)
 				ereport(ERROR,
 						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-						 errmsg("block size must be between 8KB and 2MB and be"
-								" an 8KB multiple. Got %d", result->blocksize)));
+						 errmsg("block size must be between 8KB and 2MB and be a multiple of 8KB"),
+						 errdetail("Got block size %d.", result->blocksize)));
 
 			result->blocksize = DEFAULT_APPENDONLY_BLOCK_SIZE;
 		}
@@ -916,8 +870,8 @@ validate_and_adjust_options(StdRdOptions *result,
 		if (!result->appendonly && validate)
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("invalid option \"compresstype\" for base relation."
-							" Only valid for Append Only relations")));
+					 errmsg("invalid option \"compresstype\" for base relation"),
+					 errhint("\"compresstype\" is only valid for Append Only relations, create an AO relation to use \"compresstype\".")));
 
 		if (!compresstype_is_valid(comptype_opt->values.string_val))
 			ereport(ERROR,
@@ -941,8 +895,8 @@ validate_and_adjust_options(StdRdOptions *result,
 		if (!result->appendonly && validate)
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("invalid option 'compresslevel' for base "
-							"relation. Only valid for Append Only relations")));
+					 errmsg("invalid option \"compresslevel\" for base relation"),
+					 errhint("Compression only valid for Append Only relations, create an AO relation to use compression.")));
 
 		result->compresslevel = complevel_opt->values.int_val;
 
@@ -951,7 +905,8 @@ validate_and_adjust_options(StdRdOptions *result,
 			result->compresslevel == 0 && validate)
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-					 errmsg("compresstype can\'t be used with compresslevel 0")));
+					 errmsg("compresstype \"%s\" can\'t be used with compresslevel 0",
+							result->compresstype)));
 		if (result->compresslevel < 0)
 		{
 			if (validate)
@@ -974,17 +929,24 @@ validate_and_adjust_options(StdRdOptions *result,
 		/* Check upper bound of compresslevel for each compression type */
 
 		if (result->compresstype[0] &&
-			(pg_strcasecmp(result->compresstype, "zlib") == 0) &&
-			(result->compresslevel > 9))
+			(pg_strcasecmp(result->compresstype, "zlib") == 0))
 		{
-			if (validate)
-				ereport(ERROR,
-						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-						 errmsg("compresslevel=%d is out of range for zlib "
-								"(should be in the range 1 to 9)",
-								result->compresslevel)));
+#ifndef HAVE_LIBZ
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("zlib compression is not supported by this build"),
+					 errhint("Compile without --without-zlib to use zlib compression.")));
+#endif
+			if (result->compresslevel > 9)
+			{
+				if (validate)
+					ereport(ERROR,
+							(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+							 errmsg("compresslevel=%d is out of range for zlib (should be in the range 1 to 9)",
+									result->compresslevel)));
 
-			result->compresslevel = setDefaultCompressionLevel(result->compresstype);
+				result->compresslevel = setDefaultCompressionLevel(result->compresstype);
+			}
 		}
 
 		if (result->compresstype[0] &&
@@ -1001,8 +963,7 @@ validate_and_adjust_options(StdRdOptions *result,
 				if (validate)
 					ereport(ERROR,
 							(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-							 errmsg("compresslevel=%d is out of range for zstd "
-									"(should be in the range 1 to 19)",
+							 errmsg("compresslevel=%d is out of range for zstd (should be in the range 1 to 19)",
 									result->compresslevel)));
 
 				result->compresslevel = setDefaultCompressionLevel(result->compresstype);
@@ -1010,17 +971,24 @@ validate_and_adjust_options(StdRdOptions *result,
 		}
 
 		if (result->compresstype[0] &&
-			(pg_strcasecmp(result->compresstype, "quicklz") == 0) &&
-			(result->compresslevel != 1))
+			(pg_strcasecmp(result->compresstype, "quicklz") == 0))
 		{
-			if (validate)
-				ereport(ERROR,
-						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-						 errmsg("compresslevel=%d is out of range for quicklz "
-								"(should be 1)",
-								result->compresslevel)));
+#ifndef HAVE_LIBQUICKLZ
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("QuickLZ library is not supported by this build"),
+					 errhint("Compile with --with-quicklz to use QuickLZ compression.")));
+#endif
+			if (result->compresslevel != 1)
+			{
+				if (validate)
+					ereport(ERROR,
+							(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+							 errmsg("compresslevel=%d is out of range for quicklz (should be 1)",
+									result->compresslevel)));
 
-			result->compresslevel = setDefaultCompressionLevel(result->compresstype);
+				result->compresslevel = setDefaultCompressionLevel(result->compresstype);
+			}
 		}
 
 		if (result->compresstype[0] &&
@@ -1030,8 +998,7 @@ validate_and_adjust_options(StdRdOptions *result,
 			if (validate)
 				ereport(ERROR,
 						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-						 errmsg("compresslevel=%d is out of range for rle_type "
-								"(should be in the range 1 to 4)",
+						 errmsg("compresslevel=%d is out of range for rle_type (should be in the range 1 to 4)",
 								result->compresslevel)));
 
 			result->compresslevel = setDefaultCompressionLevel(result->compresstype);
@@ -1045,14 +1012,13 @@ validate_and_adjust_options(StdRdOptions *result,
 		if (!KIND_IS_RELATION(kind) && validate)
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-					 errmsg("usage of parameter \"checksum\" in a non relation "
-							"object is not supported")));
+					 errmsg("usage of parameter \"checksum\" in a non relation object is not supported")));
 
 		if (!result->appendonly && validate)
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("invalid option \"checksum\" for base relation. "
-							"Only valid for Append Only relations")));
+					 errmsg("invalid option \"checksum\" for base relation"),
+					 errhint("\"checksum\" option only valid for Append Only relations, data checksum for heap relations are turned on at cluster creation.")));
 		result->checksum = checksum_opt->values.bool_val;
 	}
 	/* Disable checksum for heap relations. */
@@ -1066,14 +1032,13 @@ validate_and_adjust_options(StdRdOptions *result,
 		if (!KIND_IS_RELATION(kind) && validate)
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-					 errmsg("usage of parameter \"orientation\" in a non "
-							"relation object is not supported")));
+					 errmsg("usage of parameter \"orientation\" in a non relation object is not supported")));
 
 		if (!result->appendonly && validate)
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("invalid option \"orientation\" for base relation. "
-							"Only valid for Append Only relations")));
+					 errmsg("invalid option \"orientation\" for base relation"),
+					 errhint("Table orientation only valid for Append Only relations, create an AO relation to use table orientation.")));
 
 		if (!(pg_strcasecmp(orientation_opt->values.string_val, "column") == 0 ||
 			  pg_strcasecmp(orientation_opt->values.string_val, "row") == 0) &&
@@ -1081,8 +1046,8 @@ validate_and_adjust_options(StdRdOptions *result,
 		{
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-					 errmsg("invalid parameter value for \"orientation\": "
-							"\"%s\"", orientation_opt->values.string_val)));
+					 errmsg("invalid parameter value for \"orientation\": \"%s\"",
+							orientation_opt->values.string_val)));
 		}
 
 		result->columnstore = (pg_strcasecmp(orientation_opt->values.string_val, "column") == 0 ?
@@ -1095,8 +1060,8 @@ validate_and_adjust_options(StdRdOptions *result,
 			if (validate)
 				ereport(ERROR,
 						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-						 errmsg("%s cannot be used with Append Only relations "
-								"row orientation", result->compresstype)));
+						 errmsg("%s cannot be used with Append Only relations row orientation",
+								result->compresstype)));
 		}
 	}
 
@@ -1167,22 +1132,22 @@ validateAppendOnlyRelOptions(bool ao,
 							 char relkind,
 							 bool co)
 {
-	if (relkind != RELKIND_RELATION)
+	if (relkind != RELKIND_RELATION  && relkind != RELKIND_MATVIEW)
 	{
 		if (ao)
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("appendonly may only be specified for base relations")));
+					 errmsg("\"appendonly\" may only be specified for base relations")));
 
 		if (checksum)
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("checksum may only be specified for base relations")));
+					 errmsg("\"checksum\" may only be specified for base relations")));
 
 		if (comptype)
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("compresstype may only be specified for base relations")));
+					 errmsg("\"compresstype\" may only be specified for base relations")));
 	}
 
 	/*
@@ -1211,13 +1176,21 @@ validateAppendOnlyRelOptions(bool ao,
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 					 errmsg("compresstype cannot be used with compresslevel 0")));
 
-		if (comptype && (pg_strcasecmp(comptype, "zlib") == 0) &&
-			(complevel < 0 || complevel > 9))
+		if (comptype && (pg_strcasecmp(comptype, "zlib") == 0))
 		{
+#ifndef HAVE_LIBZ
 			ereport(ERROR,
-					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-					 errmsg("compresslevel=%d is out of range (should be between 0 and 9)",
-							complevel)));
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("zlib compression is not supported by this build"),
+					 errhint("Compile without --without-zlib to use zlib compression.")));
+#endif
+			if (complevel < 0 || complevel > 9)
+			{
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("compresslevel=%d is out of range (should be between 0 and 9)",
+								complevel)));
+			}
 		}
 
 		if (comptype && (pg_strcasecmp(comptype, "zstd") == 0))
@@ -1226,30 +1199,36 @@ validateAppendOnlyRelOptions(bool ao,
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					 errmsg("Zstandard library is not supported by this build"),
-					 errhint("Compile with --with-zstd to use Zstandard compression.")));
+					 errhint("Compile without --without-zstd to use Zstandard compression.")));
 #endif
 			if (complevel < 0 || complevel > 19)
 				ereport(ERROR,
 						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-						 errmsg("compresslevel=%d is out of range for zstd "
-								"(should be in the range 1 to 19)", complevel)));
+						 errmsg("compresslevel=%d is out of range for zstd (should be in the range 1 to 19)",
+								complevel)));
 		}
 
-		if (comptype && (pg_strcasecmp(comptype, "quicklz") == 0) &&
-			(complevel != 1))
+		if (comptype && (pg_strcasecmp(comptype, "quicklz") == 0))
 		{
+#ifndef HAVE_LIBQUICKLZ
 			ereport(ERROR,
-					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-					 errmsg("compresslevel=%d is out of range for quicklz "
-							"(should be 1)", complevel)));
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("QuickLZ library is not supported by this build"),
+					 errhint("Compile with --with-quicklz to use QuickLZ compression.")));
+#endif
+			if (complevel != 1)
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("compresslevel=%d is out of range for quicklz (should be 1)",
+								complevel)));
 		}
 		if (comptype && (pg_strcasecmp(comptype, "rle_type") == 0) &&
 			(complevel < 0 || complevel > 4))
 		{
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-					 errmsg("compresslevel=%d is out of range for rle_type "
-							"(should be in the range 1 to 4)", complevel)));
+					 errmsg("compresslevel=%d is out of range for rle_type (should be in the range 1 to 4)",
+							complevel)));
 		}
 	}
 
@@ -1258,22 +1237,19 @@ validateAppendOnlyRelOptions(bool ao,
 		blocksize % MIN_APPENDONLY_BLOCK_SIZE != 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("block size must be between 8KB and 2MB and "
-						"be an 8KB multiple, Got %d", blocksize)));
+				 errmsg("block size must be between 8KB and 2MB and be an 8KB multiple, got %d", blocksize)));
 
 	if (safewrite > MAX_APPENDONLY_BLOCK_SIZE || safewrite % 8 != 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("safefswrite size must be less than 8MB and "
-						"be a multiple of 8")));
+				 errmsg("safefswrite size must be less than 8MB and be a multiple of 8")));
 
 	if (gp_safefswritesize > blocksize)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("block size (%d) is smaller gp_safefswritesize (%d). "
-						"increase blocksize or decrease gp_safefswritesize if it "
-						"is safe to do so on this file system",
-						blocksize, gp_safefswritesize)));
+				 errmsg("block size (%d) is smaller gp_safefswritesize (%d)",
+						blocksize, gp_safefswritesize),
+				 errhint("Increase blocksize or decrease gp_safefswritesize if it is safe to do so on this file system.")));
 }
 
 /*

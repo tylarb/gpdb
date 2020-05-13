@@ -85,7 +85,7 @@
  *	problems can be overcome cheaply.
  *
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -125,8 +125,8 @@ typedef struct InvalidationChunk
 	struct InvalidationChunk *next;		/* list link */
 	int			nitems;			/* # items currently stored in chunk */
 	int			maxitems;		/* size of allocated array in this chunk */
-	SharedInvalidationMessage msgs[1];	/* VARIABLE LENGTH ARRAY */
-} InvalidationChunk;			/* VARIABLE LENGTH STRUCTURE */
+	SharedInvalidationMessage msgs[FLEXIBLE_ARRAY_MEMBER];
+} InvalidationChunk;
 
 typedef struct InvalidationListHeader
 {
@@ -178,21 +178,26 @@ static int	maxSharedInvalidMessagesArray;
 
 /*
  * Dynamically-registered callback functions.  Current implementation
- * assumes there won't be very many of these at once; could improve if needed.
+ * assumes there won't be enough of these to justify a dynamically resizable
+ * array; it'd be easy to improve that if needed.
+ *
+ * To avoid searching in CallSyscacheCallbacks, all callbacks for a given
+ * syscache are linked into a list pointed to by syscache_callback_links[id].
+ * The link values are syscache_callback_list[] index plus 1, or 0 for none.
  */
-/*
- * MAX_SYSCACHE_CALLBACKS has been bumped up in GPDB, because ORCA registers
- * a lot of callbacks.
- */
-#define MAX_SYSCACHE_CALLBACKS (32 + 20)
+
+#define MAX_SYSCACHE_CALLBACKS 64
 #define MAX_RELCACHE_CALLBACKS 10
 
 static struct SYSCACHECALLBACK
 {
 	int16		id;				/* cache number */
+	int16		link;			/* next callback index+1 for same cache */
 	SyscacheCallbackFunction function;
 	Datum		arg;
 }	syscache_callback_list[MAX_SYSCACHE_CALLBACKS];
+
+static int16 syscache_callback_links[SysCacheSize];
 
 static int	syscache_callback_count = 0;
 
@@ -231,8 +236,8 @@ AddInvalidationMessage(InvalidationChunk **listHdr,
 #define FIRSTCHUNKSIZE 32
 		chunk = (InvalidationChunk *)
 			MemoryContextAlloc(CurTransactionContext,
-							   sizeof(InvalidationChunk) +
-					(FIRSTCHUNKSIZE - 1) *sizeof(SharedInvalidationMessage));
+							   offsetof(InvalidationChunk, msgs) +
+						 FIRSTCHUNKSIZE * sizeof(SharedInvalidationMessage));
 		chunk->nitems = 0;
 		chunk->maxitems = FIRSTCHUNKSIZE;
 		chunk->next = *listHdr;
@@ -243,10 +248,18 @@ AddInvalidationMessage(InvalidationChunk **listHdr,
 		/* Need another chunk; double size of last chunk */
 		int			chunksize = 2 * chunk->maxitems;
 
+		/*
+		 * Keep in mind: the max allowed alloc size is about 1GB, for
+		 * simplification we set the upper limit to half of that.
+		 */
+#define MAXCHUNKSIZE (MaxAllocSize / 2 / sizeof(SharedInvalidationMessage))
+		if (chunksize > MAXCHUNKSIZE)
+			chunksize >>= 1;
+
 		chunk = (InvalidationChunk *)
 			MemoryContextAlloc(CurTransactionContext,
-							   sizeof(InvalidationChunk) +
-						 (chunksize - 1) *sizeof(SharedInvalidationMessage));
+							   offsetof(InvalidationChunk, msgs) +
+							   chunksize * sizeof(SharedInvalidationMessage));
 		chunk->nitems = 0;
 		chunk->maxitems = chunksize;
 		chunk->next = *listHdr;
@@ -339,6 +352,7 @@ AddCatcacheInvalidationMessage(InvalidationListHeader *hdr,
 	msg.cc.id = (int8) id;
 	msg.cc.dbId = dbId;
 	msg.cc.hashValue = hashValue;
+
 	/*
 	 * Define padding bytes in SharedInvalidationMessage structs to be
 	 * defined. Otherwise the sinvaladt.c ringbuffer, which is accessed by
@@ -512,10 +526,12 @@ RegisterRelcacheInvalidation(Oid dbId, Oid relId)
 	(void) GetCurrentCommandId(true);
 
 	/*
-	 * If the relation being invalidated is one of those cached in the
-	 * relcache init file, mark that we need to zap that file at commit.
+	 * If the relation being invalidated is one of those cached in a relcache
+	 * init file, mark that we need to zap that file at commit. For simplicity
+	 * invalidations for a specific database always invalidate the shared file
+	 * as well.
 	 */
-	if (RelationIdIsInInitFile(relId))
+	if (OidIsValid(dbId) && RelationIdIsInInitFile(relId))
 		transInvalInfo->RelcacheInitFileInval = true;
 }
 
@@ -554,7 +570,7 @@ si_to_str(SharedInvalidationMessage *msg)
 /*
  * RegisterSnapshotInvalidation
  *
- * Register a invalidation event for MVCC scans against a given catalog.
+ * Register an invalidation event for MVCC scans against a given catalog.
  * Only needed for catalogs that don't have catcaches.
  */
 static void
@@ -580,7 +596,7 @@ LocalExecuteInvalidationMessage(SharedInvalidationMessage *msg)
 		{
 			InvalidateCatalogSnapshot();
 
-			CatalogCacheIdInvalidate(msg->cc.id, msg->cc.hashValue);
+			SysCacheInvalidate(msg->cc.id, msg->cc.hashValue);
 
 			CallSyscacheCallbacks(msg->cc.id, msg->cc.hashValue);
 		}
@@ -731,24 +747,47 @@ AcceptInvalidationMessages(void)
 		}
 	}
 #elif defined(CLOBBER_CACHE_RECURSIVELY)
-	InvalidateSystemCaches();
+	{
+		static int	recursion_depth = 0;
+
+		/* Maximum depth is arbitrary depending on your threshold of pain */
+		if (recursion_depth < 3)
+		{
+			recursion_depth++;
+			InvalidateSystemCaches();
+			recursion_depth--;
+		}
+	}
 #endif
 }
 
 /*
- * AtStart_Inval
- *		Initialize inval lists at start of a main transaction.
+ * PrepareInvalidationState
+ *		Initialize inval lists for the current (sub)transaction.
  */
-void
-AtStart_Inval(void)
+static void
+PrepareInvalidationState(void)
 {
-	Assert(transInvalInfo == NULL);
-	transInvalInfo = (TransInvalidationInfo *)
+	TransInvalidationInfo *myInfo;
+
+	if (transInvalInfo != NULL &&
+		transInvalInfo->my_level == GetCurrentTransactionNestLevel())
+		return;
+
+	myInfo = (TransInvalidationInfo *)
 		MemoryContextAllocZero(TopTransactionContext,
 							   sizeof(TransInvalidationInfo));
-	transInvalInfo->my_level = GetCurrentTransactionNestLevel();
-	SharedInvalidMessagesArray = NULL;
-	numSharedInvalidMessagesArray = 0;
+	myInfo->parent = transInvalInfo;
+	myInfo->my_level = GetCurrentTransactionNestLevel();
+
+	/*
+	 * If there's any previous entry, this one should be for a deeper nesting
+	 * level.
+	 */
+	Assert(transInvalInfo == NULL ||
+		   myInfo->my_level > transInvalInfo->my_level);
+
+	transInvalInfo = myInfo;
 }
 
 /*
@@ -767,24 +806,6 @@ void
 PostPrepare_Inval(void)
 {
 	AtEOXact_Inval(false);
-}
-
-/*
- * AtSubStart_Inval
- *		Initialize inval lists at start of a subtransaction.
- */
-void
-AtSubStart_Inval(void)
-{
-	TransInvalidationInfo *myInfo;
-
-	Assert(transInvalInfo != NULL);
-	myInfo = (TransInvalidationInfo *)
-		MemoryContextAllocZero(TopTransactionContext,
-							   sizeof(TransInvalidationInfo));
-	myInfo->parent = transInvalInfo;
-	myInfo->my_level = GetCurrentTransactionNestLevel();
-	transInvalInfo = myInfo;
 }
 
 /*
@@ -846,8 +867,16 @@ xactGetCommittedInvalidationMessages(SharedInvalidationMessage **msgs,
 {
 	MemoryContext oldcontext;
 
+	/* Quick exit if we haven't done anything with invalidation messages. */
+	if (transInvalInfo == NULL)
+	{
+		*RelcacheInitFileInval = false;
+		*msgs = NULL;
+		return 0;
+	}
+
 	/* Must be at top of stack */
-	Assert(transInvalInfo != NULL && transInvalInfo->parent == NULL);
+	Assert(transInvalInfo->my_level == 1 && transInvalInfo->parent == NULL);
 
 	/*
 	 * Relcache init file invalidation requires processing both before and
@@ -881,8 +910,9 @@ xactGetCommittedInvalidationMessages(SharedInvalidationMessage **msgs,
 }
 
 /*
- * ProcessCommittedInvalidationMessages is executed by xact_redo_commit()
- * to process invalidation messages added to commit records.
+ * ProcessCommittedInvalidationMessages is executed by xact_redo_commit() or
+ * standby_redo() to process invalidation messages. Currently that happens
+ * only at end-of-xact.
  *
  * Relcache init file invalidation requires processing both
  * before and after we send the SI messages. See AtEOXact_Inval()
@@ -900,18 +930,26 @@ ProcessCommittedInvalidationMessages(SharedInvalidationMessage *msgs,
 
 	if (RelcacheInitFileInval)
 	{
+		elog(trace_recovery(DEBUG4), "removing relcache init files for database %u",
+			 dbid);
+
 		/*
-		 * RelationCacheInitFilePreInvalidate requires DatabasePath to be set,
-		 * but we should not use SetDatabasePath during recovery, since it is
+		 * RelationCacheInitFilePreInvalidate, when the invalidation message
+		 * is for a specific database, requires DatabasePath to be set, but we
+		 * should not use SetDatabasePath during recovery, since it is
 		 * intended to be used only once by normal backends.  Hence, a quick
 		 * hack: set DatabasePath directly then unset after use.
 		 */
-		DatabasePath = GetDatabasePath(dbid, tsid);
-		elog(trace_recovery(DEBUG4), "removing relcache init file in \"%s\"",
-			 DatabasePath);
+		if (OidIsValid(dbid))
+			DatabasePath = GetDatabasePath(dbid, tsid);
+
 		RelationCacheInitFilePreInvalidate();
-		pfree(DatabasePath);
-		DatabasePath = NULL;
+
+		if (OidIsValid(dbid))
+		{
+			pfree(DatabasePath);
+			DatabasePath = NULL;
+		}
 	}
 
 	SendSharedInvalidMessages(msgs, nmsgs);
@@ -947,11 +985,15 @@ ProcessCommittedInvalidationMessages(SharedInvalidationMessage *msgs,
 void
 AtEOXact_Inval(bool isCommit)
 {
+	/* Quick exit if no messages */
+	if (transInvalInfo == NULL)
+		return;
+
+	/* Must be at top of stack */
+	Assert(transInvalInfo->my_level == 1 && transInvalInfo->parent == NULL);
+
 	if (isCommit)
 	{
-		/* Must be at top of stack */
-		Assert(transInvalInfo != NULL && transInvalInfo->parent == NULL);
-
 		/*
 		 * Relcache init file invalidation requires processing both before and
 		 * after we send the SI messages.  However, we need not do anything
@@ -969,17 +1011,16 @@ AtEOXact_Inval(bool isCommit)
 		if (transInvalInfo->RelcacheInitFileInval)
 			RelationCacheInitFilePostInvalidate();
 	}
-	else if (transInvalInfo != NULL)
+	else
 	{
-		/* Must be at top of stack */
-		Assert(transInvalInfo->parent == NULL);
-
 		ProcessInvalidationMessages(&transInvalInfo->PriorCmdInvalidMsgs,
 									LocalExecuteInvalidationMessage);
 	}
 
 	/* Need not free anything explicitly */
 	transInvalInfo = NULL;
+	SharedInvalidMessagesArray = NULL;
+	numSharedInvalidMessagesArray = 0;
 }
 
 /*
@@ -1003,17 +1044,37 @@ AtEOXact_Inval(bool isCommit)
 void
 AtEOSubXact_Inval(bool isCommit)
 {
-	int			my_level = GetCurrentTransactionNestLevel();
+	int			my_level;
 	TransInvalidationInfo *myInfo = transInvalInfo;
+
+	/* Quick exit if no messages. */
+	if (myInfo == NULL)
+		return;
+
+	/* Also bail out quickly if messages are not for this level. */
+	my_level = GetCurrentTransactionNestLevel();
+	if (myInfo->my_level != my_level)
+	{
+		Assert(myInfo->my_level < my_level);
+		return;
+	}
 
 	if (isCommit)
 	{
-		/* Must be at non-top of stack */
-		Assert(myInfo != NULL && myInfo->parent != NULL);
-		Assert(myInfo->my_level == my_level);
-
 		/* If CurrentCmdInvalidMsgs still has anything, fix it */
 		CommandEndInvalidationMessages();
+
+		/*
+		 * We create invalidation stack entries lazily, so the parent might
+		 * not have one.  Instead of creating one, moving all the data over,
+		 * and then freeing our own, we can just adjust the level of our own
+		 * entry.
+		 */
+		if (myInfo->parent == NULL || myInfo->parent->my_level < my_level - 1)
+		{
+			myInfo->my_level--;
+			return;
+		}
 
 		/* Pass up my inval messages to parent */
 		AppendInvalidationMessages(&myInfo->parent->PriorCmdInvalidMsgs,
@@ -1029,11 +1090,8 @@ AtEOSubXact_Inval(bool isCommit)
 		/* Need not free anything else explicitly */
 		pfree(myInfo);
 	}
-	else if (myInfo != NULL && myInfo->my_level == my_level)
+	else
 	{
-		/* Must be at non-top of stack */
-		Assert(myInfo->parent != NULL);
-
 		ProcessInvalidationMessages(&myInfo->PriorCmdInvalidMsgs,
 									LocalExecuteInvalidationMessage);
 
@@ -1118,6 +1176,12 @@ CacheInvalidateHeapTuple(Relation relation,
 		return;
 
 	/*
+	 * If we're not prepared to queue invalidation messages for this
+	 * subtransaction level, get ready now.
+	 */
+	PrepareInvalidationState();
+
+	/*
 	 * First let the catcache do its thing
 	 */
 	tupleRelId = RelationGetRelid(relation);
@@ -1171,6 +1235,13 @@ CacheInvalidateHeapTuple(Relation relation,
 		relationId = gptup->localoid;
 		databaseId = MyDatabaseId;
 	}
+	else if (tupleRelId == AppendOnlyRelationId)
+	{
+		FormData_pg_appendonly *aotup = (FormData_pg_appendonly *) GETSTRUCT(tuple);
+
+		relationId = aotup->relid;
+		databaseId = MyDatabaseId;
+	}
 	else if (tupleRelId == IndexRelationId)
 	{
 		Form_pg_index indextup = (Form_pg_index) GETSTRUCT(tuple);
@@ -1209,6 +1280,8 @@ CacheInvalidateCatalog(Oid catalogId)
 {
 	Oid			databaseId;
 
+	PrepareInvalidationState();
+
 	if (IsSharedRelation(catalogId))
 		databaseId = InvalidOid;
 	else
@@ -1232,6 +1305,8 @@ CacheInvalidateRelcache(Relation relation)
 	Oid			databaseId;
 	Oid			relationId;
 
+	PrepareInvalidationState();
+
 	relationId = RelationGetRelid(relation);
 	if (relation->rd_rel->relisshared)
 		databaseId = InvalidOid;
@@ -1252,6 +1327,8 @@ CacheInvalidateRelcacheByTuple(HeapTuple classTuple)
 	Oid			databaseId;
 	Oid			relationId;
 
+	PrepareInvalidationState();
+
 	relationId = HeapTupleGetOid(classTuple);
 	if (classtup->relisshared)
 		databaseId = InvalidOid;
@@ -1270,6 +1347,8 @@ void
 CacheInvalidateRelcacheByRelid(Oid relid)
 {
 	HeapTuple	tup;
+
+	PrepareInvalidationState();
 
 	tup = SearchSysCache1(RELOID, ObjectIdGetDatum(relid));
 	if (!HeapTupleIsValid(tup))
@@ -1366,10 +1445,28 @@ CacheRegisterSyscacheCallback(int cacheid,
 							  SyscacheCallbackFunction func,
 							  Datum arg)
 {
+	if (cacheid < 0 || cacheid >= SysCacheSize)
+		elog(FATAL, "invalid cache ID: %d", cacheid);
 	if (syscache_callback_count >= MAX_SYSCACHE_CALLBACKS)
 		elog(FATAL, "out of syscache_callback_list slots");
 
+	if (syscache_callback_links[cacheid] == 0)
+	{
+		/* first callback for this cache */
+		syscache_callback_links[cacheid] = syscache_callback_count + 1;
+	}
+	else
+	{
+		/* add to end of chain, so that older callbacks are called first */
+		int			i = syscache_callback_links[cacheid] - 1;
+
+		while (syscache_callback_list[i].link > 0)
+			i = syscache_callback_list[i].link - 1;
+		syscache_callback_list[i].link = syscache_callback_count + 1;
+	}
+
 	syscache_callback_list[syscache_callback_count].id = cacheid;
+	syscache_callback_list[syscache_callback_count].link = 0;
 	syscache_callback_list[syscache_callback_count].function = func;
 	syscache_callback_list[syscache_callback_count].arg = arg;
 
@@ -1409,11 +1506,16 @@ CallSyscacheCallbacks(int cacheid, uint32 hashvalue)
 {
 	int			i;
 
-	for (i = 0; i < syscache_callback_count; i++)
+	if (cacheid < 0 || cacheid >= SysCacheSize)
+		elog(ERROR, "invalid cache ID: %d", cacheid);
+
+	i = syscache_callback_links[cacheid] - 1;
+	while (i >= 0)
 	{
 		struct SYSCACHECALLBACK *ccitem = syscache_callback_list + i;
 
-		if (ccitem->id == cacheid)
-			(*ccitem->function) (ccitem->arg, cacheid, hashvalue);
+		Assert(ccitem->id == cacheid);
+		(*ccitem->function) (ccitem->arg, cacheid, hashvalue);
+		i = ccitem->link - 1;
 	}
 }

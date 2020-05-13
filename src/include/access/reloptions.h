@@ -9,7 +9,7 @@
  * into a lot of low-level code.
  *
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/access/reloptions.h
@@ -19,9 +19,11 @@
 #ifndef RELOPTIONS_H
 #define RELOPTIONS_H
 
+#include "access/amapi.h"
 #include "access/htup.h"
 #include "access/tupdesc.h"
 #include "nodes/pg_list.h"
+#include "storage/lock.h"
 #include "utils/rel.h"
 
 #define AO_DEFAULT_APPENDONLY     false
@@ -34,7 +36,11 @@
  * If compression is turned on without specifying compresstype, this
  * is the default.
  */
+#ifdef HAVE_LIBZ
 #define AO_DEFAULT_COMPRESSTYPE   "zlib"
+#else
+#define AO_DEFAULT_COMPRESSTYPE   "none"
+#endif
 #define AO_DEFAULT_CHECKSUM       true
 #define AO_DEFAULT_COLUMNSTORE    false
 
@@ -61,8 +67,9 @@ typedef enum relopt_kind
 	RELOPT_KIND_SPGIST = (1 << 8),
 	RELOPT_KIND_VIEW = (1 << 9),
 	RELOPT_KIND_BITMAP = (1 << 10),
+	RELOPT_KIND_BRIN = (1 << 11),
 	/* if you add a new kind, make sure you update "last_default" too */
-	RELOPT_KIND_LAST_DEFAULT = RELOPT_KIND_BITMAP,
+	RELOPT_KIND_LAST_DEFAULT = RELOPT_KIND_BRIN,
 	/* some compilers treat enums as signed ints, so we can't use 1 << 31 */
 	RELOPT_KIND_MAX = (1 << 30)
 } relopt_kind;
@@ -77,6 +84,7 @@ typedef struct relopt_gen
 								 * marker) */
 	const char *desc;
 	bits32		kinds;
+	LOCKMODE	lockmode;
 	int			namelen;
 	relopt_type type;
 } relopt_gen;
@@ -266,12 +274,14 @@ extern void add_real_reloption(bits32 kinds, char *name, char *desc,
 extern void add_string_reloption(bits32 kinds, char *name, char *desc,
 					 char *default_val, validate_string_relopt validator);
 
+extern void set_reloption_lockmode(const char *name, LOCKMODE lockmode);
+
 extern Datum transformRelOptions(Datum oldOptions, List *defList,
 					char *namspace, char *validnsps[],
 					bool ignoreOids, bool isReset);
 extern List *untransformRelOptions(Datum options);
 extern bytea *extractRelOptions(HeapTuple tuple, TupleDesc tupdesc,
-				  Oid amoptions);
+				  amoptions_function amoptions);
 extern relopt_value *parseRelOptions(Datum options, bool validate,
 				relopt_kind kind, int *numrelopts);
 extern void *allocateReloptStruct(Size base, relopt_value *options,
@@ -284,10 +294,12 @@ extern void fillRelOptions(void *rdopts, Size basesize,
 extern bytea *default_reloptions(Datum reloptions, bool validate,
 				   relopt_kind kind);
 extern bytea *heap_reloptions(char relkind, Datum reloptions, bool validate);
-extern bytea *index_reloptions(RegProcedure amoptions, Datum reloptions,
+extern bytea *view_reloptions(Datum reloptions, bool validate);
+extern bytea *index_reloptions(amoptions_function amoptions, Datum reloptions,
 				 bool validate);
 extern bytea *attribute_reloptions(Datum reloptions, bool validate);
 extern bytea *tablespace_reloptions(Datum reloptions, bool validate);
+extern LOCKMODE AlterTableGetRelOptionsLockLevel(List *defList);
 
 extern void validateAppendOnlyRelOptions(bool ao, int blocksize, int writesize,
 										 int complevel, char* comptype, 

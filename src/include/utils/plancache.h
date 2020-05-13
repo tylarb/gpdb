@@ -5,7 +5,7 @@
  *
  * See plancache.c for comments.
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/utils/plancache.h
@@ -96,6 +96,9 @@ typedef struct CachedPlanSource
 	struct OverrideSearchPath *search_path;		/* search_path used for
 												 * parsing and planning */
 	MemoryContext query_context;	/* context holding the above, or NULL */
+	Oid			rewriteRoleId;	/* Role ID we did rewriting for */
+	bool		rewriteRowSecurity;		/* row_security used during rewrite */
+	bool		dependsOnRLS;	/* is rewritten query specific to the above? */
 	/* If we have a generic plan, this is a reference-counted link to it: */
 	struct CachedPlan *gplan;	/* generic plan, or NULL if not valid */
 	/* Some state flags: */
@@ -130,6 +133,8 @@ typedef struct CachedPlan
 	bool		is_oneshot;		/* is it a "oneshot" plan? */
 	bool		is_saved;		/* is CachedPlan in a long-lived context? */
 	bool		is_valid;		/* is the stmt_list currently valid? */
+	Oid			planRoleId;		/* Role ID the plan was created for */
+	bool		dependsOnRole;	/* is plan specific to that role? */
 	TransactionId saved_xmin;	/* if valid, replan when TransactionXmin
 								 * changes from this value */
 	int			generation;		/* parent's generation number for this plan */
@@ -176,4 +181,15 @@ extern CachedPlan *GetCachedPlan(CachedPlanSource *plansource,
 			  IntoClause *intoClause);
 extern void ReleaseCachedPlan(CachedPlan *plan, bool useResOwner);
 
-#endif   /* PLANCACHE_H */
+/* possible values for plan_cache_mode */
+typedef enum
+{
+	PLAN_CACHE_MODE_AUTO,
+	PLAN_CACHE_MODE_FORCE_GENERIC_PLAN,
+	PLAN_CACHE_MODE_FORCE_CUSTOM_PLAN
+}			PlanCacheMode;
+
+/* GUC parameter */
+extern int plan_cache_mode;
+
+#endif							/* PLANCACHE_H */

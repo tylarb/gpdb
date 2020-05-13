@@ -52,9 +52,6 @@ return None
 '
 	LANGUAGE plpythonu;
 
-
-
-
 CREATE FUNCTION join_sequences(s sequences) RETURNS text
 	AS
 'if not s["multipart"]:
@@ -68,19 +65,22 @@ return seq
 '
 	LANGUAGE plpythonu;
 
+CREATE FUNCTION spi_recursive_sum(a int) RETURNS int
+	AS
+'r = 0
+if a > 1:
+    r = plpy.execute("SELECT spi_recursive_sum(%d) as a" % (a-1))[0]["a"]
+return a + r
+'
+	LANGUAGE plpythonu;
 
-
-
-
+--
 -- spi and nested calls
 --
 select nested_call_one('pass this along');
 select spi_prepared_plan_test_one('doe');
 select spi_prepared_plan_test_one('smith');
 select spi_prepared_plan_test_nested('smith');
-
-
-
 
 -- start_ignore
 -- Greenplum doesn't support functions that execute SQL from segments
@@ -91,6 +91,7 @@ SELECT join_sequences(sequences) FROM sequences
 	WHERE join_sequences(sequences) ~* '^B';
 -- end_ignore
 
+SELECT spi_recursive_sum(10);
 
 --
 -- plan and result objects
@@ -287,6 +288,17 @@ plan = plpy.prepare("select fname, lname from users where fname like $1 || '%'",
 c = plpy.cursor(plan, ["a", "b"])
 $$ LANGUAGE plpythonu;
 
+CREATE TYPE test_composite_type AS (
+  a1 int,
+  a2 varchar
+);
+
+CREATE OR REPLACE FUNCTION plan_composite_args() RETURNS test_composite_type AS $$
+plan = plpy.prepare("select $1 as c1", ["test_composite_type"])
+res = plpy.execute(plan, [{"a1": 3, "a2": "label"}])
+return res[0]["c1"]
+$$ LANGUAGE plpythonu;
+
 SELECT simple_cursor_test();
 SELECT double_cursor_close();
 SELECT cursor_fetch();
@@ -296,3 +308,4 @@ SELECT next_after_close();
 SELECT cursor_fetch_next_empty();
 SELECT cursor_plan();
 SELECT cursor_plan_wrong_args();
+SELECT plan_composite_args();

@@ -4,7 +4,7 @@
  *	  Definitions for using the POSTGRES copy command.
  *
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/commands/copy.h
@@ -34,7 +34,6 @@ typedef enum CopyDest
 } CopyDest;
 
 /* CopyStateData is private in commands/copy.c */
-typedef struct CopyStateData *CopyState;
 typedef int (*copy_data_source_cb) (void *outbuf, int datasize, void *extra);
 
 /*
@@ -122,22 +121,19 @@ typedef struct CopyStateData
 	bool		encoding_embeds_ascii;	/* ASCII can be non-first byte? */
 	FmgrInfo   *enc_conversion_proc; /* conv proc from exttbl encoding to 
 										server or the other way around */
-	size_t		bytesread;
 
 	/* parameters from the COPY command */
 	Relation	rel;			/* relation to copy to or from */
-	GpPolicy	cdb_policy;		/* in ON SEGMENT mode, we received this from QD. Otherwise
-								 * it's equal to rel->rd_cdbpolicy */
 	QueryDesc  *queryDesc;		/* executable query to copy from */
 	List	   *attnumlist;		/* integer list of attnums to copy */
 	List	   *attnamelist;	/* list of attributes by name */
 	char	   *filename;		/* filename, or NULL for STDIN/STDOUT */
 	bool		is_program;		/* is 'filename' a program to popen? */
+	bool		binary;			/* binary format? */
 	copy_data_source_cb data_source_cb; /* function for reading data */
 	void	   *data_source_cb_extra;
 	bool		oids;			/* include OIDs? */
 	bool		freeze;			/* freeze rows on loading? */
-	bool        binary;         /* binary format */
 	bool		csv_mode;		/* Comma Separated Value format? */
 	bool		header_line;	/* CSV header line? */
 	char	   *null_print;		/* NULL marker string (server encoding!) */
@@ -147,7 +143,7 @@ typedef struct CopyStateData
 	char	   *quote;			/* CSV quote char (must be 1 byte) */
 	char	   *escape;			/* CSV escape char (must be 1 byte) */
 	List	   *force_quote;	/* list of column names */
-	bool		force_quote_all;	/* FORCE QUOTE *? */
+	bool		force_quote_all;	/* FORCE_QUOTE *? */
 	bool	   *force_quote_flags;		/* per-column CSV FQ flags */
 	List	   *force_notnull;	/* list of column names */
 	bool	   *force_notnull_flags;	/* per-column CSV FNN flags */
@@ -163,7 +159,6 @@ typedef struct CopyStateData
 	/* these are just for error messages, see CopyFromErrorCallback */
 	const char *cur_relname;	/* table name for error messages */
 	int64		cur_lineno;		/* line number for error messages.  Negative means it isn't available. */
-	int64       cur_byteno;     /* number of bytes processed from input */
 	const char *cur_attname;	/* current att for error messages */
 	const char *cur_attval;		/* current att value for error messages */
 
@@ -200,7 +195,6 @@ typedef struct CopyStateData
 	CopyErrMode	errMode;
 	struct CdbSreh *cdbsreh; /* single row error handler */
 	int			lastsegid;
-	int			num_consec_csv_err; /* # of consecutive csv invalid format errs */
 
 	/*
 	 * These variables are used to reduce overhead in textual COPY FROM.
@@ -225,50 +219,29 @@ typedef struct CopyStateData
 	 * can display it in error messages if appropriate.
 	 */
 	StringInfoData line_buf;
-
-	int		   *attr_offsets;
-
 	bool		line_buf_converted;		/* converted to server encoding? */
 	bool		line_buf_valid; /* contains the row being processed? */
 
 	/*
 	 * Finally, raw_buf holds raw data read from the data source (file or
-	 * client connection). CopyReadLine parses this data sufficiently to
+	 * client connection).  CopyReadLine parses this data sufficiently to
 	 * locate line boundaries, then transfers the data to line_buf and
 	 * converts it.  Note: we guarantee that there is a \0 at
 	 * raw_buf[raw_buf_len].
 	 */
-
 #define RAW_BUF_SIZE 65536		/* we palloc RAW_BUF_SIZE+1 bytes */
 	char	   *raw_buf;
 	int			raw_buf_index;	/* next byte to process */
 	int			raw_buf_len;	/* total # of bytes stored */
 
 	/* Greenplum Database specific variables */
-	bool		is_copy_in;		/* copy in or out? */
 	bool		escape_off;		/* treat backslashes as non-special? */
-	bool		delimiter_off;  /* no delimiter. 1-column external tabs only */
-	int			last_hash_field;
-	bool		end_marker;
-	char	   *begloc;
-	char	   *endloc;
-	bool		error_on_executor;		/* true if errors arrived from the
-										 * executors COPY (QEs) */
-	StringInfoData executor_err_context;		/* error context text from QE */
-
-
-	/* for CSV format */
-	bool		in_quote;
-	bool		last_was_esc;
-
-	/* for TEXT format */
-	bool		esc_in_prevbuf; /* escape was last character of the data input
-								 * buffer */
-	bool		cr_in_prevbuf;	/* CR was last character of the data input
-								 * buffer */
+	int			first_qe_processed_field;
+	List	   *qd_attnumlist;
+	List	   *qe_attnumlist;
+	bool		stopped_processing_at_delim;
 
 	PartitionNode *partitions; /* partitioning meta data from dispatcher */
-	List		  *ao_segnos;  /* AO table meta data from dispatcher */
 	bool          skip_ext_partition;  /* skip external partition */
 
 	bool		on_segment; /* QE save data files locally */
@@ -282,6 +255,17 @@ typedef struct CopyStateData
 
 /* end Greenplum Database specific variables */
 } CopyStateData;
+
+typedef struct CopyStateData *CopyState;
+
+/* DestReceiver for COPY (query) TO */
+typedef struct
+{
+	DestReceiver pub;			/* publicly-known function pointers */
+	CopyState	cstate;			/* CopyStateData for the command */
+	QueryDesc	*queryDesc;		/* QueryDesc for the copy*/
+	uint64		processed;		/* # of tuples processed */
+} DR_copy;
 
 /*
  * Some platforms like macOS (since Yosemite) already define 64 bit versions
@@ -302,8 +286,14 @@ extern void ProcessCopyOptions(CopyState cstate, bool is_from, List *options,
 extern CopyState BeginCopyFrom(Relation rel, const char *filename,
 			  bool is_program, copy_data_source_cb data_source_cb,
 			  void *data_source_cb_extra,
-			  List *attnamelist, List *options, List *ao_segnos);
-extern CopyState BeginCopyToForExternalTable(Relation extrel, List *options);
+			  List *attnamelist, List *options);
+extern CopyState BeginCopy(bool is_from, Relation rel, Node *raw_query,
+						   const char *queryString, const Oid queryRelId, List *attnamelist, List *options,
+						   TupleDesc tupDesc);
+extern CopyState
+BeginCopyToOnSegment(QueryDesc *queryDesc);
+extern void EndCopyToOnSegment(CopyState cstate);
+extern CopyState BeginCopyToForeignTable(Relation forrel, List *options);
 extern void EndCopyFrom(CopyState cstate);
 extern bool NextCopyFrom(CopyState cstate, ExprContext *econtext,
 						 Datum *values, bool *nulls, Oid *tupleOid);
@@ -315,7 +305,6 @@ extern DestReceiver *CreateCopyDestReceiver(void);
 
 extern List *CopyGetAttnums(TupleDesc tupDesc, Relation rel, List *attnamelist);
 
-extern bool CopyReadLine(CopyState cstate);
 extern void CopyOneRowTo(CopyState cstate, Oid tupleOid,
 						 Datum *values, bool *nulls);
 extern void CopyOneCustomRowTo(CopyState cstate, bytea *value);
@@ -323,46 +312,28 @@ extern void CopySendEndOfRow(CopyState cstate);
 extern char *limit_printout_length(const char *str);
 extern void truncateEol(StringInfo buf, EolType	eol_type);
 extern void truncateEolStr(char *str, EolType eol_type);
-extern void setEncodingConversionProc(CopyState cstate, int encoding, bool iswritable);
-extern void CopyEolStrToType(CopyState cstate);
 
+/*
+ * This is used to hold information about the target's distribution policy,
+ * during COPY FROM.
+ *
+ * For a regular, non-partitioned table, 'policy' and 'cdbHash' are filled in,
+ * and 'relid' and 'hashmap' are unused.
+ *
+ * For a partitioned table, there is one "main" GpDistributionData for the
+ * whole operation, and a separate GpDistributionData object for each
+ * partition. The per-table objects are stored in the 'hashmap' of the main
+ * GpDistributionData object, keyed by the partition's OID. 'policy' and
+ * 'cdbHash' in the main GpDistributionData are unused.
+ */
 typedef struct GpDistributionData
 {
-	GpPolicy *policy;	/* the partitioning policy for this table */
-	AttrNumber p_nattrs; /* num of attributes in the distribution policy */
-	Oid *p_attr_types;   /* types for each policy attribute */
-	CdbHash *cdbHash;
-	HTAB *hashmap;
+	Oid			relid;		/* hash key, must be first */
+
+	GpPolicy   *policy;		/* partitioning policy for this table */
+	CdbHash	   *cdbHash;	/* corresponding CdbHash object */
+
+	HTAB	   *hashmap;
 } GpDistributionData;
-
-typedef struct PartitionData
-{
-	/* variables for partitioning */
-	Datum *part_values ;
-	Oid *part_attr_types; /* types for partitioning */
-	Oid *part_typio ;
-	FmgrInfo *part_infuncs ;
-	AttrNumber *part_attnum ;
-	int part_attnums ;
-} PartitionData;
-
-typedef struct GetAttrContext
-{
-	TupleDesc tupDesc;
-	Form_pg_attribute *attr;
-	AttrNumber num_phys_attrs;
-	int *attr_offsets;
-	bool *nulls;
-	Datum *values;
-	CdbCopy *cdbCopy;
-	int original_lineno_for_qe;
-} GetAttrContext;
-
-typedef struct  cdbhashdata
-{
-	Oid relid;
-	CdbHash *cdbHash; /* a CdbHash API object */
-	GpPolicy *policy; /* policy for this cdb hash */
-} cdbhashdata;
 
 #endif /* COPY_H */

@@ -49,8 +49,18 @@ sub CreateSolution
 	{
 		return new VS2013Solution(@_);
 	}
+	elsif ($visualStudioVersion eq '14.00')
+	{
+		return new VS2015Solution(@_);
+	}
+	# visual 2017 hasn't changed the nmake version to 15, so adjust the check to support it.
+	elsif (($visualStudioVersion ge '14.10') or ($visualStudioVersion eq '15.00'))
+	{
+		return new VS2017Solution(@_);
+	}
 	else
 	{
+		croak $visualStudioVersion;
 		croak "The requested Visual Studio version is not supported.";
 	}
 }
@@ -84,38 +94,37 @@ sub CreateProject
 	{
 		return new VC2013Project(@_);
 	}
+	elsif ($visualStudioVersion eq '14.00')
+	{
+		return new VC2015Project(@_);
+	}
+	# visual 2017 hasn't changed the nmake version to 15, so adjust the check to support it.
+	elsif (($visualStudioVersion ge '14.10') or ($visualStudioVersion eq '15.00'))
+	{
+		return new VC2017Project(@_);
+	}
 	else
 	{
+		croak $visualStudioVersion;
 		croak "The requested Visual Studio version is not supported.";
 	}
 }
 
 sub DetermineVisualStudioVersion
 {
-	my $nmakeVersion = shift;
 
-	if (!defined($nmakeVersion))
-	{
-
-# Determine version of nmake command, to set proper version of visual studio
-# we use nmake as it has existed for a long time and still exists in current visual studio versions
-		open(P, "nmake /? 2>&1 |")
-		  || croak
+	# To determine version of Visual Studio we use nmake as it has
+	# existed for a long time and still exists in current Visual
+	# Studio versions.
+	my $output = `nmake /? 2>&1`;
+	$? >> 8 == 0
+	  or croak
 "Unable to determine Visual Studio version: The nmake command wasn't found.";
-		while (<P>)
-		{
-			chomp;
-			if (/(\d+)\.(\d+)\.\d+(\.\d+)?$/)
-			{
-				return _GetVisualStudioVersion($1, $2);
-			}
-		}
-		close(P);
-	}
-	elsif ($nmakeVersion =~ /(\d+)\.(\d+)\.\d+(\.\d+)?$/)
+	if ($output =~ /(\d+)\.(\d+)\.\d+(\.\d+)?$/m)
 	{
 		return _GetVisualStudioVersion($1, $2);
 	}
+
 	croak
 "Unable to determine Visual Studio version: The nmake version could not be determined.";
 }
@@ -123,11 +132,12 @@ sub DetermineVisualStudioVersion
 sub _GetVisualStudioVersion
 {
 	my ($major, $minor) = @_;
-	if ($major > 12)
+	# visual 2017 hasn't changed the nmake version to 15, so still using the older version for comparison.
+	if ($major > 14)
 	{
 		carp
 "The determined version of Visual Studio is newer than the latest supported version. Returning the latest supported version instead.";
-		return '12.00';
+		return '14.00';
 	}
 	elsif ($major < 6)
 	{

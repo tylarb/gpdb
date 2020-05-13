@@ -16,15 +16,16 @@ include $(top_builddir)/src/Makefile.global
 all: pg_config.h pg_config_ext.h pg_config_os.h check_oids
 
 
-# Subdirectories containing headers for server-side dev
-SUBDIRS = access bootstrap catalog commands common datatype executor foreign \
+# Subdirectories containing installable headers
+SUBDIRS = access bootstrap catalog commands common datatype \
+	executor fe_utils foreign \
 	lib libpq mb nodes optimizer parser postmaster regex replication \
 	rewrite storage tcop snowball snowball/libstemmer tsearch \
 	tsearch/dicts utils port port/atomics port/win32 port/win32_msvc \
 	port/win32_msvc/sys port/win32/arpa port/win32/netinet \
 	port/win32/sys portability
 
-SUBDIRS += cdb gpmon
+SUBDIRS += cdb
 
 # Install all headers
 install: all installdirs
@@ -54,7 +55,7 @@ install: all installdirs
 	  chmod $(INSTALL_DATA_MODE) '$(DESTDIR)$(includedir_server)'/$$dir/*.h  || exit; \
 	done
 ifeq ($(vpath_build),yes)
-	for file in dynloader.h catalog/schemapg.h parser/gram.h utils/probes.h; do \
+	for file in dynloader.h catalog/schemapg.h parser/gram.h storage/lwlocknames.h utils/probes.h; do \
 	  cp $$file '$(DESTDIR)$(includedir_server)'/$$file || exit; \
 	  chmod $(INSTALL_DATA_MODE) '$(DESTDIR)$(includedir_server)'/$$file || exit; \
 	done

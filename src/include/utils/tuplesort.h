@@ -30,7 +30,7 @@
  *
  * Portions Copyright (c) 2007-2008, Greenplum inc
  * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/utils/tuplesort.h
@@ -60,7 +60,7 @@
 #define tuplesort_set_bound tuplesort_set_bound_pg
 #define tuplesort_puttupleslot tuplesort_puttupleslot_pg
 #define tuplesort_putheaptuple tuplesort_putheaptuple_pg
-#define tuplesort_putindextuple tuplesort_putindextuple_pg
+#define tuplesort_putindextuplevalues tuplesort_putindextuplevalues_pg
 #define tuplesort_putdatum tuplesort_putdatum_pg
 #define tuplesort_performsort tuplesort_performsort_pg
 #define tuplesort_gettupleslot tuplesort_gettupleslot_pg
@@ -85,7 +85,6 @@
 #define tuplesort_markpos_pos tuplesort_markpos_pos_pg
 #define tuplesort_restorepos_pos tuplesort_restorepos_pos_pg
 #define tuplesort_set_instrument tuplesort_set_instrument_pg
-#define tuplesort_set_gpmon tuplesort_set_gpmon_pg
 
 #include "access/itup.h"
 #include "executor/tuptable.h"
@@ -93,7 +92,6 @@
 #include "utils/relcache.h"
 
 #include "utils/tuplesort_gp.h"
-
 
 /* Tuplesortstate is an opaque type whose details are not known outside
  * tuplesort.c.
@@ -126,8 +124,9 @@ typedef struct Tuplesortstate Tuplesortstate;
  * The "index_hash" API is similar to index_btree, but the tuples are
  * actually sorted by their hash codes not the raw data.
  */
+struct ScanState;
 
-extern Tuplesortstate *tuplesort_begin_heap(ScanState *ss, TupleDesc tupDesc,
+extern Tuplesortstate *tuplesort_begin_heap(struct ScanState *ss, TupleDesc tupDesc,
 					 int nkeys, AttrNumber *attNums,
 					 Oid *sortOperators, Oid *sortCollations,
 					 bool *nullsFirstFlags,
@@ -143,7 +142,7 @@ extern Tuplesortstate *tuplesort_begin_index_hash(Relation heapRel,
 						   Relation indexRel,
 						   uint32 hash_mask,
 						   int workMem, bool randomAccess);
-extern Tuplesortstate *tuplesort_begin_datum(ScanState *ss, Oid datumType,
+extern Tuplesortstate *tuplesort_begin_datum(struct ScanState *ss, Oid datumType,
 					  Oid sortOperator, Oid sortCollation,
 					  bool nullsFirstFlag,
 					  int workMem, bool randomAccess);
@@ -153,20 +152,22 @@ extern void tuplesort_set_bound(Tuplesortstate *state, int64 bound);
 extern void tuplesort_puttupleslot(Tuplesortstate *state,
 					   TupleTableSlot *slot);
 extern void tuplesort_putheaptuple(Tuplesortstate *state, HeapTuple tup);
-extern void tuplesort_putindextuple(Tuplesortstate *state, IndexTuple tuple);
+extern void tuplesort_putindextuplevalues(Tuplesortstate *state,
+							  Relation rel, ItemPointer self,
+							  Datum *values, bool *isnull);
 extern void tuplesort_putdatum(Tuplesortstate *state, Datum val,
 				   bool isNull);
 
 extern void tuplesort_performsort(Tuplesortstate *state);
 
 extern bool tuplesort_gettupleslot(Tuplesortstate *state, bool forward,
-					   TupleTableSlot *slot);
+					   TupleTableSlot *slot, Datum *abbrev);
 extern HeapTuple tuplesort_getheaptuple(Tuplesortstate *state, bool forward,
 					   bool *should_free);
 extern IndexTuple tuplesort_getindextuple(Tuplesortstate *state, bool forward,
 						bool *should_free);
 extern bool tuplesort_getdatum(Tuplesortstate *state, bool forward,
-				   Datum *val, bool *isNull);
+				   Datum *val, bool *isNull, Datum *abbrev);
 
 extern bool tuplesort_skiptuples(Tuplesortstate *state, int64 ntuples,
 					 bool forward);
@@ -184,21 +185,6 @@ extern int	tuplesort_merge_order(int64 allowedMem);
 extern void tuplesort_rescan(Tuplesortstate *state);
 extern void tuplesort_markpos(Tuplesortstate *state);
 extern void tuplesort_restorepos(Tuplesortstate *state);
-
-/* Setup for ApplySortFunction */
-extern void SelectSortFunction(Oid sortOperator, bool nulls_first,
-				   Oid *sortFunction,
-				   int *sortFlags);
-
-/*
- * Apply a sort function (by now converted to fmgr lookup form)
- * and return a 3-way comparison result.  This takes care of handling
- * reverse-sort and NULLs-ordering properly.
- */
-extern int32 ApplySortFunction(FmgrInfo *sortFunction, int sortFlags,
-				  Oid collation,
-				  Datum datum1, bool isNull1,
-				  Datum datum2, bool isNull2);
 
 
 /*
@@ -222,7 +208,7 @@ extern int32 ApplySortFunction(FmgrInfo *sortFunction, int sortFlags,
 #undef tuplesort_set_bound
 #undef tuplesort_puttupleslot
 #undef tuplesort_putheaptuple
-#undef tuplesort_putindextuple
+#undef tuplesort_putindextuplevalues
 #undef tuplesort_putdatum
 #undef tuplesort_performsort
 #undef tuplesort_gettupleslot
@@ -244,7 +230,6 @@ extern int32 ApplySortFunction(FmgrInfo *sortFunction, int sortFlags,
 #undef tuplesort_markpos_pos
 #undef tuplesort_restorepos_pos
 #undef tuplesort_set_instrument
-#undef tuplesort_set_gpmon
 
 #include "tuplesort_mk.h"
 
@@ -264,7 +249,7 @@ struct switcheroo_Tuplesortstate
 typedef struct switcheroo_Tuplesortstate switcheroo_Tuplesortstate;
 
 static inline switcheroo_Tuplesortstate *
-switcheroo_tuplesort_begin_heap(ScanState *ss, TupleDesc tupDesc,
+switcheroo_tuplesort_begin_heap(struct ScanState *ss, TupleDesc tupDesc,
 					 int nkeys, AttrNumber *attNums,
 					 Oid *sortOperators, Oid *sortCollations,
 					 bool *nullsFirstFlags,
@@ -358,7 +343,7 @@ switcheroo_tuplesort_begin_index_hash(Relation heapRel,
 }
 
 static inline switcheroo_Tuplesortstate *
-switcheroo_tuplesort_begin_datum(ScanState *ss,
+switcheroo_tuplesort_begin_datum(struct ScanState *ss,
 								 Oid datumType, Oid sortOperator, Oid sortCollation,
 								 bool nullsFirstFlag,
 								 int workMem, bool randomAccess)
@@ -409,12 +394,16 @@ switcheroo_tuplesort_putheaptuple(switcheroo_Tuplesortstate *state, HeapTuple tu
 }
 
 static inline void
-switcheroo_tuplesort_putindextuple(switcheroo_Tuplesortstate *state, IndexTuple tuple)
+switcheroo_tuplesort_putindextuplevalues(switcheroo_Tuplesortstate *state,
+										 Relation rel, ItemPointer self,
+										 Datum *values, bool *isnull)
 {
 	if (state->is_mk_tuplesortstate)
-		tuplesort_putindextuple_mk((Tuplesortstate_mk *) state, tuple);
+		tuplesort_putindextuplevalues_mk((Tuplesortstate_mk *) state, rel,
+										 self, values, isnull);
 	else
-		tuplesort_putindextuple_pg((Tuplesortstate_pg *) state, tuple);
+		tuplesort_putindextuplevalues_pg((Tuplesortstate_pg *) state, rel,
+										 self, values, isnull);
 }
 
 static inline void
@@ -437,12 +426,12 @@ switcheroo_tuplesort_performsort(switcheroo_Tuplesortstate *state)
 
 static inline bool
 switcheroo_tuplesort_gettupleslot(switcheroo_Tuplesortstate *state, bool forward,
-								   TupleTableSlot *slot)
+								   TupleTableSlot *slot, Datum *abbrev)
 {
 	if (state->is_mk_tuplesortstate)
-		return tuplesort_gettupleslot_mk((Tuplesortstate_mk *) state, forward, slot);
+		return tuplesort_gettupleslot_mk((Tuplesortstate_mk *) state, forward, slot, abbrev);
 	else
-		return tuplesort_gettupleslot_pg((Tuplesortstate_pg *) state, forward, slot);
+		return tuplesort_gettupleslot_pg((Tuplesortstate_pg *) state, forward, slot, abbrev);
 }
 
 static inline HeapTuple
@@ -464,12 +453,12 @@ switcheroo_tuplesort_getindextuple(switcheroo_Tuplesortstate *state, bool forwar
 }
 
 static inline bool
-switcheroo_tuplesort_getdatum(switcheroo_Tuplesortstate *state, bool forward, Datum *val, bool *isNull)
+switcheroo_tuplesort_getdatum(switcheroo_Tuplesortstate *state, bool forward, Datum *val, bool *isNull, Datum *abbrev)
 {
 	if (state->is_mk_tuplesortstate)
-		return tuplesort_getdatum_mk((Tuplesortstate_mk *) state, forward, val, isNull);
+		return tuplesort_getdatum_mk((Tuplesortstate_mk *) state, forward, val, isNull, abbrev);
 	else
-		return tuplesort_getdatum_pg((Tuplesortstate_pg *) state, forward, val, isNull);
+		return tuplesort_getdatum_pg((Tuplesortstate_pg *) state, forward, val, isNull, abbrev);
 }
 
 static inline bool
@@ -520,7 +509,7 @@ switcheroo_tuplesort_restorepos(switcheroo_Tuplesortstate *state)
 
 static inline switcheroo_Tuplesortstate *
 switcheroo_tuplesort_begin_heap_file_readerwriter(
-		ScanState * ss,
+		struct ScanState * ss,
 		const char* rwfile_prefix, bool isWriter,
 		TupleDesc tupDesc,
 		int nkeys, AttrNumber *attNums,
@@ -575,12 +564,12 @@ switcheroo_tuplesort_begin_pos(switcheroo_Tuplesortstate *state, TuplesortPos **
 
 static inline bool
 switcheroo_tuplesort_gettupleslot_pos(switcheroo_Tuplesortstate *state, TuplesortPos *pos,
-                          bool forward, TupleTableSlot *slot, MemoryContext mcontext)
+                          bool forward, TupleTableSlot *slot, Datum *abbrev, MemoryContext mcontext)
 {
 	if (state->is_mk_tuplesortstate)
-		return tuplesort_gettupleslot_pos_mk((Tuplesortstate_mk *) state, (TuplesortPos_mk *) pos, forward, slot, mcontext);
+		return tuplesort_gettupleslot_pos_mk((Tuplesortstate_mk *) state, (TuplesortPos_mk *) pos, forward, slot, abbrev, mcontext);
 	else
-		return tuplesort_gettupleslot_pos_pg((Tuplesortstate_pg *) state, pos, forward, slot, mcontext);
+		return tuplesort_gettupleslot_pos_pg((Tuplesortstate_pg *) state, pos, forward, slot, abbrev, mcontext);
 }
 
 static inline void
@@ -639,17 +628,6 @@ switcheroo_tuplesort_set_instrument(switcheroo_Tuplesortstate *state,
 		tuplesort_set_instrument_pg((Tuplesortstate_pg *) state, instrument, explainbuf);
 }
 
-static inline void
-switcheroo_tuplesort_set_gpmon(switcheroo_Tuplesortstate *state,
-							   gpmon_packet_t *gpmon_pkt,
-							   int *gpmon_tick)
-{
-	if (state->is_mk_tuplesortstate)
-		tuplesort_set_gpmon_mk((Tuplesortstate_mk *) state, gpmon_pkt, gpmon_tick);
-	else
-		tuplesort_set_gpmon_pg((Tuplesortstate_pg *) state, gpmon_pkt, gpmon_tick);
-}
-
 /* these are in tuplesort.h */
 #undef Tuplesortstate
 #define Tuplesortstate switcheroo_Tuplesortstate
@@ -662,7 +640,7 @@ switcheroo_tuplesort_set_gpmon(switcheroo_Tuplesortstate *state,
 #define tuplesort_set_bound switcheroo_tuplesort_set_bound
 #define tuplesort_puttupleslot switcheroo_tuplesort_puttupleslot
 #define tuplesort_putheaptuple switcheroo_tuplesort_putheaptuple
-#define tuplesort_putindextuple switcheroo_tuplesort_putindextuple
+#define tuplesort_putindextuplevalues switcheroo_tuplesort_putindextuplevalues
 #define tuplesort_putdatum switcheroo_tuplesort_putdatum
 #define tuplesort_performsort switcheroo_tuplesort_performsort
 #define tuplesort_gettupleslot switcheroo_tuplesort_gettupleslot
@@ -686,7 +664,6 @@ switcheroo_tuplesort_set_gpmon(switcheroo_Tuplesortstate *state,
 #define tuplesort_markpos_pos switcheroo_tuplesort_markpos_pos
 #define tuplesort_restorepos_pos switcheroo_tuplesort_restorepos_pos
 #define tuplesort_set_instrument switcheroo_tuplesort_set_instrument
-#define tuplesort_set_gpmon switcheroo_tuplesort_set_gpmon
 
 #endif
 

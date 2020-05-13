@@ -17,7 +17,10 @@ limitations under the License.
 
 import pg
 import os
-import subprocess
+try:
+    import subprocess32 as subprocess
+except:
+    import subprocess
 import re
 import multiprocessing
 import tempfile
@@ -34,22 +37,37 @@ def is_digit(n):
     except ValueError:
         return  False
 
+def load_helper_file(helper_file):
+    with open(helper_file) as file:
+        return "".join(file.readlines()).strip()
+
+
+def parse_include_statement(sql):
+    include_statement, command = sql.split(None, 1)
+    stripped_command = command.strip()
+
+    if stripped_command.endswith(";"):
+        return stripped_command.replace(";", "")
+    else:
+        raise SyntaxError("expected 'include: %s' to end with a semicolon." % stripped_command)
+
+
 class SQLIsolationExecutor(object):
     def __init__(self, dbname=''):
         self.processes = {}
         # The re.S flag makes the "." in the regex match newlines.
         # When matched against a command in process_command(), all
         # lines in the command are matched and sent as SQL query.
-        self.command_pattern = re.compile(r"^(-?\d+|[*])([&\\<\\>Uq]*?)\:(.*)", re.S)
+        self.command_pattern = re.compile(r"^(-?\d+|[*])([&\\<\\>USIq]*?)\:(.*)", re.S)
         if dbname:
             self.dbname = dbname
         else:
             self.dbname = os.environ.get('PGDATABASE')
 
     class SQLConnection(object):
-        def __init__(self, out_file, name, utility_mode, dbname):
+        def __init__(self, out_file, name, mode, dbname):
             self.name = name
-            self.utility_mode = utility_mode
+            self.mode = mode
             self.out_file = out_file
             self.dbname = dbname
 
@@ -67,7 +85,7 @@ class SQLIsolationExecutor(object):
 
         def session_process(self, pipe):
             sp = SQLIsolationExecutor.SQLSessionProcess(self.name, 
-                self.utility_mode, pipe, self.dbname)
+                self.mode, pipe, self.dbname)
             sp.do()
 
         def query(self, command):
@@ -82,7 +100,7 @@ class SQLIsolationExecutor(object):
             r = self.pipe.recv()
             if r is None:
                 raise Exception("Execution failed")
-            print >>self.out_file, r.strip()
+            print >>self.out_file, r.rstrip()
 
         def fork(self, command, blocking):
             print >>self.out_file, " <waiting ...>"
@@ -102,7 +120,7 @@ class SQLIsolationExecutor(object):
                 r = self.pipe.recv()
             if r is None:
                 raise Exception("Execution failed")
-            print >>self.out_file, r.strip()
+            print >>self.out_file, r.rstrip()
             self.has_open = False
 
         def stop(self):
@@ -120,21 +138,29 @@ class SQLIsolationExecutor(object):
             self.p.terminate()
 
     class SQLSessionProcess(object):
-        def __init__(self, name, utility_mode, pipe, dbname):
+        def __init__(self, name, mode, pipe, dbname):
             """
                 Constructor
             """
             self.name = name
-            self.utility_mode = utility_mode
+            self.mode = mode
             self.pipe = pipe
             self.dbname = dbname
-            if self.utility_mode:
-                (hostname, port) = self.get_utility_mode_port(name)
+            if self.mode == "utility":
+                (hostname, port) = self.get_hostname_port(name, 'p')
                 self.con = self.connectdb(given_dbname=self.dbname,
                                           given_host=hostname,
                                           given_port=port,
                                           given_opt="-c gp_session_role=utility")
-
+            elif self.mode == "standby":
+                # Connect to standby even when it's role is recorded
+                # as mirror.  This is useful for scenarios where a
+                # test needs to promote a standby without using
+                # gpactivatestandby.
+                (hostname, port) = self.get_hostname_port(name, 'm')
+                self.con = self.connectdb(given_dbname=self.dbname,
+                                          given_host=hostname,
+                                          given_port=port)
             else:
                 self.con = self.connectdb(self.dbname)
 
@@ -172,15 +198,18 @@ class SQLIsolationExecutor(object):
             con.set_notice_receiver(self.null_notice_receiver)
             return con
 
-        def get_utility_mode_port(self, name):
+        def get_hostname_port(self, contentid, role):
             """
                 Gets the port number/hostname combination of the
-                contentid = name and role = primary
+                contentid and role
             """
-            con = self.connectdb(self.dbname)
-            r = con.query("SELECT hostname, port FROM gp_segment_configuration WHERE content = %s and role = 'p'" % name).getresult()
+            query = ("SELECT hostname, port FROM gp_segment_configuration WHERE"
+                     " content = %s AND role = '%s'") % (contentid, role)
+            con = self.connectdb(self.dbname, given_opt="-c gp_session_role=utility")
+            r = con.query(query).getresult()
+            con.close()
             if len(r) == 0:
-                raise Exception("Invalid content %s" % name)
+                raise Exception("Invalid content %s" % contentid)
             if r[0][0] == socket.gethostname():
                 return (None, int(r[0][1]))
             return (r[0][0], int(r[0][1]))
@@ -191,6 +220,8 @@ class SQLIsolationExecutor(object):
             between PyGreSQL 4 and 5. Rather than couple our result files to
             this (undocumented) output format, create our own (based on the
             PyGreSQL 4 format) so that we are stable across versions.
+            The output need not be exactly comparable to the output of psql,
+            but close enough that gpdiff.pl recognizes the result sets.
             """
             columns = r.listfields()
             if not columns:
@@ -277,35 +308,35 @@ class SQLIsolationExecutor(object):
                 (c, wait) = self.pipe.recv()
 
 
-    def get_process(self, out_file, name, utility_mode=False, dbname=""):
+    def get_process(self, out_file, name, mode="", dbname=""):
         """
             Gets or creates the process by the given name
         """
         if len(name) > 0 and not is_digit(name):
             raise Exception("Name should be a number")
-        if len(name) > 0 and not utility_mode and int(name) >= 1024:
+        if len(name) > 0 and mode != "utility" and int(name) >= 1024:
             raise Exception("Session name should be smaller than 1024 unless it is utility mode number")
 
-        if not (name, utility_mode) in self.processes:
+        if not (name, mode) in self.processes:
             if not dbname:
                 dbname = self.dbname
-            self.processes[(name, utility_mode)] = SQLIsolationExecutor.SQLConnection(out_file, name, utility_mode, dbname)
-        return self.processes[(name, utility_mode)]
+            self.processes[(name, mode)] = SQLIsolationExecutor.SQLConnection(out_file, name, mode, dbname)
+        return self.processes[(name, mode)]
 
-    def quit_process(self, out_file, name, utility_mode=False, dbname=""):
+    def quit_process(self, out_file, name, mode="", dbname=""):
         """
         Quits a process with the given name
         """
         if len(name) > 0 and not is_digit(name):
             raise Exception("Name should be a number")
-        if len(name) > 0 and not utility_mode and int(name) >= 1024:
+        if len(name) > 0 and mode != "utility" and int(name) >= 1024:
             raise Exception("Session name should be smaller than 1024 unless it is utility mode number")
 
-        if not (name, utility_mode) in self.processes:
+        if not (name, mode) in self.processes:
             raise Exception("Sessions not started cannot be quit")
 
-        self.processes[(name, utility_mode)].quit()
-        del self.processes[(name, utility_mode)]
+        self.processes[(name, mode)].quit()
+        del self.processes[(name, mode)]
 
     def get_all_primary_contentids(self, dbname):
         """
@@ -330,11 +361,18 @@ class SQLIsolationExecutor(object):
         process_name = ""
         sql = command
         flag = ""
+        con_mode = ""
         dbname = ""
         m = self.command_pattern.match(command)
         if m:
             process_name = m.groups()[0]
             flag = m.groups()[1]
+            if flag and flag[0] == "U":
+                con_mode = "utility"
+            elif flag and flag[0] == "S":
+                if len(flag) > 1:
+                    flag = flag[1:]
+                con_mode = "standby"
             sql = m.groups()[2]
             sql = sql.lstrip()
             # If db_name is specifed , it should be of the following syntax:
@@ -376,20 +414,30 @@ class SQLIsolationExecutor(object):
                 if mode == '\\retcode':
                     print >> output_file, '-- end_ignore'
                     print >> output_file, '(exited with code {})'.format(cmd_output.returncode)
+            elif sql.startswith('include:'):
+                helper_file = parse_include_statement(sql)
+
+                self.get_process(
+                    output_file,
+                    process_name,
+                    dbname=dbname
+                ).query(
+                    load_helper_file(helper_file)
+                )
             else:
-                self.get_process(output_file, process_name, dbname=dbname).query(sql.strip())
+                self.get_process(output_file, process_name, con_mode, dbname=dbname).query(sql.strip())
         elif flag == "&":
-            self.get_process(output_file, process_name, dbname=dbname).fork(sql.strip(), True)
+            self.get_process(output_file, process_name, con_mode, dbname=dbname).fork(sql.strip(), True)
         elif flag == ">":
-            self.get_process(output_file, process_name, dbname=dbname).fork(sql.strip(), False)
+            self.get_process(output_file, process_name, con_mode, dbname=dbname).fork(sql.strip(), False)
         elif flag == "<":
             if len(sql) > 0:
                 raise Exception("No query should be given on join")
-            self.get_process(output_file, process_name, dbname=dbname).join()
+            self.get_process(output_file, process_name, con_mode, dbname=dbname).join()
         elif flag == "q":
             if len(sql) > 0:
                 raise Exception("No query should be given on quit")
-            self.quit_process(output_file, process_name, dbname=dbname)
+            self.quit_process(output_file, process_name, con_mode, dbname=dbname)
         elif flag == "U":
             if process_name == '*':
                 process_names = [str(content) for content in self.get_all_primary_contentids(dbname)]
@@ -397,17 +445,19 @@ class SQLIsolationExecutor(object):
                 process_names = [process_name]
 
             for name in process_names:
-                self.get_process(output_file, name, utility_mode=True, dbname=dbname).query(sql.strip())
+                self.get_process(output_file, name, con_mode, dbname=dbname).query(sql.strip())
         elif flag == "U&":
-            self.get_process(output_file, process_name, utility_mode=True, dbname=dbname).fork(sql.strip(), True)
+            self.get_process(output_file, process_name, con_mode, dbname=dbname).fork(sql.strip(), True)
         elif flag == "U<":
             if len(sql) > 0:
                 raise Exception("No query should be given on join")
-            self.get_process(output_file, process_name, utility_mode=True, dbname=dbname).join()
+            self.get_process(output_file, process_name, con_mode, dbname=dbname).join()
         elif flag == "Uq":
             if len(sql) > 0:
                 raise Exception("No query should be given on quit")
-            self.quit_process(output_file, process_name, utility_mode=True, dbname=dbname)
+            self.quit_process(output_file, process_name, con_mode, dbname=dbname)
+        elif flag == "S":
+            self.get_process(output_file, process_name, con_mode, dbname=dbname).query(sql.strip())
         else:
             raise Exception("Invalid isolation flag")
 
@@ -423,11 +473,13 @@ class SQLIsolationExecutor(object):
                 print >>output_file, line.strip(),
                 if line[0] == "!":
                     command_part = line # shell commands can use -- for multichar options like --include
-                else:
+                elif re.match(r";.*--", line) or re.match(r"^--", line):
                     command_part = line.partition("--")[0] # remove comment from line
+                else:
+                    command_part = line
                 if command_part == "" or command_part == "\n":
                     print >>output_file 
-                elif command_part.endswith(";\n") or re.match(r"^\d+[q\\<]:$", line) or re.match(r"^-?\d+U[q\\<]:$", line):
+                elif re.match(r".*;\s*$", command_part) or re.match(r"^\d+[q\\<]:$", line) or re.match(r"^-?\d+[SU][q\\<]:$", line):
                     command += command_part
                     try:
                         self.process_command(command, output_file)
@@ -466,6 +518,7 @@ class SQLIsolationTestCase:
             U: connect in utility mode to primary contentid from gp_segment_configuration
             U&: expect blocking behavior in utility mode (does not currently support an asterisk target)
             U<: join an existing utility mode session (does not currently support an asterisk target)
+            I: include a file of sql statements (useful for loading reusable functions)
 
         An example is:
 
@@ -565,6 +618,33 @@ class SQLIsolationTestCase:
         failures; a better long-term solution is needed.)
 
         Block/join flags are not currently supported with *U.
+
+        Including files:
+
+        -- example contents for file.sql: create function some_test_function() returning void ...
+        include: path/to/some/file.sql;
+        select some_helper_function();
+
+        Line continuation:
+        If a line is not ended by a semicolon ';' which is followed by 0 or more spaces, the line will be combined with next line and
+        sent together as a single statement.
+
+        e.g.: Send to the server separately:
+        1: SELECT * FROM t1; -> send "SELECT * FROM t1;"
+        SELECT * FROM t2; -> send "SELECT * FROM t2;"
+
+        e.g.: Send to the server once:
+        1: SELECT * FROM
+        t1; SELECT * FROM t2; -> "send SELECT * FROM t1; SELECT * FROM t2;"
+
+        ATTENTION:
+        Send multi SQL statements once:
+        Multi SQL statements can be sent at once, but there are some known issues. Generally only the last query result will be printed.
+        But due to the difficulties of dealing with semicolons insides quotes, we always echo the first SQL command instead of the last
+        one if query() returns None. This created some strange issues like:
+
+        CREATE TABLE t1 (a INT); INSERT INTO t1 SELECT generate_series(1,1000);
+        CREATE 1000 (Should be INSERT 1000, but here the CREATE is taken due to the limitation)
     """
 
     def run_sql_file(self, sql_file, out_file = None, out_dir = None, optimizer = None):

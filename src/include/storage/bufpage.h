@@ -4,7 +4,7 @@
  *	  Standard POSTGRES buffer page definitions.
  *
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/storage/bufpage.h
@@ -19,11 +19,6 @@
 #include "storage/item.h"
 #include "storage/off.h"
 #include "miscadmin.h"
-
-#ifndef FRONTEND
-/* Needed by PageGetLSN(), only for asserts in backend code */
-#include "storage/bufmgr.h"
-#endif
 
 /*
  * A postgres disk page is an abstraction layered on top of a postgres
@@ -162,7 +157,7 @@ typedef struct PageHeaderData
 	LocationIndex pd_special;	/* offset to start of special space */
 	uint16		pd_pagesize_version;
 	TransactionId pd_prune_xid; /* oldest prunable XID, or zero if none */
-	ItemIdData	pd_linp[1];		/* beginning of line pointer array */
+	ItemIdData	pd_linp[FLEXIBLE_ARRAY_MEMBER]; /* line pointer array */
 } PageHeaderData;
 
 typedef PageHeaderData *PageHeader;
@@ -317,12 +312,31 @@ typedef PageHeaderData *PageHeader;
 	((uint16) (PageGetPageSize(page) - ((PageHeader)(page))->pd_special))
 
 /*
+ * Using assertions, validate that the page special pointer is OK.
+ *
+ * This is intended to catch use of the pointer before page initialization.
+ * It is implemented as a function due to the limitations of the MSVC
+ * compiler, which choked on doing all these tests within another macro.  We
+ * return true so that MacroAssert() can be used while still getting the
+ * specifics from the macro failure within this function.
+ */
+static inline bool
+PageValidateSpecialPointer(Page page)
+{
+	Assert(PageIsValid(page));
+	Assert(((PageHeader) (page))->pd_special <= BLCKSZ);
+	Assert(((PageHeader) (page))->pd_special >= SizeOfPageHeaderData);
+
+	return true;
+}
+
+/*
  * PageGetSpecialPointer
  *		Returns pointer to special space on a page.
  */
 #define PageGetSpecialPointer(page) \
 ( \
-	AssertMacro(PageIsValid(page)), \
+	AssertMacro(PageValidateSpecialPointer(page)), \
 	(char *) ((char *) (page) + ((PageHeader) (page))->pd_special) \
 )
 
@@ -366,23 +380,12 @@ typedef PageHeaderData *PageHeader;
  * local buffers do not need to worry about concurrency.
  *
  */
+extern bool BufferLockHeldByMe(Page page);
 static inline XLogRecPtr
 PageGetLSN(Page page)
 {
 #if defined (USE_ASSERT_CHECKING) && !defined(FRONTEND)
-	extern PGDLLIMPORT char *BufferBlocks; /* duplicates bufmgr.h */
-	char *pagePtr = page;
-
-	/*
-	 * We only want to assert that we hold a lock on the page contents if the
-	 * page is shared (i.e. it is one of the BufferBlocks).
-	 */
-	if (BufferBlocks <= pagePtr &&
-		pagePtr < (BufferBlocks + NBuffers * BLCKSZ))
-	{
-		BufferDesc *hdr = &BufferDescriptors[(pagePtr - BufferBlocks) / BLCKSZ];
-		Assert(LWLockHeldByMe(hdr->content_lock));
-	}
+	Assert(BufferLockHeldByMe(page));
 #endif
 	return PageXLogRecPtrGet(((PageHeader) (page))->pd_lsn);
 }
@@ -443,11 +446,16 @@ do { \
  *		extern declarations
  * ----------------------------------------------------------------
  */
+#define PAI_OVERWRITE			(1 << 0)
+#define PAI_IS_HEAP				(1 << 1)
+#define PAI_ALLOW_FAR_OFFSET	(1 << 2)
 
 extern void PageInit(Page page, Size pageSize, Size specialSize);
 extern bool PageIsVerified(Page page, BlockNumber blkno);
 extern OffsetNumber PageAddItem(Page page, Item item, Size size,
 			OffsetNumber offsetNumber, bool overwrite, bool is_heap);
+extern OffsetNumber PageAddItemExtended(Page page, Item item, Size size,
+					OffsetNumber offsetNumber, int flags);
 extern Page PageGetTempPage(Page page);
 extern Page PageGetTempPageCopy(Page page);
 extern Page PageGetTempPageCopySpecial(Page page);
@@ -458,6 +466,8 @@ extern Size PageGetExactFreeSpace(Page page);
 extern Size PageGetHeapFreeSpace(Page page);
 extern void PageIndexTupleDelete(Page page, OffsetNumber offset);
 extern void PageIndexMultiDelete(Page page, OffsetNumber *itemnos, int nitems);
+extern void PageIndexDeleteNoCompact(Page page, OffsetNumber *itemnos,
+						 int nitems);
 extern char *PageSetChecksumCopy(Page page, BlockNumber blkno);
 extern void PageSetChecksumInplace(Page page, BlockNumber blkno);
 

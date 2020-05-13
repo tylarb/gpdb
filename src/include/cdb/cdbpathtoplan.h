@@ -15,11 +15,6 @@
 #ifndef CDBPATHTOPLAN_H
 #define CDBPATHTOPLAN_H
 
-
-Flow *
-cdbpathtoplan_create_flow(PlannerInfo  *root,
-                          CdbPathLocus  locus,
-                          Relids        relids,
-                          Plan         *plan);
+extern Flow *cdbpathtoplan_create_flow(PlannerInfo *root, CdbPathLocus locus);
 
 #endif   /* CDBPATHTOPLAN_H */

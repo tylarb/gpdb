@@ -5,7 +5,7 @@
  *
  * Portions Copyright (c) 2007-2008, Greenplum inc
  * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -28,6 +28,7 @@
 #include "utils/faultinjector.h"
 
 static void ExecSortExplainEnd(PlanState *planstate, struct StringInfoData *buf);
+static void ExecEagerFreeSort(SortState *node);
 
 /* ----------------------------------------------------------------
  *		ExecSort
@@ -105,11 +106,6 @@ ExecSort(SortState *node)
 		if(plannode->share_type == SHARE_SORT_XSLICE)
 		{
 			char rwfile_prefix[100];
-			if(plannode->driver_slice != currentSliceId)
-			{
-				elog(LOG, "Sort exec on CrossSlice, current slice %d", currentSliceId);
-				return NULL;
-			}
 
 			shareinput_create_bufname_prefix(rwfile_prefix, sizeof(rwfile_prefix), plannode->share_id);
 			elog(LOG, "Sort node create shareinput rwfile %s", rwfile_prefix);
@@ -160,9 +156,6 @@ ExecSort(SortState *node)
 			tuplesort_set_instrument(tuplesortstate,
 									 node->ss.ps.instrument,
 									 node->ss.ps.cdbexplainbuf);
-
-		tuplesort_set_gpmon(tuplesortstate, &node->ss.ps.gpmon_pkt,
-							&node->ss.ps.gpmon_plan_tick);
 	}
 
 	/*
@@ -189,14 +182,13 @@ ExecSort(SortState *node)
 			tuplesort_puttupleslot(tuplesortstate, slot);
 		}
 
-		SIMPLE_FAULT_INJECTOR(ExecSortBeforeSorting);
+		SIMPLE_FAULT_INJECTOR("execsort_before_sorting");
 
 		/*
 		 * Complete the sort.
 		 */
 		tuplesort_performsort(tuplesortstate);
 
-		CheckSendPlanStateGpmonPkt(&node->ss.ps);
 		/*
 		 * restore to user specified direction
 		 */
@@ -215,16 +207,8 @@ ExecSort(SortState *node)
 		{
 			Assert(plannode->share_type == SHARE_SORT || plannode->share_type == SHARE_SORT_XSLICE);
 
-			if(plannode->share_type == SHARE_SORT_XSLICE)
-			{
-				if(plannode->driver_slice == currentSliceId)
-				{
-					tuplesort_flush(tuplesortstate);
-
-					node->share_lk_ctxt = shareinput_writer_notifyready(plannode->share_id, plannode->nsharer_xslice,
-							estate->es_plannedstmt->planGen);
-				}
-			}
+			if (plannode->share_type == SHARE_SORT_XSLICE)
+				tuplesort_flush(tuplesortstate);
 
 			return NULL;
 		}
@@ -244,9 +228,9 @@ ExecSort(SortState *node)
 	slot = node->ss.ps.ps_ResultTupleSlot;
 	(void) tuplesort_gettupleslot(tuplesortstate,
 								  ScanDirectionIsForward(dir),
-								  slot);
+								  slot, NULL);
 
-	if (TupIsNull(slot) && !node->ss.ps.delayEagerFree)
+	if (TupIsNull(slot) && !node->delayEagerFree)
 	{
 		ExecEagerFreeSort(node);
 	}
@@ -292,7 +276,6 @@ ExecInitSort(Sort *node, EState *estate, int eflags)
 	sortstate->bounded = false;
 	sortstate->sort_Done = false;
 	sortstate->tuplesortstate = palloc0(sizeof(GenericTupStore));
-	sortstate->share_lk_ctxt = NULL;
 
 	/* CDB */
 
@@ -338,7 +321,7 @@ ExecInitSort(Sort *node, EState *estate, int eflags)
 	 * If eflag contains EXEC_FLAG_REWIND or EXEC_FLAG_BACKWARD or EXEC_FLAG_MARK,
 	 * then this node is not eager free safe.
 	 */
-	sortstate->ss.ps.delayEagerFree =
+	sortstate->delayEagerFree =
 		((eflags & (EXEC_FLAG_REWIND | EXEC_FLAG_BACKWARD | EXEC_FLAG_MARK)) != 0);
 
 	/*
@@ -370,7 +353,7 @@ ExecInitSort(Sort *node, EState *estate, int eflags)
 	 */
 	if (IsA(outerPlan((Plan *)node), Motion))
 	{
-		sortstate->ss.ps.delayEagerFree = true;
+		sortstate->delayEagerFree = true;
 	}
 
 	/*
@@ -380,13 +363,6 @@ ExecInitSort(Sort *node, EState *estate, int eflags)
 	ExecAssignResultTypeFromTL(&sortstate->ss.ps);
 	ExecAssignScanTypeFromOuterPlan(&sortstate->ss);
 	sortstate->ss.ps.ps_ProjInfo = NULL;
-
-	if(node->share_type != SHARE_NOTSHARED)
-	{
-		ShareNodeEntry *snEntry = ExecGetShareNodeEntry(estate, node->share_id, true);
-		snEntry->sharePlan = (Node *)node;
-		snEntry->shareState = (Node *)sortstate;
-	}
 
 	SO1_printf("ExecInitSort: %s\n",
 			   "sort node initialized");
@@ -413,8 +389,6 @@ ExecEndSort(SortState *node)
 
 	SO1_printf("ExecEndSort: %s\n",
 			   "sort node shutdown");
-
-	EndPlanStateGpmonPkt(&node->ss.ps);
 }
 
 /* ----------------------------------------------------------------
@@ -459,6 +433,8 @@ ExecSortRestrPos(SortState *node)
 void
 ExecReScanSort(SortState *node)
 {
+	PlanState  *outerPlan = outerPlanState(node);
+
 	/*
 	 * If we haven't sorted yet, just return. If outerplan's chgParam is not
 	 * NULL then it will be re-scanned by ExecProcNode, else no reason to
@@ -477,7 +453,7 @@ ExecReScanSort(SortState *node)
 	 *
 	 * Otherwise we can just rewind and rescan the sorted output.
 	 */
-	if (node->ss.ps.lefttree->chgParam != NULL ||
+	if (outerPlan->chgParam != NULL ||
 		node->bounded != node->bounded_Done ||
 		node->bound != node->bound_Done ||
 		!node->randomAccess ||
@@ -494,8 +470,8 @@ ExecReScanSort(SortState *node)
 		 * if chgParam of subnode is not null then plan will be re-scanned by
 		 * first ExecProcNode.
 		 */
-		if (node->ss.ps.lefttree->chgParam == NULL)
-			ExecReScan(node->ss.ps.lefttree);
+		if (outerPlan->chgParam == NULL)
+			ExecReScan(outerPlan);
 	}
 	else
 		tuplesort_rescan(node->tuplesortstate->sortstore);
@@ -518,32 +494,9 @@ ExecSortExplainEnd(PlanState *planstate, struct StringInfoData *buf)
 
 }                               /* ExecSortExplainEnd */
 
-void
+static void
 ExecEagerFreeSort(SortState *node)
 {
-	Sort	   *plan = (Sort *) node->ss.ps.plan;
-	EState	   *estate = node->ss.ps.state;
-
-	/*
-	 * If we still have potential readers assocated with this node,
-	 * we shouldn't free the tuplesort too early.  The eager-free message
-	 * doesn't know about upper ShareInputScan nodes, but those nodes
-	 * bumps up the reference count in their initializations and decrement
-	 * it in either EagerFree or ExecEnd.
-	 */
-	Assert(SHARE_MATERIAL != plan->share_type && SHARE_MATERIAL_XSLICE != plan->share_type);
-	if (SHARE_SORT == plan->share_type)
-	{
-		ShareNodeEntry	   *snEntry;
-
-		snEntry = ExecGetShareNodeEntry(estate, plan->share_id, false);
-
-		if (snEntry->refcount > 0)
-		{
-			return;
-		}
-	}
-
 	/* clean out the tuple table */
 	ExecClearTuple(node->ss.ss_ScanTupleSlot);
 
@@ -552,16 +505,14 @@ ExecEagerFreeSort(SortState *node)
 
 	if (NULL != node->tuplesortstate->sortstore)
 	{
-		Sort *sort = (Sort *) node->ss.ps.plan;
-
-		/* If this is a producer for a ShareScan, then wait for all consumers to be done */
-		/* XXX gcaragea: In Materialize, we moved this to End instead of EF, since EF might be too early to do it */
-		if(sort->share_type == SHARE_SORT_XSLICE && NULL != node->share_lk_ctxt)
-		{
-			shareinput_writer_waitdone(node->share_lk_ctxt, sort->share_id, sort->nsharer_xslice);
-		}
-
 		tuplesort_end(node->tuplesortstate->sortstore);
 		node->tuplesortstate->sortstore = NULL;
 	}
+}
+
+void
+ExecSquelchSort(SortState *node)
+{
+	ExecEagerFreeSort(node);
+	ExecSquelchNode(outerPlanState(node));
 }

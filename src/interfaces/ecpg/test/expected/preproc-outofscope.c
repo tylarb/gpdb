@@ -28,6 +28,8 @@
 #ifndef PGTYPES_NUMERIC
 #define PGTYPES_NUMERIC
 
+#include <pgtypes.h>
+
 #define NUMERIC_POS						0x0000
 #define NUMERIC_NEG						0x4000
 #define NUMERIC_NAN						0xC000
@@ -271,7 +273,7 @@ main (void)
 	ECPGdebug(1, stderr);
 
 	strcpy(msg, "connect");
-	{ ECPGconnect(__LINE__, 0, "regress1" , NULL, NULL , NULL, 0); 
+	{ ECPGconnect(__LINE__, 0, "ecpg1_regression" , NULL, NULL , NULL, 0); 
 #line 75 "outofscope.pgc"
 
 if (sqlca.sqlcode < 0) exit (1);}
@@ -337,7 +339,7 @@ if (sqlca.sqlcode < 0) exit (1);}
 		get_record1();
 		if (sqlca.sqlcode == ECPG_NOT_FOUND)
 			break;
-		printf("id=%d%s t='%s'%s d1=%lf%s d2=%lf%s c = '%s'%s\n",
+		printf("id=%d%s t='%s'%s d1=%f%s d2=%f%s c = '%s'%s\n",
 			myvar->id, mynullvar->id ? " (NULL)" : "",
 			myvar->t, mynullvar->t ? " (NULL)" : "",
 			myvar->d1, mynullvar->d1 ? " (NULL)" : "",

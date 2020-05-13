@@ -3,7 +3,7 @@
  * nodeMergeAppend.c
  *	  routines to handle MergeAppend nodes.
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -137,6 +137,15 @@ ExecInitMergeAppend(MergeAppend *node, EState *estate, int eflags)
 		sortKey->ssup_nulls_first = node->nullsFirst[i];
 		sortKey->ssup_attno = node->sortColIdx[i];
 
+		/*
+		 * It isn't feasible to perform abbreviated key conversion, since
+		 * tuples are pulled into mergestate's binary heap as needed.  It
+		 * would likely be counter-productive to convert tuples into an
+		 * abbreviated representation as they're pulled up, so opt out of that
+		 * additional optimization entirely.
+		 */
+		sortKey->abbreviate = false;
+
 		PrepareSortSupportFromOrderingOp(node->sortOperators[i], sortKey);
 	}
 
@@ -241,7 +250,10 @@ heap_compare_slots(Datum a, Datum b, void *arg)
 									  datum2, isNull2,
 									  sortKey);
 		if (compare != 0)
-			return -compare;
+		{
+			INVERT_COMPARE_RESULT(compare);
+			return compare;
+		}
 	}
 	return 0;
 }
@@ -299,4 +311,15 @@ ExecReScanMergeAppend(MergeAppendState *node)
 	}
 	binaryheap_reset(node->ms_heap);
 	node->ms_initialized = false;
+}
+
+void
+ExecSquelchMergeAppend(MergeAppendState *node)
+{
+	int			i;
+
+	for (i = 0; i < node->ms_nplans; i++)
+	{
+		ExecSquelchNode(node->mergeplans[i]);
+	}
 }

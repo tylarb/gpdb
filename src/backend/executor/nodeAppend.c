@@ -3,7 +3,7 @@
  * nodeAppend.c
  *	  routines to handle append nodes.
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -265,8 +265,6 @@ ExecEndAppend(AppendState *node)
 		if (appendplans[i])
 			ExecEndNode(appendplans[i]);
 	}
-
-	EndPlanStateGpmonPkt(&node->ps);
 }
 
 void
@@ -294,4 +292,13 @@ ExecReScanAppend(AppendState *node)
 	}
 	node->as_whichplan = 0;
 	exec_append_initialize_next(node);
+}
+
+void
+ExecSquelchAppend(AppendState *node)
+{
+	int			i;
+
+	for (i = 0; i < node->as_nplans; i++)
+		ExecSquelchNode(node->appendplans[i]);
 }

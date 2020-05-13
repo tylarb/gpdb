@@ -6,7 +6,7 @@
  *
  * Portions Copyright (c) 2007-2008, Greenplum inc
  * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/storage/fd.h
@@ -54,7 +54,7 @@ typedef int File;
 
 
 /* GUC parameter */
-extern int	max_files_per_process;
+extern PGDLLIMPORT int max_files_per_process;
 
 /*
  * This is private to fd.c, but exported for save/restore_backend_variables()
@@ -82,7 +82,11 @@ extern int	FileSync(File file);
 extern int64 FileSeek(File file, int64 offset, int whence);
 extern int64 FileNonVirtualCurSeek(File file);
 extern int	FileTruncate(File file, int64 offset);
+extern void FileWriteback(File file, off_t offset, off_t nbytes);
 extern char *FilePathName(File file);
+extern int	FileGetRawDesc(File file);
+extern int	FileGetRawFlags(File file);
+extern int	FileGetRawMode(File file);
 extern int64 FileDiskSize(File file);
 
 /* Operations that allow use of regular stdio --- USE WITH CAUTION */
@@ -96,6 +100,8 @@ extern int	ClosePipeStream(FILE *file);
 /* Operations to allow use of the <dirent.h> library routines */
 extern DIR *AllocateDir(const char *dirname);
 extern struct dirent *ReadDir(DIR *dir, const char *dirname);
+extern struct dirent *ReadDirExtended(DIR *dir, const char *dirname,
+				int elevel);
 extern int	FreeDir(DIR *dir);
 
 /* Operations to allow use of a plain kernel FD, with automatic cleanup */
@@ -121,8 +127,13 @@ extern int	pg_fsync(int fd);
 extern int	pg_fsync_no_writethrough(int fd);
 extern int	pg_fsync_writethrough(int fd);
 extern int	pg_fdatasync(int fd);
-extern int	pg_flush_data(int fd, off_t offset, off_t amount);
-extern void fsync_fname(char *fname, bool isdir);
+extern void pg_flush_data(int fd, off_t offset, off_t amount);
+extern void fsync_fname(const char *fname, bool isdir);
+extern int	durable_rename(const char *oldfile, const char *newfile, int loglevel);
+extern int	durable_link_or_rename(const char *oldfile, const char *newfile, int loglevel);
+extern void SyncDataDirectory(void);
+extern int	durable_rename(const char *oldfile, const char *newfile, int loglevel);
+extern int	durable_link_or_rename(const char *oldfile, const char *newfile, int loglevel);
 
 extern int gp_retry_close(int fd);
 
@@ -131,5 +142,10 @@ extern int gp_retry_close(int fd);
 #define PG_TEMP_FILE_PREFIX "pgsql_tmp"
 
 extern char *GetTempFilePath(const char *filename, bool createdir);
+
+extern const char *FileGetFilename(File file);
+
+extern void FileSetIsWorkfile(File file);
+extern void FileSetIsTempFile(File file, bool isTempFile);
 
 #endif   /* FD_H */

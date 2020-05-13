@@ -484,12 +484,11 @@ explain (costs off)
    ->  Append
          ->  Result
                Filter: (((t1.a || t1.b)) = 'ab'::text)
-               ->  Result
-                     ->  Table Scan on t1
+               ->  Seq Scan on t1
          ->  Index Scan using t2_pkey on t2
                Index Cond: (ab = 'ab'::text)
- Optimizer: PQO version 2.74.0
-(9 rows)
+ Optimizer: Pivotal Optimizer (GPORCA) version 3.83.0
+(8 rows)
 
 explain (costs off)
  SELECT * FROM
@@ -497,28 +496,23 @@ explain (costs off)
   UNION
   SELECT * FROM t2) t
  WHERE ab = 'ab';
-                                     QUERY PLAN                                      
--------------------------------------------------------------------------------------
- Gather Motion 3:1  (slice2; segments: 3)
+                               QUERY PLAN                                
+-------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
    ->  GroupAggregate
          Group Key: ((t1.a || t1.b))
          ->  Sort
                Sort Key: ((t1.a || t1.b))
-               ->  Redistribute Motion 3:3  (slice1; segments: 3)
-                     Hash Key: ((t1.a || t1.b))
-                     ->  GroupAggregate
-                           Group Key: ((t1.a || t1.b))
-                           ->  Sort
-                                 Sort Key: ((t1.a || t1.b))
-                                 ->  Append
-                                       ->  Result
-                                             Filter: (((t1.a || t1.b)) = 'ab'::text)
-                                             ->  Result
-                                                   ->  Table Scan on t1
-                                       ->  Index Scan using t2_pkey on t2
-                                             Index Cond: (ab = 'ab'::text)
- Optimizer: PQO version 2.74.0
-(19 rows)
+               ->  Append
+                     ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                           Hash Key: ((t1.a || t1.b))
+                           ->  Result
+                                 Filter: (((t1.a || t1.b)) = 'ab'::text)
+                                 ->  Seq Scan on t1
+                     ->  Index Scan using t2_pkey on t2
+                           Index Cond: (ab = 'ab'::text)
+ Optimizer: Pivotal Optimizer (GPORCA) version 3.83.0
+(14 rows)
 
 --
 -- Test that ORDER BY for UNION ALL can be pushed down to inheritance
@@ -532,8 +526,8 @@ INSERT INTO t2c VALUES ('vw'), ('cd'), ('mn'), ('ef');
 CREATE INDEX t1c_ab_idx on t1c ((a || b));
 set enable_seqscan = on;
 set enable_indexonlyscan = off;
---- GPDB_94_MERGE_FIXME: GPDB would choose seqscan rather than indexscan for t1.
---- This is a side-effect of disabling pull-up for simple union all in GPDB.
+-- NOTE: GPDB planner chooses a seqscan rather than indexscan for t1.
+-- This is a side-effect of disabling pull-up for simple union all in GPDB.
 explain (costs off)
   SELECT * FROM
   (SELECT a || b AS ab FROM t1
@@ -553,7 +547,7 @@ explain (costs off)
                            ->  Seq Scan on t1c
                            ->  Seq Scan on t2
                            ->  Seq Scan on t2c
- Optimizer: legacy query optimizer
+ Optimizer: Postgres query optimizer
 (12 rows)
 
   SELECT * FROM
@@ -576,6 +570,31 @@ explain (costs off)
 reset enable_seqscan;
 reset enable_indexscan;
 reset enable_bitmapscan;
+-- This simpler variant of the above test has been observed to fail differently
+create table events (event_id int primary key);
+create table other_events (event_id int primary key);
+create table events_child () inherits (events);
+NOTICE:  table has parent, setting distribution columns to match parent table
+explain (costs off)
+select event_id
+ from (select event_id from events
+       union all
+       select event_id from other_events) ss
+ order by event_id;
+                 QUERY PLAN                 
+--------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   Merge Key: events.event_id
+   ->  Sort
+         Sort Key: events.event_id
+         ->  Append
+               ->  Seq Scan on events
+               ->  Seq Scan on events_child
+               ->  Seq Scan on other_events
+ Optimizer: Postgres query optimizer
+(9 rows)
+
+drop table events_child, events, other_events;
 reset enable_indexonlyscan;
 -- Test constraint exclusion of UNION ALL subqueries
 explain (costs off)
@@ -584,19 +603,17 @@ explain (costs off)
    UNION ALL
    SELECT 2 AS t, * FROM tenk1 b) c
  WHERE t = 2;
-                   QUERY PLAN                   
-------------------------------------------------
+                      QUERY PLAN                      
+------------------------------------------------------
  Append
    ->  Result
-         ->  Result
-               One-Time Filter: false
+         One-Time Filter: false
    ->  Gather Motion 3:1  (slice1; segments: 3)
          ->  Result
-               Filter: (t = 2)
-               ->  Result
-                     ->  Table Scan on tenk1
- Optimizer: PQO version 2.74.0
-(10 rows)
+               Filter: ((2) = 2)
+               ->  Seq Scan on tenk1
+ Optimizer: Pivotal Optimizer (GPORCA) version 3.83.0
+(8 rows)
 
 -- Test that we push quals into UNION sub-selects only when it's safe
 explain (costs off)
@@ -605,18 +622,16 @@ SELECT * FROM
    UNION
    SELECT 2 AS t, 4 AS x) ss
 WHERE x < 4;
-              QUERY PLAN              
---------------------------------------
+                      QUERY PLAN                      
+------------------------------------------------------
  Append
    ->  Result
-         Filter: (x < 4)
+         Filter: ((2) < 4)
          ->  Result
-               ->  Result
    ->  Result
-         ->  Result
-               One-Time Filter: false
- Optimizer: PQO version 2.74.0
-(9 rows)
+         One-Time Filter: false
+ Optimizer: Pivotal Optimizer (GPORCA) version 3.83.0
+(7 rows)
 
 SELECT * FROM
   (SELECT 1 AS t, 2 AS x
@@ -637,22 +652,21 @@ WHERE x < 4
 ORDER BY x;
                             QUERY PLAN                            
 ------------------------------------------------------------------
- GroupAggregate
-   Group Key: t, (generate_series(1, 10))
+ Sort
+   Sort Key: (generate_series(1, 10))
    ->  GroupAggregate
-         Group Key: t, (generate_series(1, 10))
+         Group Key: (1), (generate_series(1, 10))
          ->  Sort
-               Sort Key: (generate_series(1, 10)), t
+               Sort Key: (1), (generate_series(1, 10))
                ->  Append
                      ->  Result
                            Filter: ((generate_series(1, 10)) < 4)
                            ->  Result
                                  ->  Result
                      ->  Result
-                           ->  Result
-                                 One-Time Filter: false
- Optimizer: PQO version 2.74.0
-(15 rows)
+                           One-Time Filter: false
+ Optimizer: Pivotal Optimizer (GPORCA) version 3.83.0
+(14 rows)
 
 SELECT * FROM
   (SELECT 1 AS t, generate_series(1,10) AS x
@@ -677,16 +691,14 @@ WHERE x > 3;
 ---------------------------------------------------------------------------------------
  Subquery Scan on ss
    Filter: (ss.x > 3)
-   ->  Unique
-         Group Key: "outer".t, ((($0 * 3::double precision))::integer)
-         ->  Sort
-               Sort Key (Distinct): "outer".t, ((($0 * 3::double precision))::integer)
-               ->  Append
-                     ->  Result
-                           InitPlan 1 (returns $0)
-                             ->  Result
-                     ->  Result
- Optimizer: legacy query optimizer
+   ->  HashAggregate
+         Group Key: (1), ((($0 * '3'::double precision))::integer)
+         ->  Append
+               ->  Result
+                     InitPlan 1 (returns $0)
+                       ->  Result
+               ->  Result
+ Optimizer: Postgres query optimizer
 (12 rows)
 
 SELECT * FROM
@@ -713,16 +725,16 @@ select * from
   join int4_tbl on f1 = expensivefunc(x);
                           QUERY PLAN                           
 ---------------------------------------------------------------
- Gather Motion 3:1  (slice2; segments: 3)
+ Gather Motion 3:1  (slice1; segments: 3)
    ->  Hash Join
          Hash Cond: (expensivefunc(t3.x) = int4_tbl.f1)
          ->  Append
-               ->  Table Scan on t3
-               ->  Table Scan on t3 t3_1
+               ->  Seq Scan on t3
+               ->  Seq Scan on t3 t3_1
          ->  Hash
-               ->  Broadcast Motion 3:3  (slice1; segments: 3)
-                     ->  Table Scan on int4_tbl
- Optimizer: PQO version 3.1.0
+               ->  Broadcast Motion 3:3  (slice2; segments: 3)
+                     ->  Seq Scan on int4_tbl
+ Optimizer: Pivotal Optimizer (GPORCA) version 3.1.0
 (10 rows)
 
 select * from

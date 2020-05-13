@@ -9,7 +9,6 @@
 # we'd prefer not to have checkpoints later in the tests because that
 # interferes with crash-recovery testing.
 test: tablespace
-
 # ----------
 # The first group of parallel tests
 # ----------
@@ -36,6 +35,7 @@ test: geometry horology regex oidjoins type_sanity opr_sanity
 # These four each depend on the previous one
 # ----------
 test: insert
+test: insert_conflict
 test: create_function_1
 test: create_type
 test: create_table
@@ -47,7 +47,7 @@ test: create_function_2
 # execute two copy tests parallel, to check that copy itself
 # is concurrent safe.
 # ----------
-test: copy copyselect
+test: copy copyselect copydml
 
 # ----------
 # More groups of parallel tests
@@ -55,15 +55,13 @@ test: copy copyselect
 test: create_misc create_operator
 # These depend on the above two
 test: create_index create_view
-
-test: inherit
-
-test: triggers
+# Depends on things setup for create_index
+test: gp_gin_index
 
 # ----------
 # Another group of parallel tests
 # ----------
-test: create_aggregate create_function_3 create_cast constraints create_table_like typed_table vacuum drop_if_exists  updatable_views
+test: create_aggregate create_function_3 create_cast constraints triggers inherit create_table_like typed_table vacuum drop_if_exists updatable_views rolenames roleattributes create_am
 
 # ----------
 # Because vacuum will detect concurrently running transactions, it is necessary to
@@ -90,7 +88,7 @@ ignore: random
 # ----------
 # Another group of parallel tests
 # ----------
-test: select_into select_distinct select_distinct_on select_implicit select_having subselect union case join aggregates random portals arrays btree_index hash_index update delete lock
+test: select_into select_distinct select_distinct_on select_implicit select_having subselect union case join aggregates random portals arrays btree_index hash_index update delete
 
 # In PostgreSQL, namespace test is run as part of the fourth group, but there
 # are some GPDB additions in it that will show diff if concurrent tests use
@@ -108,18 +106,15 @@ test: namespace
 # ----------
 # Another group of parallel tests
 # ----------
-test: privileges security_label collate lock replica_identity
+test: brin gin gist spgist privileges init_privs security_label collate lock replica_identity rowsecurity object_address tablesample groupingsets drop_operator join_hash
 
-# GPDB_93_MERGE_FIXME: Materialized views have not been "MPP-ified", and don't
-# currently work. Disable test, until it's fixed. (If they still don't work when
-# we make a release, we should add a check in code, to throw a proper "not
-# supported" error message.)
-#test: matview
+# MATERIALIZED_VIEW_FIXME : matview is not supported on greenplum. Enable the test when the feature is ready.
+test: matview
 
 # ----------
 # Another group of parallel tests
 # ----------
-test: alter_generic misc psql async
+test: alter_generic alter_operator misc psql async dbsize misc_functions
 
 # rules cannot run concurrently with any test that creates a view
 #
@@ -131,13 +126,12 @@ test: alter_generic misc psql async
 # merge, it was done a long time ago, it's time to revisit this so we can re-
 # enable it
 #test: rules
-# event triggers cannot run concurrently with any test that runs DDL
-test: event_trigger
+test: psql_crosstab select_parallel amutils
 
 # ----------
 # Another group of parallel tests
 # ----------
-test: select_views portals_p2 cluster dependency guc bitmapops tsearch tsdicts foreign_data window xmlmap functional_deps advisory_lock json jsonb indirect_toast
+test: select_views portals_p2 cluster dependency guc bitmapops tsearch tsdicts foreign_data window xmlmap functional_deps advisory_lock json jsonb json_encoding indirect_toast equivclass
 
 # Output of the 'combocid' test contains ctid and cmin values, which will
 # differ depending on how many segments are used. Hence disabled in GPDB.
@@ -152,13 +146,13 @@ test: select_views portals_p2 cluster dependency guc bitmapops tsearch tsdicts f
 # NB: temp.sql does a reconnect which transiently uses 2 connections,
 # so keep this parallel group to at most 19 tests
 # ----------
-test: plancache limit plpgsql copy2 temp domain rangefuncs prepare without_oid conversion truncate alter_table alter_extension sequence polymorphism rowtypes with xml
+test: plancache limit plpgsql copy2 temp domain rangefuncs prepare without_oid conversion truncate truncate_gp alter_table alter_extension sequence polymorphism rowtypes returning with xml gp_foreign_data
 
 # large objects are not supported by GPDB
 # test: largeobject
 
-# INSERT RETURNING is not supported by GPDB
-test: returning
+# event triggers cannot run concurrently with any test that runs DDL
+test: event_trigger
 
 # run stats by itself because its delay may be insufficient under heavy load
 #
@@ -166,6 +160,3 @@ test: returning
 # GUCs stats_block_level and stats_row_level, which have been removed from
 # GPDB.
 #test: stats
-
-test: reshuffle reshuffle_ao reshuffle_aoco
-

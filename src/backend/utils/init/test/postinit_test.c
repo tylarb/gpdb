@@ -6,11 +6,13 @@
 /* Fetch definition of PG_exception_stack */
 #include "postgres.h"
 
+#undef PG_RE_THROW
 #define PG_RE_THROW() siglongjmp(*PG_exception_stack, 1)
 
 #define errfinish errfinish_impl
 
-int errfinish_impl(int dummy __attribute__((unused)),...)
+static int
+errfinish_impl(int dummy pg_attribute_unused(),...)
 {
 	PG_RE_THROW();
 }
@@ -49,9 +51,6 @@ test_check_superuser_connection_limit_error(void **state)
 	will_return(HaveNFreeProcs, false);
 
 	expect_ereport(FATAL);
-
-	expect_value(errSendAlert, sendAlert, true);
-	will_be_called(errSendAlert);
 
 	/*
 	 * Expect ERROR

@@ -32,7 +32,6 @@
 #include "storage/lmgr.h"
 #include "utils/rel.h"
 #include "utils/tqual.h"
-#include "storage/gp_compress.h"
 
 #include "access/appendonlytid.h"
 
@@ -338,9 +337,9 @@ extern AppendOnlyScanDesc appendonly_beginrangescan(Relation relation,
 		int nkeys, ScanKey keys);
 extern void appendonly_rescan(AppendOnlyScanDesc scan, ScanKey key);
 extern void appendonly_endscan(AppendOnlyScanDesc scan);
-extern MemTuple appendonly_getnext(AppendOnlyScanDesc scan, 
-									ScanDirection direction,
-									TupleTableSlot *slot);
+extern bool appendonly_getnext(AppendOnlyScanDesc scan,
+							   ScanDirection direction,
+							   TupleTableSlot *slot);
 extern AppendOnlyFetchDesc appendonly_fetch_init(
 	Relation 	relation,
 	Snapshot    snapshot,

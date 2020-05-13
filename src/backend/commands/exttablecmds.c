@@ -22,6 +22,7 @@
 #include "catalog/oid_dispatch.h"
 #include "catalog/pg_exttable.h"
 #include "catalog/pg_extprotocol.h"
+#include "catalog/pg_foreign_server.h"
 #include "catalog/pg_authid.h"
 #include "commands/copy.h"
 #include "commands/defrem.h"
@@ -60,14 +61,17 @@ static Datum optionsListToArray(List *options);
 * to leave it intact and do another dispatch.
 * ----------------------------------------------------------------
 */
-extern void
+void
 DefineExternalRelation(CreateExternalStmt *createExtStmt)
 {
-	CreateStmt *createStmt = makeNode(CreateStmt);
+	CreateForeignTableStmt *createForeignTableStmt;
+	CreateStmt *createStmt;
 	ExtTableTypeDesc *exttypeDesc = (ExtTableTypeDesc *) createExtStmt->exttypedesc;
 	SingleRowErrorDesc *singlerowerrorDesc = NULL;
 	DefElem    *dencoding = NULL;
 	ListCell   *option;
+	ObjectAddress objAddr;
+	Oid			userid;
 	Oid			reloid = 0;
 	Datum		formatOptStr;
 	Datum		optionsStr;
@@ -80,16 +84,22 @@ DefineExternalRelation(CreateExternalStmt *createExtStmt)
 	int			rejectlimit = -1;
 	int			encoding = -1;
 	bool		issreh = false; /* is single row error handling requested? */
-	bool 		logerrors = false;
+	char 		logerrors = LOG_ERRORS_DISABLE;
+	bool		log_persistent_option = false;
 	bool		iswritable = createExtStmt->iswritable;
 	bool		isweb = createExtStmt->isweb;
 	bool		shouldDispatch = (Gp_role == GP_ROLE_DISPATCH &&
 								  IsNormalProcessingMode());
 
+	/* Identify user ID that will own the table */
+	userid = GetUserId();
+
 	/*
 	 * now set the parameters for keys/inheritance etc. Most of these are
 	 * uninteresting for external relations...
 	 */
+	createForeignTableStmt = makeNode(CreateForeignTableStmt);
+	createStmt = &createForeignTableStmt->base;
 	createStmt->relation = createExtStmt->relation;
 	createStmt->tableElts = createExtStmt->tableElts;
 	createStmt->inhRelations = NIL;
@@ -98,6 +108,7 @@ DefineExternalRelation(CreateExternalStmt *createExtStmt)
 	createStmt->oncommit = ONCOMMIT_NOOP;
 	createStmt->tablespacename = NULL;
 	createStmt->distributedBy = createExtStmt->distributedBy; /* policy was set in transform */
+	createStmt->ownerid = userid;
 
 	switch (exttypeDesc->exttabletype)
 	{
@@ -116,13 +127,12 @@ DefineExternalRelation(CreateExternalStmt *createExtStmt)
 			if (strlen(commandString) == 0)
 				ereport(ERROR,
 						(errcode(ERRCODE_SYNTAX_ERROR),
-						 errmsg("Invalid EXECUTE clause. Found an empty command string")));
+						 errmsg("invalid EXECUTE clause, command string is empty")));
 			break;
 
 		default:
-			ereport(ERROR,
-					(errcode(ERRCODE_INTERNAL_ERROR),
-					 errmsg("Internal error: unknown external table type")));
+			elog(ERROR, "internal error: unknown external table type: %i",
+				 exttypeDesc->exttabletype);
 	}
 
 	/*----------
@@ -165,7 +175,6 @@ DefineExternalRelation(CreateExternalStmt *createExtStmt)
 				 */
 
 				bool		isnull;
-				Oid			userid = GetUserId();
 				HeapTuple	tuple;
 
 				tuple = SearchSysCache1(AUTHOID, ObjectIdGetDatum(userid));
@@ -173,7 +182,7 @@ DefineExternalRelation(CreateExternalStmt *createExtStmt)
 					ereport(ERROR,
 							(errcode(ERRCODE_UNDEFINED_OBJECT),
 							 errmsg("role \"%s\" does not exist (in DefineExternalRelation)",
-									GetUserNameFromId(userid))));
+									GetUserNameFromId(userid, false))));
 
 				if ((uri->protocol == URI_GPFDIST || uri->protocol == URI_GPFDISTS) && iswritable)
 				{
@@ -204,37 +213,6 @@ DefineExternalRelation(CreateExternalStmt *createExtStmt)
 						ereport(ERROR,
 								(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 								 errmsg("permission denied: no privilege to create a readable gpfdist(s) external table")));
-				}
-				else if (uri->protocol == URI_GPHDFS && iswritable)
-				{
-					Datum		d_wexthdfs;
-					bool		createwexthdfs;
-
-					d_wexthdfs = SysCacheGetAttr(AUTHOID, tuple,
-												 Anum_pg_authid_rolcreatewexthdfs,
-												 &isnull);
-					createwexthdfs = (isnull ? false : DatumGetBool(d_wexthdfs));
-
-					if (!createwexthdfs)
-						ereport(ERROR,
-								(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-								 errmsg("permission denied: no privilege to create a writable gphdfs external table")));
-				}
-				else if (uri->protocol == URI_GPHDFS && !iswritable)
-				{
-					Datum		d_rexthdfs;
-					bool		createrexthdfs;
-
-					d_rexthdfs = SysCacheGetAttr(AUTHOID, tuple,
-												 Anum_pg_authid_rolcreaterexthdfs,
-												 &isnull);
-					createrexthdfs = (isnull ? false : DatumGetBool(d_rexthdfs));
-
-					if (!createrexthdfs)
-						ereport(ERROR,
-								(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-								 errmsg("permission denied: no privilege to create a readable gphdfs external table")));
-
 				}
 				else if (uri->protocol == URI_HTTP && !iswritable)
 				{
@@ -273,7 +251,7 @@ DefineExternalRelation(CreateExternalStmt *createExtStmt)
 					ereport(ERROR,
 							(errcode(ERRCODE_INTERNAL_ERROR),
 							 errmsg("internal error in DefineExternalRelation"),
-							 errdetail("Protocol is %d, writable is %d",
+							 errdetail("Protocol is %d, writable is %d.",
 									   uri->protocol, iswritable)));
 
 				ReleaseSysCache(tuple);
@@ -296,6 +274,8 @@ DefineExternalRelation(CreateExternalStmt *createExtStmt)
 	/*
 	 * Parse and validate OPTION clause.
 	 */
+	ValidateExtTableOptions(createExtStmt->extOptions);
+	log_persistent_option = ExtractErrorLogPersistent(&createExtStmt->extOptions);
 	optionsStr = optionsListToArray(createExtStmt->extOptions);
 	if (DatumGetPointer(optionsStr) == NULL)
 	{
@@ -312,7 +292,12 @@ DefineExternalRelation(CreateExternalStmt *createExtStmt)
 
 		issreh = true;
 
-		logerrors = singlerowerrorDesc->into_file;
+		logerrors = singlerowerrorDesc->log_error_type;
+		if (IS_LOG_ERRORS_ENABLE(logerrors) && log_persistent_option)
+		{
+			logerrors = LOG_ERRORS_PERSISTENTLY;
+			singlerowerrorDesc->log_error_type = LOG_ERRORS_PERSISTENTLY;
+		}
 
 		/* get reject limit, and reject limit type */
 		rejectlimit = singlerowerrorDesc->rejectlimit;
@@ -399,15 +384,19 @@ DefineExternalRelation(CreateExternalStmt *createExtStmt)
 
 	/*
 	 * First, create the pg_class and other regular relation catalog entries.
-	 * Under the covers this will dispatch a CREATE TABLE statement to all the
-	 * QEs.
 	 */
-	if (Gp_role == GP_ROLE_DISPATCH || Gp_role == GP_ROLE_UTILITY)
-		reloid = DefineRelation(createStmt, RELKIND_RELATION, InvalidOid,
-								RELSTORAGE_EXTERNAL, true, true, NULL);
+	objAddr = DefineRelation(createStmt,
+							 RELKIND_FOREIGN_TABLE,
+							 InvalidOid,
+							 NULL,
+							 RELSTORAGE_FOREIGN,
+							 false, /* dispatch */
+							 true,
+							 NULL);
+	reloid = objAddr.objectId;
 
 	/*
-	 * Now we take care of pg_exttable.
+	 * Now add pg_foreign_table and pg_exttable entries.
 	 *
 	 * get our pg_class external rel OID. If we're the QD we just created it
 	 * above. If we're a QE DefineRelation() was already dispatched to us and
@@ -418,9 +407,11 @@ DefineExternalRelation(CreateExternalStmt *createExtStmt)
 	else
 		reloid = RangeVarGetRelid(createExtStmt->relation, NoLock, true);
 
-	/*
-	 * create a pg_exttable entry for this external table.
-	 */
+	createForeignTableStmt->servername = PG_EXTTABLE_SERVER_NAME;
+	createForeignTableStmt->options = NIL;
+	CreateForeignTable(createForeignTableStmt, reloid,
+					   true /* skip permission checks, we checked them ourselves */);
+
 	InsertExtTableEntry(reloid,
 						iswritable,
 						issreh,
@@ -538,16 +529,6 @@ transformLocationUris(List *locs, bool isweb, bool iswritable)
 		}
 
 		/*
-		 * check for various errors
-		 */
-		if (!first_uri && uri->protocol == URI_GPHDFS)
-			ereport(ERROR,
-					(errcode(ERRCODE_SYNTAX_ERROR),
-					 errmsg("GPHDFS can only have one location list"),
-				 errhint("Combine multiple HDFS files into a single file")));
-
-
-		/*
 		 * If a custom protocol is used, validate its existence. If it exists,
 		 * and a custom protocol url validator exists as well, invoke it now.
 		 */
@@ -576,8 +557,8 @@ transformLocationUris(List *locs, bool isweb, bool iswritable)
 		{
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-			   errmsg("URI protocols must be the same for all data sources"),
-					 errhint("Available protocols are 'http', 'file', 'gphdfs', 'gpfdist' and 'gpfdists'")));
+					 errmsg("URI protocols must be the same for all data sources"),
+					 errhint("Available protocols are 'http', 'file', 'gpfdist' and 'gpfdists'.")));
 
 		}
 
@@ -590,7 +571,7 @@ transformLocationUris(List *locs, bool isweb, bool iswritable)
 		if (uri->protocol == URI_HTTP && !isweb)
 			ereport(ERROR,
 					(errcode(ERRCODE_SYNTAX_ERROR),
-			 errmsg("http URI\'s can only be used in an external web table"),
+					 errmsg("http URI\'s can only be used in an external web table"),
 					 errhint("Use CREATE EXTERNAL WEB TABLE instead.")));
 
 		if (iswritable && (uri->protocol == URI_HTTP || uri->protocol == URI_FILE))
@@ -598,20 +579,20 @@ transformLocationUris(List *locs, bool isweb, bool iswritable)
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					 errmsg("unsupported URI protocol \'%s\' for writable external table",
 							(uri->protocol == URI_HTTP ? "http" : "file")),
-					 errhint("Writable external tables may use \'gpfdist\', \'gpfdists\' or \'gphdfs\' URIs only.")));
+					 errhint("Writable external tables may use \'gpfdist\' or \'gpfdists\' URIs only.")));
 
 		if (uri->protocol != URI_CUSTOM && iswritable && strchr(uri->path, '*'))
 			ereport(ERROR,
 					(errcode(ERRCODE_SYNTAX_ERROR),
-					 errmsg("Unsupported use of wildcard in a writable external web table definition: "
-							"\'%s\'", uri_str_final),
+					 errmsg("unsupported use of wildcard in a writable external web table definition: \'%s\'",
+							uri_str_final),
 					 errhint("Specify the explicit path and file name to write into.")));
 
 		if ((uri->protocol == URI_GPFDIST || uri->protocol == URI_GPFDISTS) && iswritable && uri->path[strlen(uri->path) - 1] == '/')
 			ereport(ERROR,
 					(errcode(ERRCODE_SYNTAX_ERROR),
-					 errmsg("Unsupported use of a directory name in a writable gpfdist(s) external table : "
-							"\'%s\'", uri_str_final),
+					 errmsg("unsupported use of a directory name in a writable gpfdist(s) external table : \'%s\'",
+							uri_str_final),
 					 errhint("Specify the explicit path and file name to write into.")));
 
 		astate = accumArrayResult(astate,
@@ -658,7 +639,7 @@ transformExecOnClause(List *on_clause)
 			if (exec_location_str)
 				ereport(ERROR,
 						(errcode(ERRCODE_SYNTAX_ERROR),
-						 errmsg("ON clause must not have more than one element.")));
+						 errmsg("ON clause must not have more than one element")));
 
 			if (strcmp(defel->defname, "all") == 0)
 			{
@@ -694,7 +675,7 @@ transformExecOnClause(List *on_clause)
 			{
 				ereport(ERROR,
 						(errcode(ERRCODE_INTERNAL_ERROR),
-						 errmsg("Unknown location code for EXECUTE in tablecmds.")));
+						 errmsg("unknown location code for EXECUTE in tablecmds")));
 			}
 		}
 	}
@@ -724,16 +705,11 @@ transformFormatType(char *formatname)
 		result = 'c';
 	else if (pg_strcasecmp(formatname, "custom") == 0)
 		result = 'b';
-	else if (pg_strcasecmp(formatname, "avro") == 0)
-		result = 'a';
-	else if (pg_strcasecmp(formatname, "parquet") == 0)
-		result = 'p';
 	else
 		ereport(ERROR,
 				(errcode(ERRCODE_SYNTAX_ERROR),
 				 errmsg("unsupported format '%s'", formatname),
-			   errhint("Available formats for external tables are \"text\", "
-					   "\"csv\", \"avro\", \"parquet\" and \"custom\"")));
+				 errhint("Available formats for external tables are \"text\", \"csv\" and \"custom\".")));
 
 	return result;
 }
@@ -743,7 +719,7 @@ transformFormatType(char *formatname)
  *
  * The result is an array that includes the format string.
  *
- * This method is a backported FDW's function from upper stream .
+ * This method is a backported FDW's function from upstream .
  */
 static Datum
 optionsListToArray(List *options)
@@ -789,9 +765,7 @@ transformFormatOpts(char formattype, List *formatOpts, int numcols, bool iswrita
 
 	Assert(fmttype_is_custom(formattype) ||
 		   fmttype_is_text(formattype) ||
-		   fmttype_is_csv(formattype) ||
-		   fmttype_is_avro(formattype) ||
-		   fmttype_is_parquet(formattype));
+		   fmttype_is_csv(formattype));
 
 	/* Extract options from the statement node tree */
 	if (fmttype_is_text(formattype) || fmttype_is_csv(formattype))
@@ -905,21 +879,6 @@ transformFormatOpts(char formattype, List *formatOpts, int numcols, bool iswrita
 			appendStringInfo(&cfbuf, " newline '%s'", cstate->eol_str);
 
 		format_str = cfbuf.data;
-	}
-	else if (fmttype_is_avro(formattype) || fmttype_is_parquet(formattype))
-	{
-		/*
-		 * avro format, add "formatter 'gphdfs_import’ " directly, user
-		 * don't need to set this value
-		 */
-		char	   *val;
-
-		if (iswritable)
-			val = "gphdfs_export";
-		else
-			val = "gphdfs_import";
-
-		format_str = psprintf("formatter '%s' ", val);
 	}
 	else
 	{

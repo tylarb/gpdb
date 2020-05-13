@@ -8,6 +8,10 @@
 --
 CREATE INDEX onek_unique1 ON onek USING btree(unique1 int4_ops);
 
+CREATE INDEX IF NOT EXISTS onek_unique1 ON onek USING btree(unique1 int4_ops);
+
+CREATE INDEX IF NOT EXISTS ON onek USING btree(unique1 int4_ops);
+
 CREATE INDEX onek_unique2 ON onek USING btree(unique2 int4_ops);
 
 CREATE INDEX onek_hundred ON onek USING btree(hundred int4_ops);
@@ -120,6 +124,7 @@ INSERT INTO radix_text_tbl VALUES ('P0123456789abcdefF');
 
 CREATE INDEX sp_radix_ind ON radix_text_tbl USING spgist (t);
 
+SET optimizer_enable_tablescan = OFF;
 --
 -- Test GiST and SP-GiST indexes
 --
@@ -220,9 +225,12 @@ SELECT count(*) FROM radix_text_tbl WHERE t >    'Worth                         
 
 SELECT count(*) FROM radix_text_tbl WHERE t ~>~  'Worth                         St  ';
 
+SELECT * FROM gpolygon_tbl ORDER BY f1 <-> '(0,0)'::point LIMIT 10;
+
+SELECT circle_center(f1), round(radius(f1)) as radius FROM gcircle_tbl ORDER BY f1 <-> '(200,300)'::point LIMIT 10;
+
 -- Now check the results from plain indexscan
 SET enable_seqscan = OFF;
-SET optimizer_enable_tablescan = OFF;
 SET enable_indexscan = ON;
 SET enable_bitmapscan = OFF;
 
@@ -433,6 +441,14 @@ SELECT count(*) FROM radix_text_tbl WHERE t >    'Worth                         
 EXPLAIN (COSTS OFF)
 SELECT count(*) FROM radix_text_tbl WHERE t ~>~  'Worth                         St  ';
 SELECT count(*) FROM radix_text_tbl WHERE t ~>~  'Worth                         St  ';
+
+EXPLAIN (COSTS OFF)
+SELECT * FROM gpolygon_tbl ORDER BY f1 <-> '(0,0)'::point LIMIT 10;
+SELECT * FROM gpolygon_tbl ORDER BY f1 <-> '(0,0)'::point LIMIT 10;
+
+EXPLAIN (COSTS OFF)
+SELECT circle_center(f1), round(radius(f1)) as radius FROM gcircle_tbl ORDER BY f1 <-> '(200,300)'::point LIMIT 10;
+SELECT circle_center(f1), round(radius(f1)) as radius FROM gcircle_tbl ORDER BY f1 <-> '(200,300)'::point LIMIT 10;
 
 -- Now check the results from bitmap indexscan
 SET enable_seqscan = OFF;
@@ -564,7 +580,6 @@ SELECT count(*) FROM radix_text_tbl WHERE t ~>~  'Worth                         
 SELECT count(*) FROM radix_text_tbl WHERE t ~>~  'Worth                         St  ';
 
 RESET enable_seqscan;
-RESET optimizer_enable_tablescan;
 RESET enable_indexscan;
 RESET enable_bitmapscan;
 
@@ -575,7 +590,6 @@ RESET enable_bitmapscan;
 --
 
 SET enable_seqscan = OFF;
-SET optimizer_enable_tablescan = OFF;
 SET enable_indexscan = OFF;
 SET enable_bitmapscan = ON;
 
@@ -636,7 +650,6 @@ SELECT * FROM array_op_test WHERE i = '{NULL}' ORDER BY seqno;
 SELECT * FROM array_op_test WHERE i <@ '{NULL}' ORDER BY seqno;
 
 RESET enable_seqscan;
-RESET optimizer_enable_tablescan;
 RESET enable_indexscan;
 RESET enable_bitmapscan;
 
@@ -655,8 +668,17 @@ SELECT COUNT(*) FROM array_gin_test WHERE a @> '{2}';
 DROP TABLE array_gin_test;
 
 --
+-- Test GIN index's reloptions
+--
+CREATE INDEX gin_relopts_test ON array_index_op_test USING gin (i)
+  WITH (FASTUPDATE=on, GIN_PENDING_LIST_LIMIT=128);
+\d+ gin_relopts_test
+
+--
 -- HASH
 --
+-- GPDB: does not support hash indexes
+-- start_ignore
 CREATE INDEX hash_i4_index ON hash_i4_heap USING hash (random int4_ops);
 
 CREATE INDEX hash_name_index ON hash_name_heap USING hash (random name_ops);
@@ -665,7 +687,22 @@ CREATE INDEX hash_txt_index ON hash_txt_heap USING hash (random text_ops);
 
 CREATE INDEX hash_f8_index ON hash_f8_heap USING hash (random float8_ops);
 
+CREATE UNLOGGED TABLE unlogged_hash_table (id int4);
+CREATE INDEX unlogged_hash_index ON unlogged_hash_table USING hash (id int4_ops);
+DROP TABLE unlogged_hash_table;
+
 -- CREATE INDEX hash_ovfl_index ON hash_ovfl_heap USING hash (x int4_ops);
+
+-- Test hash index build tuplesorting.  Force hash tuplesort using low
+-- maintenance_work_mem setting and fillfactor:
+SET maintenance_work_mem = '1MB';
+CREATE INDEX hash_tuplesort_idx ON tenk1 USING hash (stringu1 name_ops) WITH (fillfactor = 10);
+EXPLAIN (COSTS OFF)
+SELECT count(*) FROM tenk1 WHERE stringu1 = 'TVAAAA';
+SELECT count(*) FROM tenk1 WHERE stringu1 = 'TVAAAA';
+DROP INDEX hash_tuplesort_idx;
+-- end_ignore
+RESET maintenance_work_mem;
 
 
 --
@@ -717,12 +754,14 @@ create index hash_f8_index_3 on hash_f8_heap(random) where seqno > 1000;
 CREATE TABLE concur_heap (f1 text, f2 text, dk text) distributed by (dk);
 -- empty table
 CREATE INDEX CONCURRENTLY concur_index1 ON concur_heap(f2,f1);
+CREATE INDEX CONCURRENTLY IF NOT EXISTS concur_index1 ON concur_heap(f2,f1);
 INSERT INTO concur_heap VALUES  ('a','b', '1');
 INSERT INTO concur_heap VALUES  ('b','b', '1');
 INSERT INTO concur_heap VALUES  ('c','c', '2');
 INSERT INTO concur_heap VALUES  ('d','d', '3');
 -- unique index
 CREATE UNIQUE INDEX CONCURRENTLY concur_index2 ON concur_heap(dk, f1);
+CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS concur_index2 ON concur_heap(dk, f1);
 -- check if constraint is set up properly to be enforced
 INSERT INTO concur_heap VALUES ('b','x', '1');
 -- check if constraint is enforced properly at build time
@@ -754,6 +793,7 @@ REINDEX TABLE concur_heap;
 
 --
 -- Try some concurrent index drops
+-- Greenplum: The functionality of these tests is replicated in gp_index
 --
 DROP INDEX CONCURRENTLY "concur_index2";				-- works
 DROP INDEX CONCURRENTLY IF EXISTS "concur_index2";		-- notice
@@ -805,6 +845,25 @@ DROP INDEX cwi_replaced_pkey;	-- Should fail; a constraint depends on it
 DROP TABLE cwi_test;
 
 --
+-- Check handling of indexes on system columns
+--
+CREATE TABLE oid_table (a INT) WITH OIDS;
+
+-- An index on the OID column should be allowed
+CREATE INDEX ON oid_table (oid);
+
+-- Other system columns cannot be indexed
+CREATE INDEX ON oid_table (ctid);
+
+-- nor used in expressions
+CREATE INDEX ON oid_table ((ctid >= '(1000,0)'));
+
+-- nor used in predicates
+CREATE INDEX ON oid_table (a) WHERE ctid >= '(1000,0)';
+
+DROP TABLE oid_table;
+
+--
 -- Tests for IS NULL/IS NOT NULL with b-tree indexes
 --
 
@@ -813,7 +872,6 @@ INSERT INTO onek_with_null (unique1,unique2) VALUES (NULL, -1), (NULL, NULL);
 CREATE UNIQUE INDEX onek_nulltest ON onek_with_null (unique2,unique1);
 
 SET enable_seqscan = OFF;
-SET optimizer_enable_tablescan = OFF;
 SET enable_indexscan = ON;
 SET enable_bitmapscan = ON;
 
@@ -882,7 +940,6 @@ SELECT unique1, unique2 FROM onek_with_null WHERE unique2 < 999
   ORDER BY unique2 DESC LIMIT 2;
 
 RESET enable_seqscan;
-RESET optimizer_enable_tablescan;
 RESET enable_indexscan;
 RESET enable_bitmapscan;
 
@@ -893,7 +950,6 @@ DROP TABLE onek_with_null;
 --
 
 SET enable_seqscan = OFF;
-SET optimizer_enable_tablescan = OFF;
 SET enable_indexscan = ON;
 SET enable_bitmapscan = ON;
 
@@ -949,9 +1005,22 @@ WHERE thousand < 2 AND tenthous IN (1001,3000)
 ORDER BY thousand;
 
 RESET enable_seqscan;
-RESET optimizer_enable_tablescan;
 RESET enable_indexscan;
 RESET enable_bitmapscan;
+
+SET enable_indexonlyscan = OFF;
+
+explain (costs off)
+SELECT thousand, tenthous FROM tenk1
+WHERE thousand < 2 AND tenthous IN (1001,3000)
+ORDER BY thousand;
+
+SELECT thousand, tenthous FROM tenk1
+WHERE thousand < 2 AND tenthous IN (1001,3000)
+ORDER BY thousand;
+
+RESET enable_indexonlyscan;
+RESET enable_indexscan;
 
 --
 -- Check elimination of constant-NULL subexpressions
@@ -959,3 +1028,67 @@ RESET enable_bitmapscan;
 
 explain (costs off)
   select * from tenk1 where (thousand, tenthous) in ((1,1001), (null,null));
+
+--
+-- REINDEX (VERBOSE)
+--
+CREATE TABLE reindex_verbose(id integer primary key);
+\set VERBOSITY terse
+REINDEX (VERBOSE) TABLE reindex_verbose;
+DROP TABLE reindex_verbose;
+
+--
+-- REINDEX SCHEMA
+--
+REINDEX SCHEMA schema_to_reindex; -- failure, schema does not exist
+CREATE SCHEMA schema_to_reindex;
+SET search_path = 'schema_to_reindex';
+CREATE TABLE table1(col1 SERIAL PRIMARY KEY);
+INSERT INTO table1 SELECT generate_series(1,400);
+CREATE TABLE table2(col1 SERIAL PRIMARY KEY, col2 TEXT NOT NULL);
+INSERT INTO table2 SELECT generate_series(1,400), 'abc';
+CREATE INDEX ON table2(col2);
+CREATE MATERIALIZED VIEW matview AS SELECT col1 FROM table2;
+CREATE INDEX ON matview(col1);
+CREATE VIEW view AS SELECT col2 FROM table2;
+CREATE TABLE reindex_before AS
+SELECT oid, relname, relfilenode, relkind, reltoastrelid
+	FROM pg_class
+	where relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = 'schema_to_reindex');
+INSERT INTO reindex_before
+SELECT oid, 'pg_toast_TABLE', relfilenode, relkind, reltoastrelid
+FROM pg_class WHERE oid IN
+	(SELECT reltoastrelid FROM reindex_before WHERE reltoastrelid > 0);
+INSERT INTO reindex_before
+SELECT oid, 'pg_toast_TABLE_index', relfilenode, relkind, reltoastrelid
+FROM pg_class where oid in
+	(select indexrelid from pg_index where indrelid in
+		(select reltoastrelid from reindex_before where reltoastrelid > 0));
+REINDEX SCHEMA schema_to_reindex;
+CREATE TABLE reindex_after AS SELECT oid, relname, relfilenode, relkind
+	FROM pg_class
+	where relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = 'schema_to_reindex');
+SELECT  b.relname,
+        b.relkind,
+        CASE WHEN a.relfilenode = b.relfilenode THEN 'relfilenode is unchanged'
+        ELSE 'relfilenode has changed' END
+  FROM reindex_before b JOIN pg_class a ON b.oid = a.oid
+  ORDER BY 1;
+REINDEX SCHEMA schema_to_reindex;
+BEGIN;
+REINDEX SCHEMA schema_to_reindex; -- failure, cannot run in a transaction
+END;
+
+-- Failure for unauthorized user
+CREATE ROLE regress_reindexuser NOLOGIN;
+SET SESSION ROLE regress_reindexuser;
+REINDEX SCHEMA schema_to_reindex;
+
+-- Clean up
+RESET ROLE;
+DROP ROLE regress_reindexuser;
+SET client_min_messages TO 'warning';
+DROP SCHEMA schema_to_reindex CASCADE;
+RESET client_min_messages;
+
+RESET optimizer_enable_tablescan;

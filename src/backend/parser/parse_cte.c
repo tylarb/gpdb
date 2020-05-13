@@ -3,7 +3,7 @@
  * parse_cte.c
  *	  handle CTEs (common table expressions) in parser
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -16,6 +16,7 @@
 
 #include "catalog/pg_collation.h"
 #include "catalog/pg_type.h"
+#include "cdb/cdbvars.h"
 #include "nodes/nodeFuncs.h"
 #include "parser/analyze.h"
 #include "parser/parse_cte.h"
@@ -113,6 +114,16 @@ transformWithClause(ParseState *pstate, WithClause *withClause)
 	Assert(pstate->p_future_ctes == NIL);
 
 	/*
+	 * WITH RECURSIVE is disabled if gp_recursive_cte is not set
+	 * to allow recursive CTEs.
+	 */
+	if (withClause->recursive && !gp_recursive_cte)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("RECURSIVE clauses in WITH queries are currently disabled"),
+				 errhint("In order to use recursive CTEs, \"gp_recursive_cte\" must be turned on.")));
+
+	/*
 	 * For either type of WITH, there must not be duplicate CTE names in the
 	 * list.  Check this right away so we needn't worry later.
 	 *
@@ -145,6 +156,19 @@ transformWithClause(ParseState *pstate, WithClause *withClause)
 			Assert(IsA(cte->ctequery, InsertStmt) ||
 				   IsA(cte->ctequery, UpdateStmt) ||
 				   IsA(cte->ctequery, DeleteStmt));
+
+
+			/*
+			 * Since GPDB currently only support a single writer gang, only one
+			 * writable clause is permitted per CTE. Once we get flexible gangs
+			 * with more than one writer gang we can lift this restriction.
+			 */
+			if (pstate->p_hasModifyingCTE)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("only one modifying WITH clause allowed per query"),
+						 errdetail("Greenplum Database currently only support CTEs with one writable clause."),
+						 errhint("Rewrite the query to only include one writable CTE clause.")));
 
 			pstate->p_hasModifyingCTE = true;
 		}
@@ -339,41 +363,6 @@ analyzeCTE(ParseState *pstate, CommonTableExpr *cte)
 }
 
 /*
- * reportDuplicateNames
- *    Report error when a given list of names (in String) contain duplicate values for a given
- * query name.
- */
-static void
-reportDuplicateNames(const char *queryName, List *names)
-{
-	if (names == NULL)
-		return;
-
-	ListCell *lc;
-	foreach (lc, names)
-	{
-		Value *string = (Value *)lfirst(lc);
-		Assert(IsA(string, String));
-
-		ListCell *rest;
-		for_each_cell(rest, lnext(lc))
-		{
-			Value *string2 = (Value *)lfirst(rest);
-			Assert(IsA(string, String));
-			
-			if (strcmp(strVal(string), strVal(string2)) == 0)
-			{
-				ereport(ERROR,
-						(errcode(ERRCODE_SYNTAX_ERROR),
-						 errmsg("WITH query \"%s\" must not have duplicate column name: %s",
-								queryName, strVal(string)),
-						 errhint("Specify a column list without duplicate names")));
-			}
-		}
-	}
-}
-
-/*
  * Compute derived fields of a CTE, given the transformed output targetlist
  *
  * For a nonrecursive CTE, this is called after transforming the CTE's query.
@@ -456,8 +445,6 @@ analyzeCTETargetList(ParseState *pstate, CommonTableExpr *cte, List *tlist)
 				 errmsg("WITH query \"%s\" has %d columns available but %d columns specified",
 						cte->ctename, varattno, numaliases),
 				 parser_errposition(pstate, cte->location)));
-
-	reportDuplicateNames(cte->ctename, cte->ctecolnames);
 }
 
 
@@ -1089,7 +1076,7 @@ checkWindowFuncInRecursiveTerm(SelectStmt *stmt, CteState *cstate)
 				{
 					ereport(ERROR,
 							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-							 errmsg("Window Functions in a recursive query is not implemented"),
+							 errmsg("window functions in a recursive query is not implemented"),
 							 parser_errposition(cstate->pstate,
 												exprLocation((Node *) fc))));
 				}

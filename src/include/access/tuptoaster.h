@@ -4,7 +4,7 @@
  *	  POSTGRES definitions for external and compressed storage
  *	  of variable size attributes.
  *
- * Copyright (c) 2000-2014, PostgreSQL Global Development Group
+ * Copyright (c) 2000-2016, PostgreSQL Global Development Group
  *
  * src/include/access/tuptoaster.h
  *
@@ -15,8 +15,8 @@
 
 #include "access/htup_details.h"
 #include "access/memtup.h"
+#include "storage/lockdefs.h"
 #include "utils/relcache.h"
-#include "storage/lock.h"
 
 #ifndef VARSIZE_TO_SHORT
 #define VARSIZE_TO_SHORT(PTR)   ((char)(VARSIZE(PTR)-VARHDRSZ+VARHDRSZ_SHORT) | 0x80)
@@ -96,16 +96,16 @@
 
 #define TOAST_MAX_CHUNK_SIZE	\
 	(EXTERN_TUPLE_MAX_SIZE -							\
-	 MAXALIGN(offsetof(HeapTupleHeaderData, t_bits)) -	\
+	 MAXALIGN(SizeofHeapTupleHeader) -					\
 	 sizeof(Oid) -										\
 	 sizeof(int32) -									\
 	 VARHDRSZ)
 
 /* Size of an EXTERNAL datum that contains a standard TOAST pointer */
-#define TOAST_POINTER_SIZE (VARHDRSZ_EXTERNAL + sizeof(struct varatt_external))
+#define TOAST_POINTER_SIZE (VARHDRSZ_EXTERNAL + sizeof(varatt_external))
 
-/* Size of an indirect datum that contains a standard TOAST pointer */
-#define INDIRECT_POINTER_SIZE (VARHDRSZ_EXTERNAL + sizeof(struct varatt_indirect))
+/* Size of an EXTERNAL datum that contains an indirection pointer */
+#define INDIRECT_POINTER_SIZE (VARHDRSZ_EXTERNAL + sizeof(varatt_indirect))
 
 /*
  * Testing whether an externally-stored value is compressed now requires
@@ -162,7 +162,8 @@ extern MemTuple toast_insert_or_update_memtup(Relation rel,
  *	Called by heap_delete().
  * ----------
  */
-extern void toast_delete(Relation rel, GenericTuple oldtup, MemTupleBinding *pbind);
+extern void toast_delete(Relation rel, HeapTuple oldtup, bool is_speculative);
+extern void toast_delete_memtup(Relation rel, MemTuple oldtup, MemTupleBinding *pbind);
 
 /* ----------
  * heap_tuple_fetch_attr() -

@@ -4,7 +4,7 @@
  *		Routines for handling specialized SET variables.
  *
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -19,7 +19,9 @@
 #include <ctype.h>
 
 #include "access/htup_details.h"
+#include "access/parallel.h"
 #include "access/xact.h"
+#include "access/xlog.h"
 #include "catalog/pg_authid.h"
 #include "cdb/cdbvars.h"
 #include "commands/variable.h"
@@ -350,6 +352,13 @@ check_timezone(char **newval, void **extra, GucSource source)
 		}
 	}
 
+	/* Test for failure in pg_tzset_offset, which we assume is out-of-range */
+	if (!new_tz)
+	{
+		GUC_check_errdetail("UTC timezone offset is out of range.");
+		return false;
+	}
+
 	/*
 	 * Pass back data for assign_timezone to use
 	 */
@@ -474,11 +483,13 @@ show_log_timezone(void)
  * nothing since XactReadOnly will be reset by the next StartTransaction().
  * The IsTransactionState() test protects us against trying to check
  * RecoveryInProgress() in contexts where shared memory is not accessible.
+ * (Similarly, if we're restoring state in a parallel worker, just allow
+ * the change.)
  */
 bool
 check_transaction_read_only(bool *newval, void **extra, GucSource source)
 {
-	if (*newval == false && XactReadOnly && IsTransactionState())
+	if (*newval == false && XactReadOnly && IsTransactionState() && !InitializingParallelWorker)
 	{
 		/* Can't go to r/w mode inside a r/o transaction */
 		if (IsSubTransaction())
@@ -618,6 +629,22 @@ show_XactIsoLevel(void)
 	}
 }
 
+bool
+check_DefaultXactIsoLevel(int *newval, void **extra, GucSource source)
+{
+	/*
+	 * As the fixme in assign_XactIsoLevel, DefaultXactIsoLevel also need
+	 * to fallback from 'serializable' to 'repeatable read'
+	 */
+	if (*newval == XACT_SERIALIZABLE)
+	{
+		elog(LOG, "default serializable isolation requested, falling back to "
+				  "repeatable read until serializable is supported in Greenplum");
+		*newval = XACT_REPEATABLE_READ;
+	}
+
+	return true;
+}
 /*
  * SET TRANSACTION [NOT] DEFERRABLE
  */
@@ -763,6 +790,30 @@ assign_client_encoding(const char *newval, void *extra)
 {
 	int			encoding = *((int *) extra);
 
+	/*
+	 * Parallel workers send data to the leader, not the client.  They always
+	 * send data using the database encoding.
+	 */
+	if (IsParallelWorker())
+	{
+		/*
+		 * During parallel worker startup, we want to accept the leader's
+		 * client_encoding setting so that anyone who looks at the value in
+		 * the worker sees the same value that they would see in the leader.
+		 */
+		if (InitializingParallelWorker)
+			return;
+
+		/*
+		 * A change other than during startup, for example due to a SET clause
+		 * attached to a function definition, should be rejected, as there is
+		 * nothing we can do inside the worker to make it take effect.
+		 */
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_TRANSACTION_STATE),
+			  errmsg("cannot change client_encoding in a parallel worker")));
+	}
+
 	/* We do not expect an error if PrepareClientEncoding succeeded */
 	if (SetClientEncoding(encoding) < 0)
 		elog(LOG, "SetClientEncoding(%d) failed", encoding);
@@ -888,9 +939,12 @@ check_role(char **newval, void **extra, GucSource source)
 		ReleaseSysCache(roleTup);
 
 		/*
-		 * Verify that session user is allowed to become this role
+		 * Verify that session user is allowed to become this role, but skip
+		 * this in parallel mode, where we must blindly recreate the parallel
+		 * leader's state.
 		 */
-		if (!is_member_of_role(GetSessionUserId(), roleid))
+		if (!InitializingParallelWorker &&
+			!is_member_of_role(GetSessionUserId(), roleid))
 		{
 			GUC_check_errcode(ERRCODE_INSUFFICIENT_PRIVILEGE);
 			GUC_check_errmsg("permission denied to set role \"%s\"",

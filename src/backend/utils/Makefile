@@ -10,7 +10,7 @@ include $(top_builddir)/src/Makefile.global
 
 OBJS        = fmgrtab.o session_state.o
 SUBDIRS     = adt cache datumstream error fmgr gdd hash init mb misc mmgr resowner \
-			   resgroup resscheduler sort time gpmon gp workfile_manager resource_manager hyperloglog
+			   resgroup resscheduler sort time gp workfile_manager resource_manager hyperloglog
 
 # location of Catalog.pm
 catalogdir  = $(top_srcdir)/src/backend/catalog
@@ -21,8 +21,9 @@ all: errcodes.h fmgroids.h probes.h
 
 $(SUBDIRS:%=%-recursive): fmgroids.h
 
-# see explanation in ../parser/Makefile
-fmgroids.h: fmgrtab.c ;
+# see notes in src/backend/parser/Makefile
+fmgroids.h: fmgrtab.c
+	touch $@
 
 pg_proc_combined.h: $(catalogdir)/Catalog.pm $(top_srcdir)/src/include/catalog/pg_proc.h $(top_srcdir)/src/include/catalog/pg_proc_gp.h
 	cat $^ > $@
@@ -51,7 +52,7 @@ endif
 # are not cleaned here.
 clean:
 	rm -f probes.h
-	rm -f pg_proc_combied.h
+	rm -f pg_proc_combined.h
 
 maintainer-clean: clean
 	rm -f fmgroids.h fmgrtab.c errcodes.h

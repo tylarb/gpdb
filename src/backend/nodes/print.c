@@ -3,7 +3,7 @@
  * print.c
  *	  various print routines (used mostly for debugging)
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -518,8 +518,6 @@ plannode_type(Plan *p)
 			return "SCAN";
 		case T_SeqScan:
 			return "SEQSCAN";
-		case T_ExternalScan:
-			return "EXTERNALSCAN";
 		case T_IndexScan:
 			return "INDEXSCAN";
 		case T_BitmapIndexScan:
@@ -534,10 +532,6 @@ plannode_type(Plan *p)
 			return "FUNCTIONSCAN";
 		case T_ValuesScan:
 			return "VALUESSCAN";
-		case T_BitmapAppendOnlyScan:
-			return "BITMAPAPPENDONLYSCAN";
-		case T_BitmapTableScan:
-			return "BITMAPTABLESCAN";
 		case T_Join:
 			return "JOIN";
 		case T_NestLoop:
@@ -554,6 +548,8 @@ plannode_type(Plan *p)
 			return "SORT";
 		case T_Agg:
 			return "AGG";
+		case T_TupleSplit:
+			return "TupleSplit";
 		case T_WindowAgg:
 			return "WINDOWAGG";
 		case T_TableFunctionScan:
@@ -568,14 +564,10 @@ plannode_type(Plan *p)
 			return "HASH";
 		case T_Motion:
 			return "MOTION";
-		case T_Repeat:
-			return "REPEAT";
 		case T_ForeignScan:
 			return "FOREIGNSCAN";
 		case T_SplitUpdate:
 			return "SPLITUPDATE";
-		case T_Reshuffle:
-			return "RESHUFFLE";
 		default:
 			return "UNKNOWN";
 	}
@@ -599,8 +591,7 @@ print_plan_recursive(Plan *p, Query *parsetree, int indentLevel, char *label)
 		   p->plan_rows, p->plan_width);
 	if (IsA(p, Scan) ||
 		IsA(p, SeqScan) ||
-		IsA(p, BitmapHeapScan) ||
-		IsA(p, BitmapAppendOnlyScan))
+		IsA(p, BitmapHeapScan))
 	{
 		RangeTblEntry *rte;
 

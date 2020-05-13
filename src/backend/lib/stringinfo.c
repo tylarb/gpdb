@@ -6,7 +6,7 @@
  * It can be used to buffer either ordinary C strings (null-terminated text)
  * or arbitrary binary data.  All storage is allocated with palloc().
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *	  src/backend/lib/stringinfo.c
@@ -45,7 +45,7 @@ makeStringInfo(void)
 void
 initStringInfo(StringInfo str)
 {
-	int			size = 1024;		/* initial default buffer size */
+	int			size = 1024;	/* initial default buffer size */
 
 	str->data = (char *) palloc(size);
 	str->maxlen = size;
@@ -296,37 +296,13 @@ enlargeStringInfo(StringInfo str, int needed)
 	 * here that MaxAllocSize <= INT_MAX/2, else the above loop could
 	 * overflow.  We will still have newlen >= needed.
 	 */
-	if (newlen >= (int) MaxAllocSize)
-	{
-		/*
-		 * Currently we support allocations only up to MaxAllocSize - 1
-		 * (see AllocSizeIsValid()).
-		 */
-		newlen = (int) MaxAllocSize - 1;
-	}
+	if (newlen > (int) MaxAllocSize)
+		newlen = (int) MaxAllocSize;
 
 	str->data = (char *) repalloc(str->data, newlen);
 
 	str->maxlen = newlen;
 }
-
-
-/*------------------------
- * truncateStringInfo
- * Make sure a StringInfo's string is no longer than 'nchars' characters.
- */
-void 
-truncateStringInfo(StringInfo str, int nchars)
-{
-    if (str &&
-        str->len > nchars)
-    {
-        Assert(str->data != NULL && 
-               str->len <= str->maxlen);
-        str->len = nchars;
-        str->data[nchars] = '\0';
-    }
-}                               /* truncateStringInfo */
 
 /*
  * Replace all occurrences of a string in a StringInfo with a different string.

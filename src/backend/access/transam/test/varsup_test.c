@@ -6,11 +6,12 @@
 /* Fetch definition of PG_exception_stack */
 #include "postgres.h"
 
+#undef ereport
 #define ereport(elevel, rest) ereport_mock(elevel, rest)
 
 static int expected_elevel;
 
-static void ereport_mock(int elevel, int dummy __attribute__((unused)),...)
+static void ereport_mock(int elevel, int dummy pg_attribute_unused(),...)
 {
 	assert_int_equal(elevel, expected_elevel);
 	
@@ -38,7 +39,7 @@ static void expect_ereport(int log_level, int errcode)
 	expected_elevel = log_level;
 }
 
-void
+static void
 test_GetNewTransactionId_xid_stop_limit(void **state)
 {
 	VariableCacheData data;
@@ -55,11 +56,11 @@ test_GetNewTransactionId_xid_stop_limit(void **state)
 
 	will_return(RecoveryInProgress, false);
 
-	expect_any(LWLockAcquire, l);
+	expect_any(LWLockAcquire, lock);
 	expect_any(LWLockAcquire, mode);
 	will_return(LWLockAcquire, true);
 
-	expect_any(LWLockRelease, l);
+	expect_any(LWLockRelease, lock);
 	will_be_called(LWLockRelease);
 
 	expect_any(get_database_name, dbid);
@@ -78,7 +79,7 @@ test_GetNewTransactionId_xid_stop_limit(void **state)
 	PG_END_TRY();
 }
 
-void
+static void
 test_GetNewTransactionId_xid_warn_limit(void **state)
 {
 	const int xid = 25;
@@ -101,11 +102,11 @@ test_GetNewTransactionId_xid_warn_limit(void **state)
 
 	will_return(RecoveryInProgress, false);
 
-	expect_any(LWLockAcquire, l);
+	expect_any(LWLockAcquire, lock);
 	expect_any(LWLockAcquire, mode);
 	will_return(LWLockAcquire, true);
 
-	expect_any(LWLockRelease, l);
+	expect_any(LWLockRelease, lock);
 	will_be_called(LWLockRelease);
 
 	expect_any(get_database_name, dbid);
@@ -116,18 +117,20 @@ test_GetNewTransactionId_xid_warn_limit(void **state)
 	/*
 	 * verify rest of function logic, including assign MyProc->xid
 	 */
-	expect_any(LWLockAcquire, l);
+	expect_any(LWLockAcquire, lock);
 	expect_any(LWLockAcquire, mode);
 	will_return(LWLockAcquire, true);
 
 	expect_any(ExtendCLOG, newestXact);
 	will_be_called(ExtendCLOG);
+	expect_any(ExtendCommitTs, newestXact);
+	will_be_called(ExtendCommitTs);
 	expect_any(ExtendSUBTRANS, newestXact);
 	will_be_called(ExtendSUBTRANS);
 	expect_any(DistributedLog_Extend, newestXact);
 	will_be_called(DistributedLog_Extend);
 
-	expect_any(LWLockRelease, l);
+	expect_any(LWLockRelease, lock);
 	will_be_called(LWLockRelease);
 	
 	PG_TRY();
@@ -145,11 +148,11 @@ test_GetNewTransactionId_xid_warn_limit(void **state)
 static void
 should_acquire_and_release_oid_gen_lock()
 {
-	expect_value(LWLockAcquire, l, OidGenLock);
+	expect_value(LWLockAcquire, lock, OidGenLock);
 	expect_value(LWLockAcquire, mode, LW_EXCLUSIVE);
 	will_be_called(LWLockAcquire);
 
-	expect_value(LWLockRelease, l, OidGenLock);
+	expect_value(LWLockRelease, lock, OidGenLock);
 	will_be_called(LWLockRelease);
 }
 
@@ -165,7 +168,7 @@ should_generate_xlog_for_next_oid(Oid expected_oid_in_xlog_rec)
  * QD nextOid: FirstNormalObjectId, QE nextOid: PG_UINT32_MAX
  * QE should set its nextOid to FirstNormalObjectId and create an xlog
  */
-void
+static void
 test_AdvanceObjectId_QD_wrapped_before_QE(void **state)
 {
 	VariableCacheData data = {.nextOid = PG_UINT32_MAX, .oidCount = 1};
@@ -188,7 +191,7 @@ test_AdvanceObjectId_QD_wrapped_before_QE(void **state)
  * QD nextOid: PG_UINT32_MAX, QE nextOid: FirstNormalObjectId
  * QE should do nothing
  */
-void
+static void
 test_AdvanceObjectId_QE_wrapped_before_QD(void **state)
 {
 	VariableCacheData data = {.nextOid = FirstNormalObjectId, .oidCount = VAR_OID_PREFETCH};
@@ -209,7 +212,7 @@ test_AdvanceObjectId_QE_wrapped_before_QD(void **state)
  * QD nextOid: FirstNormalObjectId + 2, QE nextOid: FirstNormalObjectId
  * QE should set its nextOid to FirstNormalObjectId + 2 and not create an xlog
  */
-void
+static void
 test_AdvanceObjectId_normal_flow(void **state)
 {
 	VariableCacheData data = {.nextOid = FirstNormalObjectId, .oidCount = VAR_OID_PREFETCH};

@@ -2,12 +2,13 @@
  *
  * funcapi.h
  *	  Definitions for functions which return composite type and/or sets
+ *	  or work on VARIADIC inputs.
  *
  * This file must be included by all Postgres modules that either define
  * or call FUNCAPI-callable functions or macros.
  *
  *
- * Copyright (c) 2002-2014, PostgreSQL Global Development Group
+ * Copyright (c) 2002-2016, PostgreSQL Global Development Group
  *
  * src/include/funcapi.h
  *
@@ -62,7 +63,7 @@ typedef struct FuncCallContext
 	 * call_cntr is initialized to 0 for you by SRF_FIRSTCALL_INIT(), and
 	 * incremented for you every time SRF_RETURN_NEXT() is called.
 	 */
-	uint32		call_cntr;
+	uint64		call_cntr;
 
 	/*
 	 * OPTIONAL maximum number of calls
@@ -71,7 +72,7 @@ typedef struct FuncCallContext
 	 * not set, you must provide alternative means to know when the function
 	 * is done.
 	 */
-	uint32		max_calls;
+	uint64		max_calls;
 
 	/*
 	 * OPTIONAL pointer to result slot
@@ -178,6 +179,7 @@ extern int get_func_arg_info(HeapTuple procTup,
 extern int get_func_input_arg_names(Datum proargnames, Datum proargmodes,
 						 char ***arg_names);
 
+extern int	get_func_trftypes(HeapTuple procTup, Oid **p_trftypes);
 extern char *get_func_result_name(Oid functionId);
 
 extern TupleDesc build_function_result_tupdesc_d(Datum proallargtypes,
@@ -315,5 +317,27 @@ extern void end_MultiFuncCall(PG_FUNCTION_ARGS, FuncCallContext *funcctx);
 		rsi->isDone = ExprEndResult; \
 		PG_RETURN_NULL(); \
 	} while (0)
+
+/*----------
+ *	Support to ease writing of functions dealing with VARIADIC inputs
+ *----------
+ *
+ * This function extracts a set of argument values, types and NULL markers
+ * for a given input function. This returns a set of data:
+ * - **values includes the set of Datum values extracted.
+ * - **types the data type OID for each element.
+ * - **nulls tracks if an element is NULL.
+ *
+ * variadic_start indicates the argument number where the VARIADIC argument
+ * starts.
+ * convert_unknown set to true will enforce the conversion of arguments
+ * with unknown data type to text.
+ *
+ * The return result is the number of elements stored, or -1 in the case of
+ * "VARIADIC NULL".
+ */
+extern int extract_variadic_args(FunctionCallInfo fcinfo, int variadic_start,
+								 bool convert_unknown, Datum **values,
+								 Oid **types, bool **nulls);
 
 #endif   /* FUNCAPI_H */

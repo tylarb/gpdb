@@ -3,7 +3,7 @@
  * wparser_def.c
  *		Default text search parser
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  *
  *
  * IDENTIFICATION
@@ -13,6 +13,8 @@
  */
 
 #include "postgres.h"
+
+#include <limits.h>
 
 #include "catalog/pg_collation.h"
 #include "commands/defrem.h"
@@ -1119,6 +1121,9 @@ static const TParserStateActionItem actionTPS_InUnsignedInt[] = {
 	{p_iseqC, '.', A_PUSH, TPS_InUDecimalFirst, 0, NULL},
 	{p_iseqC, 'e', A_PUSH, TPS_InMantissaFirst, 0, NULL},
 	{p_iseqC, 'E', A_PUSH, TPS_InMantissaFirst, 0, NULL},
+	{p_iseqC, '-', A_PUSH, TPS_InHostFirstAN, 0, NULL},
+	{p_iseqC, '_', A_PUSH, TPS_InHostFirstAN, 0, NULL},
+	{p_iseqC, '@', A_PUSH, TPS_InEmail, 0, NULL},
 	{p_isasclet, 0, A_PUSH, TPS_InHost, 0, NULL},
 	{p_isalpha, 0, A_NEXT, TPS_InNumWord, 0, NULL},
 	{p_isspecial, 0, A_NEXT, TPS_InNumWord, 0, NULL},
@@ -2025,15 +2030,36 @@ typedef struct
 } hlCheck;
 
 static bool
-checkcondition_HL(void *checkval, QueryOperand *val)
+checkcondition_HL(void *opaque, QueryOperand *val, ExecPhraseData *data)
 {
 	int			i;
+	hlCheck    *checkval = (hlCheck *) opaque;
 
-	for (i = 0; i < ((hlCheck *) checkval)->len; i++)
+	for (i = 0; i < checkval->len; i++)
 	{
-		if (((hlCheck *) checkval)->words[i].item == val)
-			return true;
+		if (checkval->words[i].item == val)
+		{
+			/* don't need to find all positions */
+			if (!data)
+				return true;
+
+			if (!data->pos)
+			{
+				data->pos = palloc(sizeof(WordEntryPos) * checkval->len);
+				data->allocated = true;
+				data->npos = 1;
+				data->pos[0] = checkval->words[i].pos;
+			}
+			else if (data->pos[data->npos - 1] < checkval->words[i].pos)
+			{
+				data->pos[data->npos++] = checkval->words[i].pos;
+			}
+		}
 	}
+
+	if (data && data->npos > 0)
+		return true;
+
 	return false;
 }
 
@@ -2047,7 +2073,7 @@ hlCover(HeadlineParsedText *prs, TSQuery query, int *p, int *q)
 	int			pos = *p;
 
 	*q = -1;
-	*p = 0x7fffffff;
+	*p = INT_MAX;
 
 	for (j = 0; j < query->size; j++)
 	{
@@ -2258,7 +2284,7 @@ mark_hl_fragments(HeadlineParsedText *prs, TSQuery query, int highlight,
 	for (f = 0; f < max_fragments; f++)
 	{
 		maxitems = 0;
-		minwords = 0x7fffffff;
+		minwords = PG_INT32_MAX;
 		minI = -1;
 
 		/*
@@ -2395,7 +2421,7 @@ mark_hl_words(HeadlineParsedText *prs, TSQuery query, int highlight,
 
 			if (poslen < bestlen && !(NOENDTOKEN(prs->words[beste].type) || prs->words[beste].len <= shortword))
 			{
-				/* best already finded, so try one more cover */
+				/* best already found, so try one more cover */
 				p++;
 				continue;
 			}
@@ -2419,7 +2445,7 @@ mark_hl_words(HeadlineParsedText *prs, TSQuery query, int highlight,
 						break;
 				}
 				if (curlen < min_words && i >= prs->curwords)
-				{				/* got end of text and our cover is shoter
+				{				/* got end of text and our cover is shorter
 								 * than min_words */
 					for (i = p - 1; i >= 0; i--)
 					{
@@ -2439,6 +2465,8 @@ mark_hl_words(HeadlineParsedText *prs, TSQuery query, int highlight,
 			}
 			else
 			{					/* shorter cover :((( */
+				if (i > q)
+					i = q;
 				for (; curlen > min_words; i--)
 				{
 					if (!NONWORDTOKEN(prs->words[i].type))

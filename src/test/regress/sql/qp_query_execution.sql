@@ -9,7 +9,7 @@ create or replace function qx_count_operator(query text, planner_operator text, 
 $$
 rv = plpy.execute('EXPLAIN '+ query)
 plan = '\n'.join([row['QUERY PLAN'] for row in rv])
-optimizer = plan.find('PQO')
+optimizer = plan.find('Pivotal Optimizer (GPORCA)')
 
 if optimizer >= 0:
     return plan.count(optimizer_operator)
@@ -86,7 +86,7 @@ select a.*
 from 
   (
     select
-1,1,1,'a','a','a','a',11111,1111,11,16,6,0,0.125,0,0.25,0.875,0.125,0,0,0.9375,0.0625,125.9375,20.30810708273,0,1,0,'asdf',0,0,89,1,'aaa',0,0,'',33.5,69,38,5,6,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,2.29411764705882,5.57142857142857,33.5,0
+1,1,1,'a','a','a','a',11111,1111,11,16,6,0,0.125,0,0.25,0.875,0.125,0,0,0.9375,0.0625,125.9375,20.30810708273,0,1,0,'asdf',0,0,89,1,'aaa',0,0,'',33.5,69,38,5,6,NULL::int,NULL::int,NULL::int,NULL::int,NULL::int,NULL::int,NULL::int,NULL::int,NULL::int,NULL::int,NULL::int,2.29411764705882,5.57142857142857,33.5,0
   ) a,
   generate_series(1,100000) b;
 

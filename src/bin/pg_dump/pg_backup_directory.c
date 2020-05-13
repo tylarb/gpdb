@@ -17,7 +17,7 @@
  *	sync.
  *
  *
- *	Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ *	Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  *	Portions Copyright (c) 1994, Regents of the University of California
  *	Portions Copyright (c) 2000, Philip Warner
  *
@@ -32,10 +32,11 @@
  *
  *-------------------------------------------------------------------------
  */
+#include "postgres_fe.h"
 
 #include "compress_io.h"
-#include "pg_backup_utils.h"
 #include "parallel.h"
+#include "pg_backup_utils.h"
 
 #include <dirent.h>
 #include <sys/stat.h>
@@ -73,7 +74,7 @@ static void _WriteBuf(ArchiveHandle *AH, const void *buf, size_t len);
 static void _ReadBuf(ArchiveHandle *AH, void *buf, size_t len);
 static void _CloseArchive(ArchiveHandle *AH);
 static void _ReopenArchive(ArchiveHandle *AH);
-static void _PrintTocData(ArchiveHandle *AH, TocEntry *te, RestoreOptions *ropt);
+static void _PrintTocData(ArchiveHandle *AH, TocEntry *te);
 
 static void _WriteExtraToc(ArchiveHandle *AH, TocEntry *te);
 static void _ReadExtraToc(ArchiveHandle *AH, TocEntry *te);
@@ -83,7 +84,7 @@ static void _StartBlobs(ArchiveHandle *AH, TocEntry *te);
 static void _StartBlob(ArchiveHandle *AH, TocEntry *te, Oid oid);
 static void _EndBlob(ArchiveHandle *AH, TocEntry *te, Oid oid);
 static void _EndBlobs(ArchiveHandle *AH, TocEntry *te);
-static void _LoadBlobs(ArchiveHandle *AH, RestoreOptions *ropt);
+static void _LoadBlobs(ArchiveHandle *AH);
 
 static void _Clone(ArchiveHandle *AH);
 static void _DeClone(ArchiveHandle *AH);
@@ -355,11 +356,10 @@ _WriteData(ArchiveHandle *AH, const void *data, size_t dLen)
 {
 	lclContext *ctx = (lclContext *) AH->formatData;
 
-	/* Are we aborting? */
-	checkAborting(AH);
-
 	if (dLen > 0 && cfwrite(data, dLen, ctx->dataFH) != dLen)
-		WRITE_ERROR_EXIT;
+		exit_horribly(modulename, "could not write to output file: %s\n",
+					  get_cfp_error(ctx->dataFH));
+
 
 	return;
 }
@@ -385,7 +385,7 @@ _EndData(ArchiveHandle *AH, TocEntry *te)
  * Print data for a given file (can be a BLOB as well)
  */
 static void
-_PrintFileData(ArchiveHandle *AH, char *filename, RestoreOptions *ropt)
+_PrintFileData(ArchiveHandle *AH, char *filename)
 {
 	size_t		cnt;
 	char	   *buf;
@@ -405,7 +405,9 @@ _PrintFileData(ArchiveHandle *AH, char *filename, RestoreOptions *ropt)
 	buflen = ZLIB_OUT_SIZE;
 
 	while ((cnt = cfread(buf, buflen, cfp)))
+	{
 		ahwrite(buf, 1, cnt, AH);
+	}
 
 	free(buf);
 	if (cfclose(cfp) !=0)
@@ -417,7 +419,7 @@ _PrintFileData(ArchiveHandle *AH, char *filename, RestoreOptions *ropt)
  * Print data for a given TOC entry
 */
 static void
-_PrintTocData(ArchiveHandle *AH, TocEntry *te, RestoreOptions *ropt)
+_PrintTocData(ArchiveHandle *AH, TocEntry *te)
 {
 	lclTocEntry *tctx = (lclTocEntry *) te->formatData;
 
@@ -425,18 +427,18 @@ _PrintTocData(ArchiveHandle *AH, TocEntry *te, RestoreOptions *ropt)
 		return;
 
 	if (strcmp(te->desc, "BLOBS") == 0)
-		_LoadBlobs(AH, ropt);
+		_LoadBlobs(AH);
 	else
 	{
 		char		fname[MAXPGPATH];
 
 		setFilePath(AH, fname, tctx->filename);
-		_PrintFileData(AH, fname, ropt);
+		_PrintFileData(AH, fname);
 	}
 }
 
 static void
-_LoadBlobs(ArchiveHandle *AH, RestoreOptions *ropt)
+_LoadBlobs(ArchiveHandle *AH)
 {
 	Oid			oid;
 	lclContext *ctx = (lclContext *) AH->formatData;
@@ -464,9 +466,9 @@ _LoadBlobs(ArchiveHandle *AH, RestoreOptions *ropt)
 			exit_horribly(modulename, "invalid line in large object TOC file \"%s\": \"%s\"\n",
 						  fname, line);
 
-		StartRestoreBlob(AH, oid, ropt->dropSchema);
+		StartRestoreBlob(AH, oid, AH->public.ropt->dropSchema);
 		snprintf(path, MAXPGPATH, "%s/%s", ctx->directory, fname);
-		_PrintFileData(AH, path, ropt);
+		_PrintFileData(AH, path);
 		EndRestoreBlob(AH, oid);
 	}
 	if (!cfeof(ctx->blobsTocFH))
@@ -495,7 +497,8 @@ _WriteByte(ArchiveHandle *AH, const int i)
 	lclContext *ctx = (lclContext *) AH->formatData;
 
 	if (cfwrite(&c, 1, ctx->dataFH) != 1)
-		WRITE_ERROR_EXIT;
+		exit_horribly(modulename, "could not write to output file: %s\n",
+					  get_cfp_error(ctx->dataFH));
 
 	return 1;
 }
@@ -523,11 +526,9 @@ _WriteBuf(ArchiveHandle *AH, const void *buf, size_t len)
 {
 	lclContext *ctx = (lclContext *) AH->formatData;
 
-	/* Are we aborting? */
-	checkAborting(AH);
-
 	if (cfwrite(buf, len, ctx->dataFH) != len)
-		WRITE_ERROR_EXIT;
+		exit_horribly(modulename, "could not write to output file: %s\n",
+					  get_cfp_error(ctx->dataFH));
 
 	return;
 }
@@ -578,7 +579,7 @@ _CloseArchive(ArchiveHandle *AH)
 		setFilePath(AH, fname, "toc.dat");
 
 		/* this will actually fork the processes for a parallel backup */
-		ctx->pstate = ParallelBackupStart(AH, NULL);
+		ctx->pstate = ParallelBackupStart(AH);
 
 		/* The TOC is always created uncompressed */
 		tocFH = cfopen_write(fname, PG_BINARY_W, 0);
@@ -858,14 +859,14 @@ _MasterEndParallelItem(ArchiveHandle *AH, TocEntry *te, const char *str, T_Actio
 
 	if (act == ACT_DUMP)
 	{
-		sscanf(str, "%u%n", &dumpId, &nBytes);
+		sscanf(str, "%d%n", &dumpId, &nBytes);
 
 		Assert(dumpId == te->dumpId);
 		Assert(nBytes == strlen(str));
 	}
 	else if (act == ACT_RESTORE)
 	{
-		sscanf(str, "%u %u %u%n", &dumpId, &status, &n_errors, &nBytes);
+		sscanf(str, "%d %d %d%n", &dumpId, &status, &n_errors, &nBytes);
 
 		Assert(dumpId == te->dumpId);
 		Assert(nBytes == strlen(str));

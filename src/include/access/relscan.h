@@ -4,7 +4,7 @@
  *	  POSTGRES relation scan descriptor definitions.
  *
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/access/relscan.h
@@ -22,6 +22,26 @@
 
 #include "access/formatter.h"
 
+/*
+ * Shared state for parallel heap scan.
+ *
+ * Each backend participating in a parallel heap scan has its own
+ * HeapScanDesc in backend-private memory, and those objects all contain
+ * a pointer to this structure.  The information here must be sufficient
+ * to properly initialize each new HeapScanDesc as workers join the scan,
+ * and it must act as a font of block numbers for those workers.
+ */
+typedef struct ParallelHeapScanDescData
+{
+	Oid			phs_relid;		/* OID of relation to scan */
+	bool		phs_syncscan;	/* report location to syncscan logic? */
+	BlockNumber phs_nblocks;	/* # blocks in relation at start of scan */
+	slock_t		phs_mutex;		/* mutual exclusion for block number fields */
+	BlockNumber phs_startblock; /* starting block number */
+	BlockNumber phs_cblock;		/* current block number */
+	char		phs_snapshot_data[FLEXIBLE_ARRAY_MEMBER];
+}	ParallelHeapScanDescData;
+
 typedef struct HeapScanDescData
 {
 	/* scan parameters */
@@ -30,14 +50,17 @@ typedef struct HeapScanDescData
 	int			rs_nkeys;		/* number of scan keys */
 	ScanKey		rs_key;			/* array of scan key descriptors */
 	bool		rs_bitmapscan;	/* true if this is really a bitmap scan */
+	bool		rs_samplescan;	/* true if this is really a sample scan */
 	bool		rs_pageatatime; /* verify visibility page-at-a-time? */
 	bool		rs_allow_strat; /* allow or disallow use of access strategy */
 	bool		rs_allow_sync;	/* allow or disallow use of syncscan */
 	bool		rs_temp_snap;	/* unregister snapshot at scan end? */
 
 	/* state set up at initscan time */
-	BlockNumber rs_nblocks;		/* number of blocks to scan */
+	BlockNumber rs_nblocks;		/* total number of blocks in rel */
 	BlockNumber rs_startblock;	/* block # to start at */
+	BlockNumber rs_numblocks;	/* max number of blocks to scan */
+	/* rs_numblocks is usually InvalidBlockNumber, meaning "scan whole rel" */
 	BufferAccessStrategy rs_strategy;	/* access strategy for reads */
 	bool		rs_syncscan;	/* report location to syncscan logic? */
 
@@ -47,11 +70,10 @@ typedef struct HeapScanDescData
 	BlockNumber rs_cblock;		/* current block # in scan, if any */
 	Buffer		rs_cbuf;		/* current buffer in scan, if any */
 	/* NB: if rs_cbuf is not InvalidBuffer, we hold a pin on that buffer */
-	ItemPointerData rs_mctid;	/* marked scan position, if any */
+	ParallelHeapScanDesc rs_parallel;	/* parallel scan information */
 
 	/* these fields only used in page-at-a-time mode and for bitmap scans */
 	int			rs_cindex;		/* current tuple's index in vistuples */
-	int			rs_mindex;		/* marked tuple's saved index */
 	int			rs_ntuples;		/* number of visible tuples on page */
 	OffsetNumber rs_vistuples[MaxHeapTuplesPerPage];	/* their offsets */
 }	HeapScanDescData;
@@ -92,6 +114,17 @@ typedef struct IndexScanDescData
 	/* NB: if xs_cbuf is not InvalidBuffer, we hold a pin on that buffer */
 	bool		xs_recheck;		/* T means scan keys must be rechecked */
 
+	/*
+	 * When fetching with an ordering operator, the values of the ORDER BY
+	 * expressions of the last returned tuple, according to the index.  If
+	 * xs_recheckorderby is true, these need to be rechecked just like the
+	 * scan keys, and the values returned here are a lower-bound on the actual
+	 * values.
+	 */
+	Datum	   *xs_orderbyvals;
+	bool	   *xs_orderbynulls;
+	bool		xs_recheckorderby;
+
 	/* state data for traversing HOT chains in index_getnext */
 	bool		xs_continue_hot;	/* T if must keep walking HOT chain */
 }	IndexScanDescData;
@@ -111,8 +144,6 @@ typedef struct FileScanDescData
 	/* current file parse state */
 	struct CopyStateData *fs_pstate;
 
-	bool		raw_buf_done;
-
 	Form_pg_attribute *attr;
 	AttrNumber	num_phys_attrs;
 	Datum	   *values;
@@ -122,7 +153,6 @@ typedef struct FileScanDescData
 	Oid			in_func_oid;
 	
 	/* current file scan state */
-	bool		fs_inited;		/* false = scan not init'd yet */
 	TupleDesc	fs_tupDesc;
 	HeapTupleData fs_ctup;		/* current tuple in scan, if any */
 

@@ -3,7 +3,7 @@
  * pg_type.c
  *	  routines to support manipulation of the pg_type relation
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -86,7 +86,7 @@ add_type_encoding(Oid typid, Datum typoptions)
  *		with correct ones, and "typisdefined" will be set to true.
  * ----------------------------------------------------------------
  */
-Oid
+ObjectAddress
 TypeShellMake(const char *typeName, Oid typeNamespace, Oid ownerId)
 {
 	Relation	pg_type_desc;
@@ -97,6 +97,7 @@ TypeShellMake(const char *typeName, Oid typeNamespace, Oid ownerId)
 	bool		nulls[Natts_pg_type];
 	Oid			typoid;
 	NameData	name;
+	ObjectAddress address;
 
 	Assert(PointerIsValid(typeName));
 
@@ -193,13 +194,15 @@ TypeShellMake(const char *typeName, Oid typeNamespace, Oid ownerId)
 	/* Post creation hook for new shell type */
 	InvokeObjectPostCreateHook(TypeRelationId, typoid, 0);
 
+	ObjectAddressSet(address, TypeRelationId, typoid);
+
 	/*
 	 * clean up and return the type-oid
 	 */
 	heap_freetuple(tup);
 	heap_close(pg_type_desc, RowExclusiveLock);
 
-	return typoid;
+	return address;
 }
 
 /* ----------------------------------------------------------------
@@ -207,13 +210,13 @@ TypeShellMake(const char *typeName, Oid typeNamespace, Oid ownerId)
  *
  *		This does all the necessary work needed to define a new type.
  *
- *		Returns the OID assigned to the new type.  If newTypeOid is
- *		zero (the normal case), a new OID is created; otherwise we
- *		use exactly that OID.
+ *		Returns the ObjectAddress assigned to the new type.
+ *		If newTypeOid is zero (the normal case), a new OID is created;
+ *		otherwise we use exactly that OID.
  * ----------------------------------------------------------------
  */
-Oid
-TypeCreateWithOptions(Oid newTypeOid,
+ObjectAddress
+TypeCreate(Oid newTypeOid,
 		   const char *typeName,
 		   Oid typeNamespace,
 		   Oid relationOid,		/* only for relation rowtypes */
@@ -243,8 +246,7 @@ TypeCreateWithOptions(Oid newTypeOid,
 		   int32 typeMod,
 		   int32 typNDims,		/* Array dimensions for baseType */
 		   bool typeNotNull,
-		   Oid typeCollation,
-		   Datum typoptions)
+		   Oid typeCollation)
 {
 	Relation	pg_type_desc;
 	Oid			typeObjectId;
@@ -256,6 +258,7 @@ TypeCreateWithOptions(Oid newTypeOid,
 	NameData	name;
 	int			i;
 	Acl		   *typacl = NULL;
+	ObjectAddress address;
 
 	/*
 	 * We assume that the caller validated the arguments individually, but did
@@ -501,83 +504,14 @@ TypeCreateWithOptions(Oid newTypeOid,
 	/* Post creation hook for new type */
 	InvokeObjectPostCreateHook(TypeRelationId, typeObjectId, 0);
 
+	ObjectAddressSet(address, TypeRelationId, typeObjectId);
+
 	/*
 	 * finish up with pg_type
 	 */
 	heap_close(pg_type_desc, RowExclusiveLock);
 
-	/* now pg_type_encoding */
-	if (DatumGetPointer(typoptions) != NULL)
-		add_type_encoding(typeObjectId, typoptions);
-
-	return typeObjectId;
-}
-
-Oid
-TypeCreate(Oid newTypeOid,
-		   const char *typeName,
-		   Oid typeNamespace,
-		   Oid relationOid,
-		   char relationKind,
-		   Oid ownerId,
-		   int16 internalSize,
-		   char typeType,
-		   char typeCategory,
-		   bool typePreferred,
-		   char typDelim,
-		   Oid inputProcedure,
-		   Oid outputProcedure,
-		   Oid receiveProcedure,
-		   Oid sendProcedure,
-		   Oid typmodinProcedure,
-		   Oid typmodoutProcedure,
-		   Oid analyzeProcedure,
-		   Oid elementType,
-		   bool isImplicitArray,
-		   Oid arrayType,
-		   Oid baseType,
-		   const char *defaultTypeValue,
-		   char *defaultTypeBin,
-		   bool passedByValue,
-		   char alignment,
-		   char storage,
-		   int32 typeMod,
-		   int32 typNDims,
-		   bool typeNotNull,
-		   Oid typeCollation)
-{
-	return TypeCreateWithOptions(newTypeOid,
-		   typeName,
-		   typeNamespace,
-		   relationOid,
-		   relationKind,
-		   ownerId,
-		   internalSize,
-		   typeType,
-		   typeCategory,
-		   typePreferred,
-		   typDelim,
-		   inputProcedure,
-		   outputProcedure,
-		   receiveProcedure,
-		   sendProcedure,
-		   typmodinProcedure,
-		   typmodoutProcedure,
-		   analyzeProcedure,
-		   elementType,
-		   isImplicitArray,
-		   arrayType,
-		   baseType,
-		   defaultTypeValue,
-		   defaultTypeBin,
-		   passedByValue,
-		   alignment,
-		   storage,
-		   typeMod,
-		   typNDims,
-		   typeNotNull,
-		   typeCollation,
-		   (Datum) 0);
+	return address;
 }
 
 /*
@@ -778,6 +712,7 @@ RenameTypeInternal(Oid typeOid, const char *newTypeName, Oid typeNamespace)
 	HeapTuple	tuple;
 	Form_pg_type typ;
 	Oid			arrayOid;
+	Oid			oldTypeOid;
 
 	pg_type_desc = heap_open(TypeRelationId, RowExclusiveLock);
 
@@ -791,13 +726,28 @@ RenameTypeInternal(Oid typeOid, const char *newTypeName, Oid typeNamespace)
 
 	arrayOid = typ->typarray;
 
-	/* Just to give a more friendly error than unique-index violation */
-	if (SearchSysCacheExists2(TYPENAMENSP,
-							  CStringGetDatum(newTypeName),
-							  ObjectIdGetDatum(typeNamespace)))
-		ereport(ERROR,
-				(errcode(ERRCODE_DUPLICATE_OBJECT),
-				 errmsg("type \"%s\" already exists", newTypeName)));
+	/* Check for a conflicting type name. */
+	oldTypeOid = GetSysCacheOid2(TYPENAMENSP,
+								 CStringGetDatum(newTypeName),
+								 ObjectIdGetDatum(typeNamespace));
+
+	/*
+	 * If there is one, see if it's an autogenerated array type, and if so
+	 * rename it out of the way.  (But we must skip that for a shell type
+	 * because moveArrayTypeName will do the wrong thing in that case.)
+	 * Otherwise, we can at least give a more friendly error than unique-index
+	 * violation.
+	 */
+	if (OidIsValid(oldTypeOid))
+	{
+		if (get_typisdefined(oldTypeOid) &&
+			moveArrayTypeName(oldTypeOid, newTypeName, typeNamespace))
+			 /* successfully dodged the problem */ ;
+		else
+			ereport(ERROR,
+					(errcode(ERRCODE_DUPLICATE_OBJECT),
+					 errmsg("type \"%s\" already exists", newTypeName)));
+	}
 
 	/* OK, do the rename --- tuple is a copy, so OK to scribble on it */
 	namestrcpy(&(typ->typname), newTypeName);
@@ -812,8 +762,12 @@ RenameTypeInternal(Oid typeOid, const char *newTypeName, Oid typeNamespace)
 	heap_freetuple(tuple);
 	heap_close(pg_type_desc, RowExclusiveLock);
 
-	/* If the type has an array type, recurse to handle that */
-	if (OidIsValid(arrayOid))
+	/*
+	 * If the type has an array type, recurse to handle that.  But we don't
+	 * need to do anything more if we already renamed that array type above
+	 * (which would happen when, eg, renaming "foo" to "_foo").
+	 */
+	if (OidIsValid(arrayOid) && arrayOid != oldTypeOid)
 	{
 		char	   *arrname = makeArrayTypeName(newTypeName, typeNamespace);
 

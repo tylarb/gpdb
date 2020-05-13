@@ -20,6 +20,7 @@
 #include "optimizer/paths.h"
 #include "optimizer/pathnode.h"
 #include "optimizer/restrictinfo.h"
+#include "cdb/cdbllize.h"
 #include "cdb/cdbpartition.h"
 #include "cdb/cdbplan.h"
 #include "nodes/makefuncs.h"
@@ -104,7 +105,7 @@ inject_partition_selectors_for_join(PlannerInfo *root, JoinPath *join_path,
 	bool		any_selectors_created = false;
 	bool		good_type = false;
 
-	if (Gp_role != GP_ROLE_DISPATCH || !root->config->gp_dynamic_partition_pruning)
+	if (Gp_role != GP_ROLE_DISPATCH || !gp_dynamic_partition_pruning)
 		return false;
 
 	/*
@@ -359,18 +360,21 @@ FindEqKey(PlannerInfo *root, Bitmapset *inner_relids,
 
 					if (!bms_is_subset(inner_em->em_relids, inner_relids))
 						continue; /* not computable on the inner side */
+
 					/*
 					 * The condition will be duplicated as the partition
-					 * selection key in the PartitionSelector node. It is
-					 * not OK to duplicate the expression, if it contains
-					 * SubPlans, because the code that adds motion nodes to a
-					 * subplan gets confused if there are multiple SubPlans
-					 * referring the same subplan ID. It would probably
-					 * perform badly too, since subplans are typically quite
-					 * expensive.
+					 * selection key in the PartitionSelector node. Let's not
+					 * duplicate the expression, if it contains SubPlans,
+					 * because executing a SubPlan is typically quite
+					 * expensive. Hopefully, there is a cheaper alternative in
+					 * the member list.
+					 *
+					 * TODO: we should prefer simple Vars, like
+					 * generate_join_implied_equalities_normal() does.
 					 */
 					if (contain_subplans((Node *) inner_em->em_expr))
 						continue;
+
 					/*
 					 * This can be computed from the inner side.
 					 *
@@ -404,7 +408,7 @@ create_partition_selector_plan(PlannerInfo *root, PartitionSelectorPath *best_pa
 	int			attno;
 	Expr	  **partKeyExprs;
 
-	subplan = create_plan_recurse(root, best_path->subpath);
+	subplan = create_plan_recurse(root, best_path->subpath, 0);
 
 	max_attr = find_base_rel(root, best_path->dsinfo->rtindex)->max_attr;
 	partKeyExprs = palloc0((max_attr + 1) * sizeof(Expr *));
@@ -510,26 +514,6 @@ add_restrictinfos(PlannerInfo *root, DynamicScanInfo *dsinfo, Bitmapset *childre
 
 		root->hasPseudoConstantQuals = true;
 	}
-}
-
-RestrictInfo *
-make_mergeclause(Node *outer, Node *inner)
-{
-	OpExpr	   *opxpr;
-	Expr	   *xpr;
-	RestrictInfo *rinfo;
-
-	opxpr = (OpExpr *) make_op(NULL, list_make1(makeString("=")),
-							   outer,
-							   inner, -1);
-	opxpr->xpr.type = T_DistinctExpr;
-
-	xpr = make_notclause((Expr *) opxpr);
-
-	rinfo = make_restrictinfo(xpr, false, false, false, NULL, NULL, NULL);
-	rinfo->mergeopfamilies = get_mergejoin_opfamilies(opxpr->opno);
-
-	return rinfo;
 }
 
 /*

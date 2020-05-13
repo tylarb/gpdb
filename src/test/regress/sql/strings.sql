@@ -1,3 +1,8 @@
+-- GPDB_10_MERGE_FIXME: this shouldn't be needed after merge of upstream commit 1e7c4bb004. Remove when we get there.
+-- start_matchsubs
+-- m/^(ERROR:  .*)\(parse_coerce\.c:\d+\)$/
+-- s/\(parse_coerce\.c:\d+\)$/(parse_coerce.c:XXX)/
+-- end_matchsubs
 --
 -- STRINGS
 -- Test various data entry syntaxes.
@@ -226,6 +231,9 @@ SELECT regexp_split_to_array('the quick brown fox jumps over the lazy dog', 'nom
 SELECT regexp_split_to_array('123456','1');
 SELECT regexp_split_to_array('123456','6');
 SELECT regexp_split_to_array('123456','.');
+SELECT regexp_split_to_array('123456','');
+SELECT regexp_split_to_array('123456','(?:)');
+SELECT regexp_split_to_array('1','');
 -- errors
 SELECT foo, length(foo) FROM regexp_split_to_table('thE QUick bROWn FOx jUMPs ovEr The lazy dOG', 'e', 'zippy') AS foo;
 SELECT regexp_split_to_array('thE QUick bROWn FOx jUMPs ovEr The lazy dOG', 'e', 'iz');

@@ -3,7 +3,7 @@
  * trigger.h
  *	  Declarations for trigger handling.
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/commands/trigger.h
@@ -13,6 +13,7 @@
 #ifndef TRIGGER_H
 #define TRIGGER_H
 
+#include "catalog/objectaddress.h"
 #include "nodes/execnodes.h"
 #include "nodes/parsenodes.h"
 #include "utils/rel.h"
@@ -111,25 +112,17 @@ extern PGDLLIMPORT int SessionReplicationRole;
 #define TRIGGER_FIRES_ON_REPLICA			'R'
 #define TRIGGER_DISABLED					'D'
 
-extern Oid CreateTrigger(CreateTrigStmt *stmt, const char *queryString,
+extern ObjectAddress CreateTrigger(CreateTrigStmt *stmt, const char *queryString,
 			  Oid relOid, Oid refRelOid, Oid constraintOid, Oid indexOid,
 			  bool isInternal);
 
 extern void RemoveTriggerById(Oid trigOid);
 extern Oid	get_trigger_oid(Oid relid, const char *name, bool missing_ok);
 
-extern Oid	renametrig(RenameStmt *stmt);
+extern ObjectAddress renametrig(RenameStmt *stmt);
 
 extern void EnableDisableTrigger(Relation rel, const char *tgname,
 					 char fires_when, bool skip_system);
-
-/*cdb: export the following macro and function for nodeRowTrigger.c */
-#define GetModifiedColumns(relinfo, estate) \
-	(rt_fetch((relinfo)->ri_RangeTableIndex, (estate)->es_range_table)->modifiedCols)
-extern bool TriggerEnabled(EState *estate, ResultRelInfo *relinfo,
-			   Trigger *trigger, TriggerEvent event,
-			   Bitmapset *modifiedCols,
-			   HeapTuple oldtup, HeapTuple newtup);
 
 extern void RelationBuildTriggers(Relation relation);
 
@@ -220,12 +213,6 @@ extern bool RI_Initial_Check(Trigger *trigger,
 
 extern int	RI_FKey_trigger_type(Oid tgfoid);
 
-extern HeapTuple ExecCallTriggerFunc(TriggerData *trigdata,
- 					int tgindx,
- 					FmgrInfo *finfo,
- 					Instrumentation *instr,
- 					MemoryContext per_tuple_context);
- 
 extern Datum pg_trigger_depth(PG_FUNCTION_ARGS);
 
 #endif   /* TRIGGER_H */

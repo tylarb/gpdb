@@ -3,7 +3,7 @@
  * plpgsql.h		- Definitions for the PL/pgSQL
  *			  procedural language
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -44,6 +44,17 @@ enum
 	PLPGSQL_NSTYPE_VAR,
 	PLPGSQL_NSTYPE_ROW,
 	PLPGSQL_NSTYPE_REC
+};
+
+/* ----------
+ * A PLPGSQL_NSTYPE_LABEL stack entry must be one of these types
+ * ----------
+ */
+enum PLpgSQL_label_types
+{
+	PLPGSQL_LABEL_BLOCK,		/* DECLARE/BEGIN block */
+	PLPGSQL_LABEL_LOOP,			/* looping construct */
+	PLPGSQL_LABEL_OTHER			/* anything else */
 };
 
 /* ----------
@@ -93,6 +104,7 @@ enum PLpgSQL_stmt_types
 	PLPGSQL_STMT_RETURN_NEXT,
 	PLPGSQL_STMT_RETURN_QUERY,
 	PLPGSQL_STMT_RAISE,
+	PLPGSQL_STMT_ASSERT,
 	PLPGSQL_STMT_EXECSQL,
 	PLPGSQL_STMT_DYNEXECUTE,
 	PLPGSQL_STMT_DYNFORS,
@@ -178,10 +190,10 @@ typedef struct
 	int			ttype;			/* PLPGSQL_TTYPE_ code */
 	int16		typlen;			/* stuff copied from its pg_type entry */
 	bool		typbyval;
+	char		typtype;
 	Oid			typrelid;
-	Oid			typioparam;
 	Oid			collation;		/* from pg_type, but can be overridden */
-	FmgrInfo	typinput;		/* lookup info for typinput function */
+	bool		typisarray;		/* is "true" array, or domain over one */
 	int32		atttypmod;		/* typmod (taken from someplace else) */
 } PLpgSQL_type;
 
@@ -216,6 +228,7 @@ typedef struct PLpgSQL_expr
 	SPIPlanPtr	plan;
 	bool		cachable;			/* true if plan can be cached */
 	Bitmapset  *paramnos;		/* all dnos referenced by this query */
+	int			rwparam;		/* dno of read/write param, or -1 if none */
 
 	/* function containing this expr (not set until we first parse query) */
 	struct PLpgSQL_function *func;
@@ -225,9 +238,10 @@ typedef struct PLpgSQL_expr
 
 	/* fields for "simple expression" fast-path execution: */
 	Expr	   *expr_simple_expr;		/* NULL means not a simple expr */
-	Oid			expr_simple_type;
 	TransactionId	transaction_id;	/* used for clearing cached plan */
 	int			expr_simple_generation; /* plancache generation we checked */
+	Oid			expr_simple_type;		/* result type Oid, if simple */
+	int32		expr_simple_typmod;		/* result typmod, if simple */
 
 	/*
 	 * if expr is simple AND prepared in current transaction,
@@ -330,8 +344,10 @@ typedef struct PLpgSQL_nsitem
 {								/* Item in the compilers namespace tree */
 	int			itemtype;
 	int			itemno;
+	/* For labels, itemno is a value of enum PLpgSQL_label_types. */
+	/* For other itemtypes, itemno is the associated PLpgSQL_datum's dno. */
 	struct PLpgSQL_nsitem *prev;
-	char		name[1];		/* actually, as long as needed */
+	char		name[FLEXIBLE_ARRAY_MEMBER];	/* nul-terminated string */
 } PLpgSQL_nsitem;
 
 
@@ -631,6 +647,13 @@ typedef struct
 	PLpgSQL_expr *expr;
 } PLpgSQL_raise_option;
 
+typedef struct
+{								/* ASSERT statement */
+	int			cmd_type;
+	int			lineno;
+	PLpgSQL_expr *cond;
+	PLpgSQL_expr *message;
+} PLpgSQL_stmt_assert;
 
 typedef struct
 {								/* Generic SQL statement to execute */
@@ -710,8 +733,6 @@ typedef struct PLpgSQL_function
 	Oid			fn_rettype;
 	int			fn_rettyplen;
 	bool		fn_retbyval;
-	FmgrInfo	fn_retinput;
-	Oid			fn_rettypioparam;
 	bool		fn_retistuple;
 	bool		fn_retset;
 	bool		fn_readonly;
@@ -745,8 +766,12 @@ typedef struct PLpgSQL_function
 	int			extra_warnings;
 	int			extra_errors;
 
+	/* the datums representing the function's local variables */
 	int			ndatums;
 	PLpgSQL_datum **datums;
+	Bitmapset  *resettable_datums;		/* dnos of non-simple vars */
+
+	/* function body parsetree */
 	PLpgSQL_stmt_block *action;
 
 	/* these fields change when the function is used */
@@ -784,15 +809,22 @@ typedef struct PLpgSQL_execstate
 	int			ndatums;
 	PLpgSQL_datum **datums;
 
+	/* we pass datums[i] to the executor, when needed, in paramLI->params[i] */
+	ParamListInfo paramLI;
+	bool		params_dirty;	/* T if any resettable datum has been passed */
+
 	/* EState to use for "simple" expression evaluation */
 	EState	   *simple_eval_estate;
+
+	/* Lookup table to use for executing type casts */
+	HTAB	   *cast_hash;
+	MemoryContext cast_hash_context;
 
 	/* temporary state for results from evaluation of query or expr */
 	SPITupleTable *eval_tuptable;
 	uint64		eval_processed;
 	Oid			eval_lastoid;
 	ExprContext *eval_econtext; /* for executing simple expressions */
-	PLpgSQL_expr *cur_expr;		/* current query/expr being evaluated */
 
 	/* status information for error context reporting */
 	PLpgSQL_stmt *err_stmt;		/* current stmt */
@@ -887,6 +919,8 @@ extern int	plpgsql_variable_conflict;
 
 extern bool plpgsql_print_strict_params;
 
+extern bool plpgsql_check_asserts;
+
 /* extra compile-time checks */
 #define PLPGSQL_XCHECK_NONE			0
 #define PLPGSQL_XCHECK_SHADOWVAR	1
@@ -906,9 +940,9 @@ extern PLpgSQL_datum **plpgsql_Datums;
 extern char *plpgsql_error_funcname;
 
 extern PLpgSQL_function *plpgsql_curr_compile;
-extern MemoryContext compile_tmp_cxt;
+extern MemoryContext plpgsql_compile_tmp_cxt;
 
-extern PLpgSQL_plugin **plugin_ptr;
+extern PLpgSQL_plugin **plpgsql_plugin_ptr;
 
 /**********************************************************************
  * Function declarations
@@ -967,18 +1001,19 @@ extern void plpgsql_exec_event_trigger(PLpgSQL_function *func,
 extern void plpgsql_xact_cb(XactEvent event, void *arg);
 extern void plpgsql_subxact_cb(SubXactEvent event, SubTransactionId mySubid,
 				   SubTransactionId parentSubid, void *arg);
-extern Oid exec_get_datum_type(PLpgSQL_execstate *estate,
-					PLpgSQL_datum *datum);
-extern void exec_get_datum_type_info(PLpgSQL_execstate *estate,
-						 PLpgSQL_datum *datum,
-						 Oid *typeid, int32 *typmod, Oid *collation);
+extern Oid plpgsql_exec_get_datum_type(PLpgSQL_execstate *estate,
+							PLpgSQL_datum *datum);
+extern void plpgsql_exec_get_datum_type_info(PLpgSQL_execstate *estate,
+								 PLpgSQL_datum *datum,
+								 Oid *typeid, int32 *typmod, Oid *collation);
 
 /* ----------
  * Functions for namespace handling in pl_funcs.c
  * ----------
  */
 extern void plpgsql_ns_init(void);
-extern void plpgsql_ns_push(const char *label);
+extern void plpgsql_ns_push(const char *label,
+				enum PLpgSQL_label_types label_type);
 extern void plpgsql_ns_pop(void);
 extern PLpgSQL_nsitem *plpgsql_ns_top(void);
 extern void plpgsql_ns_additem(int itemtype, int itemno, const char *name);
@@ -987,6 +1022,7 @@ extern PLpgSQL_nsitem *plpgsql_ns_lookup(PLpgSQL_nsitem *ns_cur, bool localmode,
 				  const char *name3, int *names_used);
 extern PLpgSQL_nsitem *plpgsql_ns_lookup_label(PLpgSQL_nsitem *ns_cur,
 						const char *name);
+extern PLpgSQL_nsitem *plpgsql_ns_find_nearest_loop(PLpgSQL_nsitem *ns_cur);
 
 /* ----------
  * Other functions in pl_funcs.c
@@ -1011,7 +1047,7 @@ extern int	plpgsql_peek(void);
 extern void plpgsql_peek2(int *tok1_p, int *tok2_p, int *tok1_loc,
 			  int *tok2_loc);
 extern int	plpgsql_scanner_errposition(int location);
-extern void plpgsql_yyerror(const char *message);
+extern void plpgsql_yyerror(const char *message) pg_attribute_noreturn();
 extern int	plpgsql_location_to_lineno(int location);
 extern int	plpgsql_latest_lineno(void);
 extern void plpgsql_scanner_init(const char *str);

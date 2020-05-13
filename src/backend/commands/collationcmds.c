@@ -3,7 +3,7 @@
  * collationcmds.c
  *	  collation-related commands support code
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -37,6 +37,7 @@
 
 #include "cdb/cdbvars.h"
 #include "cdb/cdbdisp_query.h"
+#include "storage/fd.h"
 
 typedef struct
 {
@@ -50,7 +51,7 @@ Datum pg_import_system_collations(PG_FUNCTION_ARGS);
 /*
  * CREATE COLLATION
  */
-Oid
+ObjectAddress
 DefineCollation(List *names, List *parameters, bool if_not_exists)
 {
 	char	   *collName;
@@ -64,6 +65,7 @@ DefineCollation(List *names, List *parameters, bool if_not_exists)
 	char	   *collcollate = NULL;
 	char	   *collctype = NULL;
 	Oid			newoid;
+	ObjectAddress address;
 
 	collNamespace = QualifiedNameGetCreationNamespace(names, &collName);
 
@@ -153,7 +155,9 @@ DefineCollation(List *names, List *parameters, bool if_not_exists)
 							 false);	/* not quiet */
 
 	if (!OidIsValid(newoid))
-		return InvalidOid;
+		return InvalidObjectAddress;
+
+	ObjectAddressSet(address, CollationRelationId, newoid);
 
 	/* check that the locales can be loaded */
 	CommandCounterIncrement();
@@ -176,7 +180,7 @@ DefineCollation(List *names, List *parameters, bool if_not_exists)
 		                            NULL);
 	}
 
-	return newoid;
+	return address;
 }
 
 /*

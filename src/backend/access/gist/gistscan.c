@@ -4,7 +4,7 @@
  *	  routines to manage scans on GiST index relations
  *
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -17,19 +17,19 @@
 #include "access/gist_private.h"
 #include "access/gistscan.h"
 #include "access/relscan.h"
+#include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
 
 
 /*
- * RBTree support functions for the GISTSearchTreeItem queue
+ * Pairing heap comparison function for the GISTSearchItem queue
  */
-
 static int
-GISTSearchTreeItemComparator(const RBNode *a, const RBNode *b, void *arg)
+pairingheap_GISTSearchItem_cmp(const pairingheap_node *a, const pairingheap_node *b, void *arg)
 {
-	const GISTSearchTreeItem *sa = (const GISTSearchTreeItem *) a;
-	const GISTSearchTreeItem *sb = (const GISTSearchTreeItem *) b;
+	const GISTSearchItem *sa = (const GISTSearchItem *) a;
+	const GISTSearchItem *sb = (const GISTSearchItem *) b;
 	IndexScanDesc scan = (IndexScanDesc) arg;
 	int			i;
 
@@ -37,59 +37,16 @@ GISTSearchTreeItemComparator(const RBNode *a, const RBNode *b, void *arg)
 	for (i = 0; i < scan->numberOfOrderBys; i++)
 	{
 		if (sa->distances[i] != sb->distances[i])
-			return (sa->distances[i] > sb->distances[i]) ? 1 : -1;
+			return (sa->distances[i] < sb->distances[i]) ? 1 : -1;
 	}
+
+	/* Heap items go before inner pages, to ensure a depth-first search */
+	if (GISTSearchItemIsHeap(*sa) && !GISTSearchItemIsHeap(*sb))
+		return 1;
+	if (!GISTSearchItemIsHeap(*sa) && GISTSearchItemIsHeap(*sb))
+		return -1;
 
 	return 0;
-}
-
-static void
-GISTSearchTreeItemCombiner(RBNode *existing, const RBNode *newrb, void *arg)
-{
-	GISTSearchTreeItem *scurrent = (GISTSearchTreeItem *) existing;
-	const GISTSearchTreeItem *snew = (const GISTSearchTreeItem *) newrb;
-	GISTSearchItem *newitem = snew->head;
-
-	/* snew should have just one item in its chain */
-	Assert(newitem && newitem->next == NULL);
-
-	/*
-	 * If new item is heap tuple, it goes to front of chain; otherwise insert
-	 * it before the first index-page item, so that index pages are visited in
-	 * LIFO order, ensuring depth-first search of index pages.  See comments
-	 * in gist_private.h.
-	 */
-	if (GISTSearchItemIsHeap(*newitem))
-	{
-		newitem->next = scurrent->head;
-		scurrent->head = newitem;
-		if (scurrent->lastHeap == NULL)
-			scurrent->lastHeap = newitem;
-	}
-	else if (scurrent->lastHeap == NULL)
-	{
-		newitem->next = scurrent->head;
-		scurrent->head = newitem;
-	}
-	else
-	{
-		newitem->next = scurrent->lastHeap->next;
-		scurrent->lastHeap->next = newitem;
-	}
-}
-
-static RBNode *
-GISTSearchTreeItemAllocator(void *arg)
-{
-	IndexScanDesc scan = (IndexScanDesc) arg;
-
-	return palloc(GSTIHDRSZ + sizeof(double) * scan->numberOfOrderBys);
-}
-
-static void
-GISTSearchTreeItemDeleter(RBNode *rb, void *arg)
-{
-	pfree(rb);
 }
 
 
@@ -97,12 +54,9 @@ GISTSearchTreeItemDeleter(RBNode *rb, void *arg)
  * Index AM API functions for scanning GiST indexes
  */
 
-Datum
-gistbeginscan(PG_FUNCTION_ARGS)
+IndexScanDesc
+gistbeginscan(Relation r, int nkeys, int norderbys)
 {
-	Relation	r = (Relation) PG_GETARG_POINTER(0);
-	int			nkeys = PG_GETARG_INT32(1);
-	int			norderbys = PG_GETARG_INT32(2);
 	IndexScanDesc scan;
 	GISTSTATE  *giststate;
 	GISTScanOpaque so;
@@ -127,24 +81,36 @@ gistbeginscan(PG_FUNCTION_ARGS)
 	so->queueCxt = giststate->scanCxt;	/* see gistrescan */
 
 	/* workspaces with size dependent on numberOfOrderBys: */
-	so->tmpTreeItem = palloc(GSTIHDRSZ + sizeof(double) * scan->numberOfOrderBys);
 	so->distances = palloc(sizeof(double) * scan->numberOfOrderBys);
 	so->qual_ok = true;			/* in case there are zero keys */
+	if (scan->numberOfOrderBys > 0)
+	{
+		scan->xs_orderbyvals = palloc0(sizeof(Datum) * scan->numberOfOrderBys);
+		scan->xs_orderbynulls = palloc(sizeof(bool) * scan->numberOfOrderBys);
+		memset(scan->xs_orderbynulls, true, sizeof(bool) * scan->numberOfOrderBys);
+	}
+
+	so->killedItems = NULL;		/* until needed */
+	so->numKilled = 0;
+	so->curBlkno = InvalidBlockNumber;
+	so->curPageLSN = InvalidXLogRecPtr;
 
 	scan->opaque = so;
 
+	/*
+	 * All fields required for index-only scans are initialized in gistrescan,
+	 * as we don't know yet if we're doing an index-only scan or not.
+	 */
+
 	MemoryContextSwitchTo(oldCxt);
 
-	PG_RETURN_POINTER(scan);
+	return scan;
 }
 
-Datum
-gistrescan(PG_FUNCTION_ARGS)
+void
+gistrescan(IndexScanDesc scan, ScanKey key, int nkeys,
+		   ScanKey orderbys, int norderbys)
 {
-	IndexScanDesc scan = (IndexScanDesc) PG_GETARG_POINTER(0);
-	ScanKey		key = (ScanKey) PG_GETARG_POINTER(1);
-	ScanKey		orderbys = (ScanKey) PG_GETARG_POINTER(3);
-
 	/* nkeys and norderbys arguments are ignored */
 	GISTScanOpaque so = (GISTScanOpaque) scan->opaque;
 	bool		first_time;
@@ -186,17 +152,44 @@ gistrescan(PG_FUNCTION_ARGS)
 		first_time = false;
 	}
 
+	/*
+	 * If we're doing an index-only scan, on the first call, also initialize a
+	 * tuple descriptor to represent the returned index tuples and create a
+	 * memory context to hold them during the scan.
+	 */
+	if (scan->xs_want_itup && !scan->xs_itupdesc)
+	{
+		int			natts;
+		int			attno;
+
+		/*
+		 * The storage type of the index can be different from the original
+		 * datatype being indexed, so we cannot just grab the index's tuple
+		 * descriptor. Instead, construct a descriptor with the original data
+		 * types.
+		 */
+		natts = RelationGetNumberOfAttributes(scan->indexRelation);
+		so->giststate->fetchTupdesc = CreateTemplateTupleDesc(natts, false);
+		for (attno = 1; attno <= natts; attno++)
+		{
+			TupleDescInitEntry(so->giststate->fetchTupdesc, attno, NULL,
+							   scan->indexRelation->rd_opcintype[attno - 1],
+							   -1, 0);
+		}
+		scan->xs_itupdesc = so->giststate->fetchTupdesc;
+
+		so->pageDataCxt = AllocSetContextCreate(so->giststate->scanCxt,
+												"GiST page data context",
+												ALLOCSET_DEFAULT_MINSIZE,
+												ALLOCSET_DEFAULT_INITSIZE,
+												ALLOCSET_DEFAULT_MAXSIZE);
+	}
+
 	/* create new, empty RBTree for search queue */
 	oldCxt = MemoryContextSwitchTo(so->queueCxt);
-	so->queue = rb_create(GSTIHDRSZ + sizeof(double) * scan->numberOfOrderBys,
-						  GISTSearchTreeItemComparator,
-						  GISTSearchTreeItemCombiner,
-						  GISTSearchTreeItemAllocator,
-						  GISTSearchTreeItemDeleter,
-						  scan);
+	so->queue = pairingheap_allocate(pairingheap_GISTSearchItem_cmp, scan);
 	MemoryContextSwitchTo(oldCxt);
 
-	so->curTreeItem = NULL;
 	so->firstCall = true;
 
 	/* Update scan key, if a new one is given */
@@ -236,6 +229,10 @@ gistrescan(PG_FUNCTION_ARGS)
 		{
 			ScanKey		skey = scan->keyData + i;
 
+			/*
+			 * Copy consistent support function to ScanKey structure instead
+			 * of function implementing filtering operator.
+			 */
 			fmgr_info_copy(&(skey->sk_func),
 						   &(so->giststate->consistentFn[skey->sk_attno - 1]),
 						   so->giststate->scanCxt);
@@ -271,6 +268,8 @@ gistrescan(PG_FUNCTION_ARGS)
 		memmove(scan->orderByData, orderbys,
 				scan->numberOfOrderBys * sizeof(ScanKeyData));
 
+		so->orderByTypes = (Oid *) palloc(scan->numberOfOrderBys * sizeof(Oid));
+
 		/*
 		 * Modify the order-by key so that the Distance method is called for
 		 * all comparisons. The original operator is passed to the Distance
@@ -289,6 +288,24 @@ gistrescan(PG_FUNCTION_ARGS)
 					 GIST_DISTANCE_PROC, skey->sk_attno,
 					 RelationGetRelationName(scan->indexRelation));
 
+			/*
+			 * Look up the datatype returned by the original ordering
+			 * operator. GiST always uses a float8 for the distance function,
+			 * but the ordering operator could be anything else.
+			 *
+			 * XXX: The distance function is only allowed to be lossy if the
+			 * ordering operator's result type is float4 or float8.  Otherwise
+			 * we don't know how to return the distance to the executor.  But
+			 * we cannot check that here, as we won't know if the distance
+			 * function is lossy until it returns *recheck = true for the
+			 * first time.
+			 */
+			so->orderByTypes[i] = get_func_rettype(skey->sk_func.fn_oid);
+
+			/*
+			 * Copy distance support function to ScanKey structure instead of
+			 * function implementing ordering operator.
+			 */
 			fmgr_info_copy(&(skey->sk_func), finfo, so->giststate->scanCxt);
 
 			/* Restore prior fn_extra pointers, if not first time */
@@ -299,28 +316,11 @@ gistrescan(PG_FUNCTION_ARGS)
 		if (!first_time)
 			pfree(fn_extras);
 	}
-
-	PG_RETURN_VOID();
 }
 
-Datum
-gistmarkpos(PG_FUNCTION_ARGS)
+void
+gistendscan(IndexScanDesc scan)
 {
-	elog(ERROR, "GiST does not support mark/restore");
-	PG_RETURN_VOID();
-}
-
-Datum
-gistrestrpos(PG_FUNCTION_ARGS)
-{
-	elog(ERROR, "GiST does not support mark/restore");
-	PG_RETURN_VOID();
-}
-
-Datum
-gistendscan(PG_FUNCTION_ARGS)
-{
-	IndexScanDesc scan = (IndexScanDesc) PG_GETARG_POINTER(0);
 	GISTScanOpaque so = (GISTScanOpaque) scan->opaque;
 
 	/*
@@ -328,6 +328,4 @@ gistendscan(PG_FUNCTION_ARGS)
 	 * as well as the queueCxt if there is a separate context for it.
 	 */
 	freeGISTstate(so->giststate);
-
-	PG_RETURN_VOID();
 }

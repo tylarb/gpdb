@@ -30,19 +30,30 @@
 CATALOG(gp_distribution_policy,5002) BKI_WITHOUT_OIDS
 {
 	Oid			localoid;
-	int16		attrnums[1];
 	char		policytype; /* distribution policy type */
 	int32		numsegments;
+#ifdef CATALOG_VARLEN			/* variable-length fields start here */
+	int2vector	distkey;		/* column numbers of distribution key cols */
+	oidvector	distclass;		/* opclass identifiers */
+#endif
 } FormData_gp_policy;
 
 /* GPDB added foreign key definitions for gpcheckcat. */
 FOREIGN_KEY(localoid REFERENCES pg_class(oid));
 
-#define Natts_gp_policy		4
-#define Anum_gp_policy_localoid	1
-#define Anum_gp_policy_attrnums	2
-#define Anum_gp_policy_type	3
-#define Anum_gp_policy_numsegments	4
+/* ----------------
+ *		Form_gp_policy corresponds to a pointer to a tuple with
+ *		the format of gp_distribution_policy relation.
+ * ----------------
+ */
+typedef FormData_gp_policy *Form_gp_policy;
+
+#define Natts_gp_policy		5
+#define Anum_gp_policy_localoid		1
+#define Anum_gp_policy_policytype	2
+#define Anum_gp_policy_numsegments	3
+#define Anum_gp_policy_distkey		4
+#define Anum_gp_policy_distclass	5
 
 /*
  * Symbolic values for Anum_gp_policy_type column
@@ -51,27 +62,28 @@ FOREIGN_KEY(localoid REFERENCES pg_class(oid));
 #define SYM_POLICYTYPE_REPLICATED 'r'
 
 /*
- * A magic number, setting GpPolicy.numsegments to this value will cause a
- * failed assertion at runtime, which allows developers to debug with gdb.
+ * Default set of segments, the value is controlled by the variable
+ * gp_create_table_default_numsegments.
  */
-#define __GP_POLICY_EVIL_NUMSEGMENTS		(666)
+#define GP_POLICY_DEFAULT_NUMSEGMENTS()		\
+( gp_create_table_default_numsegments == GP_DEFAULT_NUMSEGMENTS_FULL    ? getgpsegmentCount() \
+: gp_create_table_default_numsegments == GP_DEFAULT_NUMSEGMENTS_RANDOM  ? (1 + random() % getgpsegmentCount()) \
+: gp_create_table_default_numsegments == GP_DEFAULT_NUMSEGMENTS_MINIMAL ? 1 \
+: gp_create_table_default_numsegments )
 
 /*
- * All the segments.  getgpsegmentCount() should not be used directly as it
- * will return 0 in utility mode, but a valid numsegments should always be
- * greater than 0.
- */
-#define GP_POLICY_ALL_NUMSEGMENTS			Max(1, getgpsegmentCount())
-
-/*
- * The segments suitable for Entry locus, which include both master and all
- * the segments.
+ * The the default numsegments policies when creating a table.
  *
- * FIXME: in fact numsegments only describe a range of segments from 0 to
- * `numsegments-1`, master is not described by it at all.  So far this does
- * not matter.
+ * - FULL: all the segments;
+ * - RANDOM: pick a random set of segments each time;
+ * - MINIMAL: the minimal set of segments;
  */
-#define GP_POLICY_ENTRY_NUMSEGMENTS			GP_POLICY_ALL_NUMSEGMENTS
+enum
+{
+	GP_DEFAULT_NUMSEGMENTS_FULL    = -1,
+	GP_DEFAULT_NUMSEGMENTS_RANDOM  = -2,
+	GP_DEFAULT_NUMSEGMENTS_MINIMAL = -3,
+};
 
 /*
  * GpPolicyType represents a type of policy under which a relation's
@@ -94,14 +106,20 @@ typedef enum GpPolicyType
  */
 typedef struct GpPolicy
 {
-	NodeTag         type;
+	NodeTag		type;
 	GpPolicyType ptype;
 	int			numsegments;
 
 	/* These fields apply to POLICYTYPE_PARTITIONED. */
 	int			nattrs;
-	AttrNumber	*attrs;		/* pointer to the first of nattrs attribute numbers.  */
+	AttrNumber *attrs;		/* array of attribute numbers  */
+	Oid		   *opclasses;	/* and their opclasses */
 } GpPolicy;
+
+/*
+ * Global Variables
+ */
+extern int	gp_create_table_default_numsegments;
 
 /*
  * GpPolicyCopy -- Return a copy of a GpPolicy object.
@@ -149,7 +167,7 @@ extern bool GpPolicyIsEntry(const GpPolicy *policy);
 extern GpPolicy *makeGpPolicy(GpPolicyType ptype, int nattrs, int numsegments);
 extern GpPolicy *createReplicatedGpPolicy(int numsegments);
 extern GpPolicy *createRandomPartitionedPolicy(int numsegments);
-extern GpPolicy *createHashPartitionedPolicy(List *keys, int numsegments);
+extern GpPolicy *createHashPartitionedPolicy(List *keys, List *opclasses, int numsegments);
 
 extern bool IsReplicatedTable(Oid relid);
 

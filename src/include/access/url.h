@@ -14,6 +14,8 @@
 #ifndef URL_H
 #define URL_H
 
+#include "access/extprotocol.h"
+
 #include "commands/copy.h"
 
 /*
@@ -55,20 +57,15 @@ typedef struct extvar_t
 	char GP_XID[TMGIDSIZE];		/* global transaction id */
 	char GP_CID[10];		/* command id */
 	char GP_SN[10];		/* scan number */
-	char GP_SEGMENT_ID[6];  /*segments content id*/
-	char GP_SEG_PORT[10];
-	char GP_SESSION_ID[10];  /* session id */
- 	char GP_SEGMENT_COUNT[6]; /* total number of (primary) segs in the system */
+	char GP_SEGMENT_ID[11];  /*segments content id*/
+	char GP_SEG_PORT[11];
+	char GP_SESSION_ID[11];  /* session id */
+	char GP_SEGMENT_COUNT[11]; /* total number of (primary) segs in the system */
  	char GP_CSVOPT[13]; /* "m.x...q...h." former -q, -h and -x options for gpfdist.*/
-
- 	/* Hadoop Specific env var */
- 	char* GP_HADOOP_CONN_JARDIR;
- 	char* GP_HADOOP_CONN_VERSION;
- 	char* GP_HADOOP_HOME;
 
  	/* EOL vars */
  	char* GP_LINE_DELIM_STR;
- 	char GP_LINE_DELIM_LENGTH[8];
+	char GP_LINE_DELIM_LENGTH[11];
 	char *GP_QUERY_STRING;
 } extvar_t;
 
@@ -77,7 +74,7 @@ typedef struct extvar_t
 #define EXEC_URL_PREFIX "execute:"
 
 /* exported functions */
-extern URL_FILE *url_fopen(char *url, bool forwrite, extvar_t *ev, CopyState pstate, List* filter_quals);
+extern URL_FILE *url_fopen(char *url, bool forwrite, extvar_t *ev, CopyState pstate, ExternalSelectDesc desc);
 extern void url_fclose(URL_FILE *file, bool failOnError, const char *relname);
 extern bool url_feof(URL_FILE *file, int bytesread);
 extern bool url_ferror(URL_FILE *file, int bytesread, char *ebuf, int ebuflen);
@@ -107,7 +104,7 @@ extern bool url_execute_ferror(URL_FILE *file, int bytesread, char *ebuf, int eb
 extern size_t url_execute_fread(void *ptr, size_t size, URL_FILE *file, CopyState pstate);
 extern size_t url_execute_fwrite(void *ptr, size_t size, URL_FILE *file, CopyState pstate);
 
-extern URL_FILE *url_custom_fopen(char *url, bool forwrite, extvar_t *ev, CopyState pstate, List* filter_quals);
+extern URL_FILE *url_custom_fopen(char *url, bool forwrite, extvar_t *ev, CopyState pstate, ExternalSelectDesc desc);
 extern void url_custom_fclose(URL_FILE *file, bool failOnError, const char *relname);
 extern bool url_custom_feof(URL_FILE *file, int bytesread);
 extern bool url_custom_ferror(URL_FILE *file, int bytesread, char *ebuf, int ebuflen);

@@ -1,11 +1,11 @@
 /*-------------------------------------------------------------------------
  *
  * selfuncs.h
- *	  Selectivity functions and index cost estimation functions for
- *	  standard operators and index access methods.
+ *	  Selectivity functions for standard operators, and assorted
+ *	  infrastructure for selectivity and cost estimation.
  *
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/utils/selfuncs.h
@@ -76,6 +76,7 @@ typedef struct VariableStatData
 	Oid			atttype;		/* type to pass to get_attstatsslot */
 	int32		atttypmod;		/* typmod to pass to get_attstatsslot */
 	bool		isunique;		/* matches unique index or DISTINCT clause */
+	bool		acl_ok;			/* result of ACL check on table or column */
 } VariableStatData;
 
 /* get the pg_statistic tuple, or NULL if none */
@@ -99,6 +100,48 @@ typedef enum
 	Pattern_Prefix_None, Pattern_Prefix_Partial, Pattern_Prefix_Exact
 } Pattern_Prefix_Status;
 
+/*
+ * deconstruct_indexquals is a simple function to examine the indexquals
+ * attached to a proposed IndexPath.  It returns a list of IndexQualInfo
+ * structs, one per qual expression.
+ */
+typedef struct
+{
+	RestrictInfo *rinfo;		/* the indexqual itself */
+	int			indexcol;		/* zero-based index column number */
+	bool		varonleft;		/* true if index column is on left of qual */
+	Oid			clause_op;		/* qual's operator OID, if relevant */
+	Node	   *other_operand;	/* non-index operand of qual's operator */
+} IndexQualInfo;
+
+/*
+ * genericcostestimate is a general-purpose estimator that can be used for
+ * most index types.  In some cases we use genericcostestimate as the base
+ * code and then incorporate additional index-type-specific knowledge in
+ * the type-specific calling function.  To avoid code duplication, we make
+ * genericcostestimate return a number of intermediate values as well as
+ * its preliminary estimates of the output cost values.  The GenericCosts
+ * struct includes all these values.
+ *
+ * Callers should initialize all fields of GenericCosts to zero.  In addition,
+ * they can set numIndexTuples to some positive value if they have a better
+ * than default way of estimating the number of leaf index tuples visited.
+ */
+typedef struct
+{
+	/* These are the values the cost estimator must return to the planner */
+	Cost		indexStartupCost;		/* index-related startup cost */
+	Cost		indexTotalCost; /* total index-related scan cost */
+	Selectivity indexSelectivity;		/* selectivity of index */
+	double		indexCorrelation;		/* order correlation of index */
+
+	/* Intermediate values we obtain along the way */
+	double		numIndexPages;	/* number of leaf pages visited */
+	double		numIndexTuples; /* number of leaf tuples visited */
+	double		spc_random_page_cost;	/* relevant random_page_cost value */
+	double		num_sa_scans;	/* # indexscans from ScalarArrayOps */
+} GenericCosts;
+
 /* Hooks for plugins to get control when we ask for stats */
 typedef bool (*get_relation_stats_hook_type) (PlannerInfo *root,
 														  RangeTblEntry *rte,
@@ -115,6 +158,7 @@ extern PGDLLIMPORT get_index_stats_hook_type get_index_stats_hook;
 
 extern void examine_variable(PlannerInfo *root, Node *node, int varRelid,
 				 VariableStatData *vardata);
+extern bool statistic_proc_security_check(VariableStatData *vardata, Oid func_oid);
 extern bool get_restriction_variable(PlannerInfo *root, List *args,
 						 int varRelid,
 						 VariableStatData *vardata, Node **other,
@@ -133,7 +177,7 @@ extern double histogram_selectivity(VariableStatData *vardata, FmgrInfo *opproc,
 					  Datum constval, bool varonleft,
 					  int min_hist_size, int n_skip,
 					  int *hist_size);
-extern double convert_timevalue_to_scalar(Datum value, Oid typid);
+extern double convert_timevalue_to_scalar(Datum value, Oid typid, bool *failure);
 
 extern Pattern_Prefix_Status pattern_fixed_prefix(Const *patt,
 					 Pattern_Type ptype,
@@ -169,6 +213,7 @@ extern Datum icregexnejoinsel(PG_FUNCTION_ARGS);
 extern Datum nlikejoinsel(PG_FUNCTION_ARGS);
 extern Datum icnlikejoinsel(PG_FUNCTION_ARGS);
 
+extern Selectivity boolvarsel(PlannerInfo *root, Node *arg, int varRelid);
 extern Selectivity booltestsel(PlannerInfo *root, BoolTestType booltesttype,
 			Node *arg, int varRelid,
 			JoinType jointype, SpecialJoinInfo *sjinfo);
@@ -190,17 +235,16 @@ extern void mergejoinscansel(PlannerInfo *root, Node *clause,
 				 Selectivity *rightstart, Selectivity *rightend);
 
 extern double estimate_num_groups(PlannerInfo *root, List *groupExprs,
-					double input_rows);
+					double input_rows, List **pgset);
 
 extern Selectivity estimate_hash_bucketsize(PlannerInfo *root, Node *hashkey,
-						 double nbuckets);
+											double nbuckets, Path *path);
 
-extern Datum btcostestimate(PG_FUNCTION_ARGS);
-extern Datum hashcostestimate(PG_FUNCTION_ARGS);
-extern Datum gistcostestimate(PG_FUNCTION_ARGS);
-extern Datum spgcostestimate(PG_FUNCTION_ARGS);
-extern Datum gincostestimate(PG_FUNCTION_ARGS);
-extern Datum bmcostestimate(PG_FUNCTION_ARGS);
+extern List *deconstruct_indexquals(IndexPath *path);
+extern void genericcostestimate(PlannerInfo *root, IndexPath *path,
+					double loop_count,
+					List *qinfos,
+					GenericCosts *costs);
 
 /* Functions in array_selfuncs.c */
 
@@ -210,5 +254,7 @@ extern Selectivity scalararraysel_containment(PlannerInfo *root,
 						   int varRelid);
 extern Datum arraycontsel(PG_FUNCTION_ARGS);
 extern Datum arraycontjoinsel(PG_FUNCTION_ARGS);
+extern double estimate_num_groups_per_segment(double groupNum, double numPerGroup, double numsegments);
+extern double estimate_num_groups_across_segments(double groupNum, double numPerGroup, double numsegments);
 
 #endif   /* SELFUNCS_H */

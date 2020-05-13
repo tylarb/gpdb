@@ -613,6 +613,9 @@ SELECT to_timestamp('19971116', 'YYYYMMDD');
 
 SELECT to_timestamp('20000-1116', 'YYYY-MMDD');
 
+SELECT to_timestamp('1997 AD 11 16', 'YYYY BC MM DD');
+SELECT to_timestamp('1997 BC 11 16', 'YYYY BC MM DD');
+
 SELECT to_timestamp('9-1116', 'Y-MMDD');
 
 SELECT to_timestamp('95-1116', 'YY-MMDD');
@@ -641,6 +644,9 @@ SELECT to_timestamp(' 2005 03 02', 'YYYYMMDD');
 
 SELECT to_timestamp('  20050302', 'YYYYMMDD');
 
+SELECT to_timestamp('2011-12-18 11:38 AM', 'YYYY-MM-DD HH12:MI PM');
+SELECT to_timestamp('2011-12-18 11:38 PM', 'YYYY-MM-DD HH12:MI PM');
+
 --
 -- Check handling of multiple spaces in format and/or input
 --
@@ -662,7 +668,7 @@ SELECT to_date('2011  12 18', 'YYYY  MM DD');
 SELECT to_date('2011   12 18', 'YYYY  MM DD');
 
 --
--- Check errors for some incorrect usages of to_timestamp()
+-- Check errors for some incorrect usages of to_timestamp() and to_date()
 --
 
 -- Mixture of date conventions (ISO week and Gregorian):
@@ -683,6 +689,28 @@ SELECT to_timestamp('199711xy', 'YYYYMMDD');
 -- Input that doesn't fit in an int:
 SELECT to_timestamp('10000000000', 'FMYYYY');
 
+-- Out-of-range and not-quite-out-of-range fields:
+SELECT to_timestamp('2016-06-13 25:00:00', 'YYYY-MM-DD HH24:MI:SS');
+SELECT to_timestamp('2016-06-13 15:60:00', 'YYYY-MM-DD HH24:MI:SS');
+SELECT to_timestamp('2016-06-13 15:50:60', 'YYYY-MM-DD HH24:MI:SS');
+SELECT to_timestamp('2016-06-13 15:50:55', 'YYYY-MM-DD HH24:MI:SS');  -- ok
+SELECT to_timestamp('2016-06-13 15:50:55', 'YYYY-MM-DD HH:MI:SS');
+SELECT to_timestamp('2016-13-01 15:50:55', 'YYYY-MM-DD HH24:MI:SS');
+SELECT to_timestamp('2016-02-30 15:50:55', 'YYYY-MM-DD HH24:MI:SS');
+SELECT to_timestamp('2016-02-29 15:50:55', 'YYYY-MM-DD HH24:MI:SS');  -- ok
+SELECT to_timestamp('2015-02-29 15:50:55', 'YYYY-MM-DD HH24:MI:SS');
+SELECT to_timestamp('2015-02-11 86000', 'YYYY-MM-DD SSSS');  -- ok
+SELECT to_timestamp('2015-02-11 86400', 'YYYY-MM-DD SSSS');
+SELECT to_date('2016-13-10', 'YYYY-MM-DD');
+SELECT to_date('2016-02-30', 'YYYY-MM-DD');
+SELECT to_date('2016-02-29', 'YYYY-MM-DD');  -- ok
+SELECT to_date('2015-02-29', 'YYYY-MM-DD');
+SELECT to_date('2015 365', 'YYYY DDD');  -- ok
+SELECT to_date('2015 366', 'YYYY DDD');
+SELECT to_date('2016 365', 'YYYY DDD');  -- ok
+SELECT to_date('2016 366', 'YYYY DDD');  -- ok
+SELECT to_date('2016 367', 'YYYY DDD');
+
 --
 -- Check behavior with SQL-style fixed-GMT-offset time zone (cf bug #8572)
 --
@@ -699,7 +727,6 @@ SELECT to_char('2012-12-12 12:00'::timestamptz, 'YYYY-MM-DD HH:MI:SS TZ');
 
 RESET TIME ZONE;
 
-
 -- Clean up
 DROP TABLE abstime_horology_tbl;
 DROP TABLE interval_horology_tbl;
@@ -708,3 +735,12 @@ DROP TABLE time_horology_tbl;
 DROP TABLE timestamp_horology_tbl;
 DROP TABLE timestamptz_horology_tbl;
 DROP TABLE timetz_horology_tbl;
+
+--
+-- Drop tables that we don't want to keep because they interfere with
+-- testing pg_upgrade to v12 and up
+--
+
+DROP TABLE abstime_tbl;
+DROP TABLE reltime_tbl;
+DROP TABLE tinterval_tbl;

@@ -3,7 +3,7 @@
  * acl.c
  *	  Basic access control list data structures manipulation routines.
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -17,6 +17,7 @@
 #include <ctype.h>
 
 #include "access/htup_details.h"
+#include "catalog/catalog.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_authid.h"
 #include "catalog/pg_auth_members.h"
@@ -118,7 +119,6 @@ static AclMode convert_role_priv_string(text *priv_type_text);
 static AclResult pg_role_aclcheck(Oid role_oid, Oid roleid, AclMode mode);
 
 static void RoleMembershipCacheCallback(Datum arg, int cacheid, uint32 hashvalue);
-static Oid	get_role_oid_or_public(const char *rolname);
 
 
 /*
@@ -723,7 +723,9 @@ hash_aclitem(PG_FUNCTION_ARGS)
  * acldefault()  --- create an ACL describing default access permissions
  *
  * Change this routine if you want to alter the default access policy for
- * newly-created objects (or any object with a NULL acl entry).
+ * newly-created objects (or any object with a NULL acl entry).  When
+ * you make a change here, don't forget to update the GRANT man page,
+ * which explains all the default permissions.
  *
  * Note that these are the hard-wired "defaults" that are used in the
  * absence of any pg_default_acl entry.
@@ -890,6 +892,9 @@ acldefault_sql(PG_FUNCTION_ARGS)
 			break;
 		case 'T':
 			objtype = ACL_OBJECT_TYPE;
+			break;
+		case 'E':
+			objtype = ACL_OBJECT_EXTPROTOCOL;
 			break;
 		default:
 			elog(ERROR, "unrecognized objtype abbreviation: %c", objtypec);
@@ -2305,8 +2310,11 @@ convert_sequence_priv_string(text *priv_type_text)
 {
 	static const priv_map sequence_priv_map[] = {
 		{"USAGE", ACL_USAGE},
+		{"USAGE WITH GRANT OPTION", ACL_GRANT_OPTION_FOR(ACL_USAGE)},
 		{"SELECT", ACL_SELECT},
+		{"SELECT WITH GRANT OPTION", ACL_GRANT_OPTION_FOR(ACL_SELECT)},
 		{"UPDATE", ACL_UPDATE},
+		{"UPDATE WITH GRANT OPTION", ACL_GRANT_OPTION_FOR(ACL_UPDATE)},
 		{NULL, 0}
 	};
 
@@ -2535,8 +2543,12 @@ has_any_column_privilege_id_id(PG_FUNCTION_ARGS)
  *
  *		The result is a boolean value: true if user has the indicated
  *		privilege, false if not.  The variants that take a relation OID
- *		and an integer attnum return NULL (rather than throwing an error)
- *		if the column doesn't exist or is dropped.
+ *		return NULL (rather than throwing an error) if that relation OID
+ *		doesn't exist.  Likewise, the variants that take an integer attnum
+ *		return NULL (rather than throwing an error) if there is no such
+ *		pg_attribute entry.  All variants return NULL if an attisdropped
+ *		column is selected.  These rules are meant to avoid unnecessary
+ *		failures in queries that scan pg_attribute.
  */
 
 /*
@@ -2552,6 +2564,12 @@ column_privilege_check(Oid tableoid, AttrNumber attnum,
 	AclResult	aclresult;
 	HeapTuple	attTuple;
 	Form_pg_attribute attributeForm;
+
+	/*
+	 * If convert_column_name failed, we can just return -1 immediately.
+	 */
+	if (attnum == InvalidAttrNumber)
+		return -1;
 
 	/*
 	 * First check if we have the privilege at the table level.  We check
@@ -2968,21 +2986,59 @@ has_column_privilege_id_attnum(PG_FUNCTION_ARGS)
 
 /*
  * Given a table OID and a column name expressed as a string, look it up
- * and return the column number
+ * and return the column number.  Returns InvalidAttrNumber in cases
+ * where caller should return NULL instead of failing.
  */
 static AttrNumber
 convert_column_name(Oid tableoid, text *column)
 {
-	AttrNumber	attnum;
 	char	   *colname;
+	HeapTuple	attTuple;
+	AttrNumber	attnum;
 
 	colname = text_to_cstring(column);
-	attnum = get_attnum(tableoid, colname);
-	if (attnum == InvalidAttrNumber)
-		ereport(ERROR,
-				(errcode(ERRCODE_UNDEFINED_COLUMN),
-				 errmsg("column \"%s\" of relation \"%s\" does not exist",
-						colname, get_rel_name(tableoid))));
+
+	/*
+	 * We don't use get_attnum() here because it will report that dropped
+	 * columns don't exist.  We need to treat dropped columns differently from
+	 * nonexistent columns.
+	 */
+	attTuple = SearchSysCache2(ATTNAME,
+							   ObjectIdGetDatum(tableoid),
+							   CStringGetDatum(colname));
+	if (HeapTupleIsValid(attTuple))
+	{
+		Form_pg_attribute attributeForm;
+
+		attributeForm = (Form_pg_attribute) GETSTRUCT(attTuple);
+		/* We want to return NULL for dropped columns */
+		if (attributeForm->attisdropped)
+			attnum = InvalidAttrNumber;
+		else
+			attnum = attributeForm->attnum;
+		ReleaseSysCache(attTuple);
+	}
+	else
+	{
+		char	   *tablename = get_rel_name(tableoid);
+
+		/*
+		 * If the table OID is bogus, or it's just been dropped, we'll get
+		 * NULL back.  In such cases we want has_column_privilege to return
+		 * NULL too, so just return InvalidAttrNumber.
+		 */
+		if (tablename != NULL)
+		{
+			/* tableoid exists, colname does not, so throw error */
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_COLUMN),
+					 errmsg("column \"%s\" of relation \"%s\" does not exist",
+							colname, tablename)));
+		}
+		/* tableoid doesn't exist, so act like attisdropped case */
+		attnum = InvalidAttrNumber;
+	}
+
 	pfree(colname);
 	return attnum;
 }
@@ -3286,6 +3342,9 @@ has_foreign_data_wrapper_privilege_name_id(PG_FUNCTION_ARGS)
 	roleid = get_role_oid_or_public(NameStr(*username));
 	mode = convert_foreign_data_wrapper_priv_string(priv_type_text);
 
+	if (!SearchSysCacheExists1(FOREIGNDATAWRAPPEROID, ObjectIdGetDatum(fdwid)))
+		PG_RETURN_NULL();
+
 	aclresult = pg_foreign_data_wrapper_aclcheck(fdwid, roleid, mode);
 
 	PG_RETURN_BOOL(aclresult == ACLCHECK_OK);
@@ -3308,6 +3367,9 @@ has_foreign_data_wrapper_privilege_id(PG_FUNCTION_ARGS)
 
 	roleid = GetUserId();
 	mode = convert_foreign_data_wrapper_priv_string(priv_type_text);
+
+	if (!SearchSysCacheExists1(FOREIGNDATAWRAPPEROID, ObjectIdGetDatum(fdwid)))
+		PG_RETURN_NULL();
 
 	aclresult = pg_foreign_data_wrapper_aclcheck(fdwid, roleid, mode);
 
@@ -3352,6 +3414,9 @@ has_foreign_data_wrapper_privilege_id_id(PG_FUNCTION_ARGS)
 	AclResult	aclresult;
 
 	mode = convert_foreign_data_wrapper_priv_string(priv_type_text);
+
+	if (!SearchSysCacheExists1(FOREIGNDATAWRAPPEROID, ObjectIdGetDatum(fdwid)))
+		PG_RETURN_NULL();
 
 	aclresult = pg_foreign_data_wrapper_aclcheck(fdwid, roleid, mode);
 
@@ -4052,6 +4117,9 @@ has_server_privilege_name_id(PG_FUNCTION_ARGS)
 	roleid = get_role_oid_or_public(NameStr(*username));
 	mode = convert_server_priv_string(priv_type_text);
 
+	if (!SearchSysCacheExists1(FOREIGNSERVEROID, ObjectIdGetDatum(serverid)))
+		PG_RETURN_NULL();
+
 	aclresult = pg_foreign_server_aclcheck(serverid, roleid, mode);
 
 	PG_RETURN_BOOL(aclresult == ACLCHECK_OK);
@@ -4074,6 +4142,9 @@ has_server_privilege_id(PG_FUNCTION_ARGS)
 
 	roleid = GetUserId();
 	mode = convert_server_priv_string(priv_type_text);
+
+	if (!SearchSysCacheExists1(FOREIGNSERVEROID, ObjectIdGetDatum(serverid)))
+		PG_RETURN_NULL();
 
 	aclresult = pg_foreign_server_aclcheck(serverid, roleid, mode);
 
@@ -4118,6 +4189,9 @@ has_server_privilege_id_id(PG_FUNCTION_ARGS)
 	AclResult	aclresult;
 
 	mode = convert_server_priv_string(priv_type_text);
+
+	if (!SearchSysCacheExists1(FOREIGNSERVEROID, ObjectIdGetDatum(serverid)))
+		PG_RETURN_NULL();
 
 	aclresult = pg_foreign_server_aclcheck(serverid, roleid, mode);
 
@@ -4234,6 +4308,9 @@ has_tablespace_privilege_name_id(PG_FUNCTION_ARGS)
 	roleid = get_role_oid_or_public(NameStr(*username));
 	mode = convert_tablespace_priv_string(priv_type_text);
 
+	if (!SearchSysCacheExists1(TABLESPACEOID, ObjectIdGetDatum(tablespaceoid)))
+		PG_RETURN_NULL();
+
 	aclresult = pg_tablespace_aclcheck(tablespaceoid, roleid, mode);
 
 	PG_RETURN_BOOL(aclresult == ACLCHECK_OK);
@@ -4256,6 +4333,9 @@ has_tablespace_privilege_id(PG_FUNCTION_ARGS)
 
 	roleid = GetUserId();
 	mode = convert_tablespace_priv_string(priv_type_text);
+
+	if (!SearchSysCacheExists1(TABLESPACEOID, ObjectIdGetDatum(tablespaceoid)))
+		PG_RETURN_NULL();
 
 	aclresult = pg_tablespace_aclcheck(tablespaceoid, roleid, mode);
 
@@ -4300,6 +4380,9 @@ has_tablespace_privilege_id_id(PG_FUNCTION_ARGS)
 	AclResult	aclresult;
 
 	mode = convert_tablespace_priv_string(priv_type_text);
+
+	if (!SearchSysCacheExists1(TABLESPACEOID, ObjectIdGetDatum(tablespaceoid)))
+		PG_RETURN_NULL();
 
 	aclresult = pg_tablespace_aclcheck(tablespaceoid, roleid, mode);
 
@@ -5023,7 +5106,7 @@ check_is_member_of_role(Oid member, Oid role)
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 				 errmsg("must be member of role \"%s\"",
-						GetUserNameFromId(role))));
+						GetUserNameFromId(role, false))));
 }
 
 /*
@@ -5250,7 +5333,7 @@ select_best_grantor(Oid roleId, AclMode privileges,
 /*
  * get_role_oid - Given a role name, look up the role's OID.
  *
- * If missing_ok is false, throw an error if tablespace name not found.  If
+ * If missing_ok is false, throw an error if role name not found.  If
  * true, just return InvalidOid.
  */
 Oid
@@ -5270,11 +5353,164 @@ get_role_oid(const char *rolname, bool missing_ok)
  * get_role_oid_or_public - As above, but return ACL_ID_PUBLIC if the
  *		role name is "public".
  */
-static Oid
+Oid
 get_role_oid_or_public(const char *rolname)
 {
 	if (strcmp(rolname, "public") == 0)
 		return ACL_ID_PUBLIC;
 
 	return get_role_oid(rolname, false);
+}
+
+/*
+ * Given a RoleSpec node, return the OID it corresponds to.  If missing_ok is
+ * true, return InvalidOid if the role does not exist.
+ *
+ * PUBLIC is always disallowed here.  Routines wanting to handle the PUBLIC
+ * case must check the case separately.
+ */
+Oid
+get_rolespec_oid(const Node *node, bool missing_ok)
+{
+	RoleSpec   *role;
+	Oid			oid;
+
+	if (!IsA(node, RoleSpec))
+		elog(ERROR, "invalid node type %d", node->type);
+
+	role = (RoleSpec *) node;
+	switch (role->roletype)
+	{
+		case ROLESPEC_CSTRING:
+			Assert(role->rolename);
+			oid = get_role_oid(role->rolename, missing_ok);
+			break;
+
+		case ROLESPEC_CURRENT_USER:
+			oid = GetUserId();
+			break;
+
+		case ROLESPEC_SESSION_USER:
+			oid = GetSessionUserId();
+			break;
+
+		case ROLESPEC_PUBLIC:
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_OBJECT),
+					 errmsg("role \"%s\" does not exist", "public")));
+			oid = InvalidOid;	/* make compiler happy */
+			break;
+
+		default:
+			elog(ERROR, "unexpected role type %d", role->roletype);
+	}
+
+	return oid;
+}
+
+/*
+ * Given a RoleSpec node, return the pg_authid HeapTuple it corresponds to.
+ * Caller must ReleaseSysCache when done with the result tuple.
+ */
+HeapTuple
+get_rolespec_tuple(const Node *node)
+{
+	RoleSpec   *role;
+	HeapTuple	tuple;
+
+	role = (RoleSpec *) node;
+	if (!IsA(node, RoleSpec))
+		elog(ERROR, "invalid node type %d", node->type);
+
+	switch (role->roletype)
+	{
+		case ROLESPEC_CSTRING:
+			Assert(role->rolename);
+			tuple = SearchSysCache1(AUTHNAME, CStringGetDatum(role->rolename));
+			if (!HeapTupleIsValid(tuple))
+				ereport(ERROR,
+						(errcode(ERRCODE_UNDEFINED_OBJECT),
+					  errmsg("role \"%s\" does not exist", role->rolename)));
+			break;
+
+		case ROLESPEC_CURRENT_USER:
+			tuple = SearchSysCache1(AUTHOID, GetUserId());
+			if (!HeapTupleIsValid(tuple))
+				elog(ERROR, "cache lookup failed for role %u", GetUserId());
+			break;
+
+		case ROLESPEC_SESSION_USER:
+			tuple = SearchSysCache1(AUTHOID, GetSessionUserId());
+			if (!HeapTupleIsValid(tuple))
+				elog(ERROR, "cache lookup failed for role %u", GetSessionUserId());
+			break;
+
+		case ROLESPEC_PUBLIC:
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_OBJECT),
+					 errmsg("role \"%s\" does not exist", "public")));
+			tuple = NULL;		/* make compiler happy */
+			break;
+
+		default:
+			elog(ERROR, "unexpected role type %d", role->roletype);
+	}
+
+	return tuple;
+}
+
+/*
+ * Given a RoleSpec, returns a palloc'ed copy of the corresponding role's name.
+ */
+char *
+get_rolespec_name(const Node *node)
+{
+	HeapTuple	tp;
+	Form_pg_authid authForm;
+	char	   *rolename;
+
+	tp = get_rolespec_tuple(node);
+	authForm = (Form_pg_authid) GETSTRUCT(tp);
+	rolename = pstrdup(NameStr(authForm->rolname));
+	ReleaseSysCache(tp);
+
+	return rolename;
+}
+
+/*
+ * Given a RoleSpec, throw an error if the name is reserved, using detail_msg,
+ * if provided.
+ *
+ * If node is NULL, no error is thrown.  If detail_msg is NULL then no detail
+ * message is provided.
+ */
+void
+check_rolespec_name(const Node *node, const char *detail_msg)
+{
+	RoleSpec   *role;
+
+	if (!node)
+		return;
+
+	role = (RoleSpec *) node;
+
+	Assert(IsA(node, RoleSpec));
+
+	if (role->roletype != ROLESPEC_CSTRING)
+		return;
+
+	if (IsReservedName(role->rolename))
+	{
+		if (detail_msg)
+			ereport(ERROR,
+					(errcode(ERRCODE_RESERVED_NAME),
+					 errmsg("role name \"%s\" is reserved",
+							role->rolename),
+					 errdetail("%s", detail_msg)));
+		else
+			ereport(ERROR,
+					(errcode(ERRCODE_RESERVED_NAME),
+					 errmsg("role name \"%s\" is reserved",
+							role->rolename)));
+	}
 }

@@ -2395,27 +2395,25 @@ from orca.bar1 inner join orca.bar2 on (bar1.x2 = bar2.x2) order by bar1.x1;
  Sort  (cost=0.00..1765423.13 rows=7 width=8)
    Sort Key: bar1.x1
    ->  Gather Motion 3:1  (slice4; segments: 3)  (cost=0.00..1765423.13 rows=20 width=8)
-         ->  Result  (cost=0.00..1765423.13 rows=7 width=8)
-               ->  Hash Join  (cost=0.00..862.00 rows=7 width=12)
-                     Hash Cond: bar1.x2 = bar2.x2
-                     ->  Redistribute Motion 3:3  (slice1; segments: 3)  (cost=0.00..431.00 rows=7 width=8)
-                           Hash Key: bar1.x2
-                           ->  Table Scan on bar1  (cost=0.00..431.00 rows=7 width=8)
-                     ->  Hash  (cost=431.00..431.00 rows=10 width=4)
-                           ->  Redistribute Motion 3:3  (slice2; segments: 3)  (cost=0.00..431.00 rows=10 width=4)
-                                 Hash Key: bar2.x2
-                                 ->  Table Scan on bar2  (cost=0.00..431.00 rows=10 width=4)
+         ->  Hash Join  (cost=0.00..862.00 rows=7 width=12)
+               Hash Cond: (bar1.x2 = bar2.x2)
+               ->  Redistribute Motion 3:3  (slice1; segments: 3)  (cost=0.00..431.00 rows=7 width=8)
+                     Hash Key: bar1.x2
+                     ->  Seq Scan on bar1  (cost=0.00..431.00 rows=7 width=8)
+               ->  Hash  (cost=431.00..431.00 rows=10 width=4)
+                     ->  Redistribute Motion 3:3  (slice2; segments: 3)  (cost=0.00..431.00 rows=10 width=4)
+                           Hash Key: bar2.x2
+                           ->  Seq Scan on bar2  (cost=0.00..431.00 rows=10 width=4)
                SubPlan 1
                  ->  Result  (cost=0.00..431.02 rows=1 width=4)
                        ->  Result  (cost=0.00..431.02 rows=1 width=1)
-                             One-Time Filter: $0 = $1
-                             Filter: $0::double precision = random() AND foo.x2 = $1
+                             One-Time Filter: (bar1.x2 = bar2.x2)
+                             Filter: (((bar1.x2)::double precision = random()) AND (foo.x2 = bar2.x2))
                              ->  Materialize  (cost=0.00..431.00 rows=10 width=4)
                                    ->  Broadcast Motion 3:3  (slice3; segments: 3)  (cost=0.00..431.00 rows=10 width=4)
-                                         ->  Table Scan on foo  (cost=0.00..431.00 rows=4 width=4)
- Settings:  optimizer_segments=3
- Optimizer status: PQO version 3.9.0
-(23 rows)
+                                         ->  Seq Scan on foo  (cost=0.00..431.00 rows=4 width=4)
+ Optimizer: Pivotal Optimizer (GPORCA) version 3.83.0
+(21 rows)
 
 select case when bar1.x2 = bar2.x2 then coalesce((select 1 from orca.foo where bar1.x2 = bar2.x2 and bar1.x2 = random() and foo.x2 = bar2.x2),0) else 1 end as col1, bar1.x1
 from orca.bar1 inner join orca.bar2 on (bar1.x2 = bar2.x2) order by bar1.x1; 
@@ -3490,10 +3488,10 @@ explain  select * from orca.r, orca.s where r.a is not distinct from s.c;
  Gather Motion 3:1  (slice1; segments: 3)  (cost=0.00..862.01 rows=30 width=16)
    ->  Hash Join  (cost=0.00..862.00 rows=10 width=16)
          Hash Cond: NOT s.c IS DISTINCT FROM r.a
-         ->  Table Scan on s  (cost=0.00..431.00 rows=10 width=8)
+         ->  Seq Scan on s  (cost=0.00..431.00 rows=10 width=8)
          ->  Hash  (cost=431.00..431.00 rows=7 width=8)
-               ->  Table Scan on r  (cost=0.00..431.00 rows=7 width=8)
- Optimizer: PQO version 2.64.0
+               ->  Seq Scan on r  (cost=0.00..431.00 rows=7 width=8)
+ Optimizer: Pivotal Optimizer (GPORCA) version 2.64.0
 (7 rows)
 
 -- explain Hash Join with equality join condition
@@ -3504,10 +3502,10 @@ explain select * from orca.r, orca.s where r.a = s.c;
  Gather Motion 3:1  (slice1; segments: 3)  (cost=0.00..491.01 rows=30 width=16)
    ->  Nested Loop  (cost=0.00..491.00 rows=10 width=16)
          Join Filter: true
-         ->  Table Scan on s  (cost=0.00..431.00 rows=10 width=8)
+         ->  Seq Scan on s  (cost=0.00..431.00 rows=10 width=8)
          ->  Index Scan using r_a on r  (cost=0.00..60.00 rows=1 width=8)
                Index Cond: a = s.c
- Optimizer: PQO version 2.64.0
+ Optimizer: Pivotal Optimizer (GPORCA) version 2.64.0
 (7 rows)
 
 -- sort
@@ -3728,6 +3726,8 @@ select * from orca.m where a=abs(b);
 
 -- grouping sets
 select a,b,count(*) from orca.m group by grouping sets ((a), (a,b));
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  Feature not supported: Grouping Sets
  a  | b  | count 
 ----+----+-------
   0 |  1 |     1
@@ -3806,6 +3806,8 @@ select a,b,count(*) from orca.m group by grouping sets ((a), (a,b));
 (73 rows)
 
 select b,count(*) from orca.m group by grouping sets ((a), (a,b));
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  Feature not supported: Grouping Sets
  b  | count 
 ----+-------
   1 |     1
@@ -3884,6 +3886,8 @@ select b,count(*) from orca.m group by grouping sets ((a), (a,b));
 (73 rows)
 
 select a,count(*) from orca.m group by grouping sets ((a), (a,b));
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  Feature not supported: Grouping Sets
  a  | count 
 ----+-------
   0 |     1
@@ -3962,6 +3966,8 @@ select a,count(*) from orca.m group by grouping sets ((a), (a,b));
 (73 rows)
 
 select a,count(*) from orca.m group by grouping sets ((a), (b));
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  Feature not supported: Grouping Sets
  a  | count 
 ----+-------
     |     1
@@ -4006,6 +4012,8 @@ select a,count(*) from orca.m group by grouping sets ((a), (b));
 (39 rows)
 
 select a,b,count(*) from orca.m group by rollup(a, b);
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  Feature not supported: Grouping Sets
  a  | b  | count 
 ----+----+-------
   0 |  1 |     1
@@ -4085,6 +4093,8 @@ select a,b,count(*) from orca.m group by rollup(a, b);
 (74 rows)
 
 select a,b,count(*) from orca.m group by rollup((a),(a,b)) order by 1,2,3;
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  Feature not supported: Grouping Sets
  a  | b  | count 
 ----+----+-------
   0 |  1 |     1
@@ -4164,6 +4174,8 @@ select a,b,count(*) from orca.m group by rollup((a),(a,b)) order by 1,2,3;
 (74 rows)
 
 select count(*) from orca.m group by ();
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  Feature not supported: Grouping Sets
  count 
 -------
     38
@@ -4196,6 +4208,8 @@ select a, count(*) from orca.r group by (), a;
 (21 rows)
 
 select a, count(*) from orca.r group by grouping sets ((),(a));
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  Feature not supported: Grouping Sets
  a  | count 
 ----+-------
   2 |     1
@@ -4223,6 +4237,8 @@ select a, count(*) from orca.r group by grouping sets ((),(a));
 (22 rows)
 
 select a, b, count(*) c from orca.r group by grouping sets ((),(a), (a,b)) order by b,a,c;
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  Feature not supported: Grouping Sets
  a  | b | c  
 ----+---+----
   3 | 0 |  1
@@ -4271,6 +4287,8 @@ select a, b, count(*) c from orca.r group by grouping sets ((),(a), (a,b)) order
 (43 rows)
 
 select a, count(*) c from orca.r group by grouping sets ((),(a), (a,b)) order by b,a,c;
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  Feature not supported: Grouping Sets
  a  | c  
 ----+----
   3 |  1
@@ -4319,12 +4337,16 @@ select a, count(*) c from orca.r group by grouping sets ((),(a), (a,b)) order by
 (43 rows)
 
 select 1 from orca.r group by ();
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  Feature not supported: Grouping Sets
  ?column? 
 ----------
         1
 (1 row)
 
 select a,1 from orca.r group by rollup(a);
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  Feature not supported: Grouping Sets
  a  | ?column? 
 ----+----------
   1 |        1
@@ -6532,6 +6554,122 @@ select lead(c,c+d,1000) over(order by c,d) from orca.s order by 1;
  1000
 (30 rows)
 
+-- test normalization of window functions
+create table orca_w1(a int, b int);
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause -- Using column named 'a' as the Greenplum Database data distribution key for this table.
+HINT:  The 'DISTRIBUTED BY' clause determines the distribution of data. Make sure column(s) chosen are the optimal data distribution key to minimize skew.
+create table orca_w2(a int, b int);
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause -- Using column named 'a' as the Greenplum Database data distribution key for this table.
+HINT:  The 'DISTRIBUTED BY' clause determines the distribution of data. Make sure column(s) chosen are the optimal data distribution key to minimize skew.
+create table orca_w3(a int, b text);
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause -- Using column named 'a' as the Greenplum Database data distribution key for this table.
+HINT:  The 'DISTRIBUTED BY' clause determines the distribution of data. Make sure column(s) chosen are the optimal data distribution key to minimize skew.
+insert into orca_w1 select i, i from generate_series(1, 3) i;
+insert into orca_w2 select i, i from generate_series(2, 4) i;
+insert into orca_w3 select i, i from generate_series(3, 5) i;
+-- outer ref in subquery in target list and window func in target list
+select (select b from orca_w3 where a = orca_w1.a) as one, row_number() over(partition by orca_w1.a) as two from orca_w2, orca_w1;
+ one | two 
+-----+-----
+     |   1
+     |   2
+     |   3
+     |   1
+     |   2
+     |   3
+ 3   |   1
+ 3   |   2
+ 3   |   3
+(9 rows)
+
+-- aggref in subquery with window func in target list
+select orca_w1.a, (select sum(orca_w2.a) from orca_w2 where orca_w1.b = orca_w2.b), count(*), rank() over (order by orca_w1.b) from orca_w1 group by orca_w1.a, orca_w1.b order by orca_w1.a;
+ a | sum | count | rank 
+---+-----+-------+------
+ 1 |     |     1 |    1
+ 2 |   2 |     1 |    2
+ 3 |   3 |     1 |    3
+(3 rows)
+
+-- window function inside subquery inside target list with outer ref
+select orca_w1.a, (select rank() over (order by orca_w1.b) from orca_w2 where orca_w1.b = orca_w2.b), count(*) from orca_w1 group by orca_w1.a, orca_w1.b order by orca_w1.a;
+ a | rank | count 
+---+------+-------
+ 1 |      |     1
+ 2 |    1 |     1
+ 3 |    1 |     1
+(3 rows)
+
+-- window function with empty partition clause inside subquery inside target list with outer ref
+select (select rank() over() from orca_w3 where a = orca_w1.a) as one, row_number() over(partition by orca_w1.a) as two from orca_w1, orca_w2;
+ one | two 
+-----+-----
+     |   1
+     |   2
+     |   3
+     |   1
+     |   2
+     |   3
+   1 |   1
+   1 |   2
+   1 |   3
+(9 rows)
+
+-- window function in IN clause
+select (select a from orca_w3 where a = orca_w1.a) as one from orca_w1 where orca_w1.a IN (select rank() over(partition by orca_w1.a) + 1 from orca_w1, orca_w2);
+ one 
+-----
+    
+(1 row)
+
+-- window function in subquery inside target list with outer ref in partition clause
+select (select rank() over(partition by orca_w2.a) from orca_w3 where a = orca_w1.a) as one, row_number() over(partition by orca_w1.a) as two from orca_w1, orca_w2 order by orca_w1.a;
+ one | two 
+-----+-----
+     |   1
+     |   2
+     |   3
+     |   1
+     |   2
+     |   3
+   1 |   1
+   1 |   2
+   1 |   3
+(9 rows)
+
+-- window function in subquery inside target list with outer ref in order clause
+select (select rank() over(order by orca_w2.a) from orca_w3 where a = orca_w1.a) as one, row_number() over(partition by orca_w1.a) as two from orca_w1, orca_w2 order by orca_w1.a;
+ one | two 
+-----+-----
+     |   1
+     |   2
+     |   3
+     |   1
+     |   2
+     |   3
+   1 |   1
+   1 |   2
+   1 |   3
+(9 rows)
+
+-- window function with outer ref in arguments
+select (select sum(orca_w1.a + a) over(order by b) + 1 from orca_w2 where orca_w1.a = orca_w2.a) from orca_w1 order by orca_w1.a;
+ ?column? 
+----------
+         
+        5
+        7
+(3 rows)
+
+-- window function with outer ref in window clause and arguments 
+select (select sum(orca_w1.a + a) over(order by b + orca_w1.a) + 1 from orca_w2 where orca_w1.a = orca_w2.a) from orca_w1 order by orca_w1.a;
+ ?column? 
+----------
+         
+        5
+        7
+(3 rows)
+
 -- cte
 with x as (select a, b from orca.r)
 select rank() over(partition by a, case when b = 0 then a+b end order by b asc) as rank_within_parent from x order by a desc ,case when a+b = 0 then a end ,b;
@@ -6659,7 +6797,7 @@ select * from orca.r where a in (select count(*)+1 as v from orca.foo full join 
 
 select * from orca.r where r.a in (select d+r.b+1 as v from orca.foo full join orca.bar on (foo.d = bar.a) group by d+r.b) order by r.a, r.b;
 INFO:  GPORCA failed to produce a plan, falling back to planner
-DETAIL:  Query-to-DXL Translation: No variable entry found due to incorrect normalization of query
+DETAIL:  Query-to-DXL Translation: No attribute entry found due to incorrect normalization of query
  a  | b 
 ----+---
   3 | 0
@@ -7816,10 +7954,10 @@ with x as (select * from orca.r) select * from x order by a;
 -- with x as (select * from orca.rcte where a < 10) select * from x x1, x x2 where x2.a = x1.b limit 1;
 -- correlated execution
 select (select 1 union select 2);
-ERROR:  One or more assertions failed
+ERROR:  one or more assertions failed
 DETAIL:  Expected no more than one row to be returned by expression
 select (select generate_series(1,5));
-ERROR:  One or more assertions failed
+ERROR:  one or more assertions failed
 DETAIL:  Expected no more than one row to be returned by expression
 select (select a from orca.foo inner1 where inner1.a=outer1.a  union select b from orca.foo inner2 where inner2.b=outer1.b) from orca.foo outer1;
 ERROR:  more than one row returned by a subquery used as an expression  (seg1 slice3 slarimac:40001 pid=383)
@@ -8170,8 +8308,8 @@ select * from orca.t order by 1,2;
 
 -- test EXPLAIN support of partition selection nodes, while we're at it.
 explain select * from orca.t order by 1,2;
-                                             QUERY PLAN
------------------------------------------------------------------------------------------------------
+                                            QUERY PLAN                                             
+---------------------------------------------------------------------------------------------------
  Gather Motion 3:1  (slice1; segments: 3)  (cost=0.00..431.00 rows=1 width=32)
    Merge Key: timest, user_id
    ->  Sequence  (cost=0.00..431.00 rows=1 width=32)
@@ -8179,9 +8317,9 @@ explain select * from orca.t order by 1,2;
                Partitions selected:  6 (out of 6)
          ->  Sort  (cost=0.00..431.00 rows=1 width=32)
                Sort Key: timest, user_id
-               ->  Dynamic Table Scan on t (dynamic scan id: 1)  (cost=0.00..431.00 rows=1 width=32)
+               ->  Dynamic Seq Scan on t (dynamic scan id: 1)  (cost=0.00..431.00 rows=1 width=32)
  Settings:  optimizer=on; optimizer_segments=3
- Optimizer status: PQO version 1.630
+ Optimizer status: Pivotal Optimizer (GPORCA) version 1.630
 (10 rows)
 
 select tag2, tag1 from orca.t order by 1, 2;;
@@ -8259,20 +8397,19 @@ set optimizer_enable_constant_expression_evaluation=on;
 set optimizer_enumerate_plans=on;
 set optimizer_plan_id = 2;
 explain select * from orca.t_date where user_id=9;
-                                                       QUERY PLAN                                                        
--------------------------------------------------------------------------------------------------------------------------
+                                                      QUERY PLAN                                                       
+-----------------------------------------------------------------------------------------------------------------------
  Gather Motion 3:1  (slice1; segments: 3)  (cost=0.00..437.00 rows=2 width=20)
    ->  Sequence  (cost=0.00..437.00 rows=1 width=20)
          ->  Partition Selector for t_date (dynamic scan id: 1)  (cost=10.00..100.00 rows=34 width=4)
                Partitions selected: 6 (out of 6)
-         ->  Result  (cost=0.00..437.00 rows=1 width=20)
-               ->  Append  (cost=0.00..437.00 rows=1 width=20)
-                     ->  Dynamic Index Scan on t_date (dynamic scan id: 1)  (cost=0.00..6.00 rows=1 width=50)
-                           Index Cond: user_id = 9::numeric
-                     ->  Dynamic Table Scan on t_date t_date_1 (dynamic scan id: 1)  (cost=0.00..431.00 rows=1 width=50)
-                           Filter: user_id = 9::numeric
- Optimizer: PQO version 2.74.0
-(11 rows)
+         ->  Append  (cost=0.00..437.00 rows=1 width=20)
+               ->  Dynamic Index Scan on t_date (dynamic scan id: 1)  (cost=0.00..6.00 rows=1 width=20)
+                     Index Cond: (user_id = 9::numeric)
+               ->  Dynamic Seq Scan on t_date t_date_1 (dynamic scan id: 1)  (cost=0.00..431.00 rows=1 width=20)
+                     Filter: (user_id = 9::numeric)
+ Optimizer: Pivotal Optimizer (GPORCA) version 3.35.0
+(10 rows)
 
 select * from orca.t_date where user_id=9;
    timest   | user_id | tag1  | tag2  
@@ -8313,20 +8450,19 @@ set optimizer_enable_constant_expression_evaluation=on;
 set optimizer_enumerate_plans=on;
 set optimizer_plan_id = 2;
 explain select * from orca.t_text where user_id=9;
-                                                       QUERY PLAN                                                        
--------------------------------------------------------------------------------------------------------------------------
+                                                      QUERY PLAN                                                       
+-----------------------------------------------------------------------------------------------------------------------
  Gather Motion 3:1  (slice1; segments: 3)  (cost=0.00..437.00 rows=2 width=20)
    ->  Sequence  (cost=0.00..437.00 rows=1 width=20)
          ->  Partition Selector for t_text (dynamic scan id: 1)  (cost=10.00..100.00 rows=34 width=4)
                Partitions selected: 3 (out of 3)
-         ->  Result  (cost=0.00..437.00 rows=1 width=20)
-               ->  Append  (cost=0.00..437.00 rows=1 width=20)
-                     ->  Dynamic Index Scan on t_text (dynamic scan id: 1)  (cost=0.00..6.00 rows=1 width=50)
-                           Index Cond: user_id = 9::numeric
-                     ->  Dynamic Table Scan on t_text t_text_1 (dynamic scan id: 1)  (cost=0.00..431.00 rows=1 width=50)
-                           Filter: user_id = 9::numeric
- Optimizer: PQO version 2.74.0
-(11 rows)
+         ->  Append  (cost=0.00..437.00 rows=1 width=20)
+               ->  Dynamic Index Scan on t_text (dynamic scan id: 1)  (cost=0.00..6.00 rows=1 width=20)
+                     Index Cond: (user_id = 9::numeric)
+               ->  Dynamic Seq Scan on t_text t_text_1 (dynamic scan id: 1)  (cost=0.00..431.00 rows=1 width=20)
+                     Filter: (user_id = 9::numeric)
+ Optimizer: Pivotal Optimizer (GPORCA) version 3.35.0
+(10 rows)
 
 select * from orca.t_text where user_id=9;
    timest   | user_id | tag1  | tag2  
@@ -8336,67 +8472,6 @@ select * from orca.t_text where user_id=9;
 
 reset optimizer_enable_space_pruning;
 set optimizer_enumerate_plans=off;
-set optimizer_enable_constant_expression_evaluation=off;
--- create a user defined type and only define equality on it
--- the type can be used in the partitioning list, but Orca is not able to pick a heterogenous index
--- because constraint derivation needs all comparison operators
-drop type if exists orca.employee cascade;
-NOTICE:  type "orca.employee" does not exist, skipping
-create type orca.employee as (empid int, empname text);
-create function orca.emp_equal(orca.employee, orca.employee) returns boolean
-  as 'select $1.empid = $2.empid;'
-  language sql
-  immutable
-  returns null on null input;
-create operator pg_catalog.= (
-        leftarg = orca.employee,
-        rightarg = orca.employee,
-        procedure = orca.emp_equal
-);
-create operator class orca.employee_op_class default for type orca.employee
-  using btree as
-  operator 3 =;
-drop table if exists orca.t_employee;
-NOTICE:  table "t_employee" does not exist, skipping
-create table orca.t_employee(timest date, user_id numeric(16,0) not null, tag1 char(5), emp orca.employee)
-  distributed by (user_id)
-  partition by list(emp)
-  (partition part1 values('(1, ''foo'')'::orca.employee), partition part2 values('(2, ''foo'')'::orca.employee));
-NOTICE:  CREATE TABLE will create partition "t_employee_1_prt_part1" for table "t_employee"
-NOTICE:  CREATE TABLE will create partition "t_employee_1_prt_part2" for table "t_employee"
-create index user_id_idx1 on orca.t_employee_1_prt_part1(user_id);
-create index user_id_idx2 on orca.t_employee_1_prt_part2(user_id);
-insert into orca.t_employee values('01-03-2012'::date,0,'tag1','(1, ''foo'')'::orca.employee);
-insert into orca.t_employee values('01-03-2012'::date,1,'tag1','(1, ''foo'')'::orca.employee);
-insert into orca.t_employee values('01-04-2012'::date,2,'tag1','(2, ''foo'')'::orca.employee);
-insert into orca.t_employee values('01-05-2012'::date,1,'tag1','(1, ''foo'')'::orca.employee);
-insert into orca.t_employee values('01-06-2012'::date,2,'tag1','(2, ''foo'')'::orca.employee);
-insert into orca.t_employee values('01-07-2012'::date,1,'tag1','(1, ''foo'')'::orca.employee);
-insert into orca.t_employee values('01-08-2012'::date,2,'tag1','(2, ''foo'')'::orca.employee);
-set optimizer_enable_constant_expression_evaluation=on;
-set optimizer_enable_dynamictablescan = off;
-explain select * from orca.t_employee where user_id = 2;
-                                                QUERY PLAN
-----------------------------------------------------------------------------------------------------------
- Gather Motion 1:1  (slice1; segments: 1)  (cost=0.00..6.00 rows=1 width=28)
-   ->  Sequence  (cost=0.00..6.00 rows=1 width=28)
-         ->  Partition Selector for t_employee (dynamic scan id: 1)  (cost=10.00..100.00 rows=50 width=4)
-               Partitions selected:  2 (out of 2)
-         ->  Dynamic Index Scan on t_employee (dynamic scan id: 1)  (cost=0.00..6.00 rows=1 width=28)
-               Index Cond: user_id = 2::numeric
- Settings:  optimizer=on; optimizer_segments=3
- Optimizer status: PQO version 1.602
-(8 rows)
-
-select * from orca.t_employee where user_id = 2;
-   timest   | user_id | tag1  |     emp      
-------------+---------+-------+--------------
- 01-08-2012 |       2 | tag1  | (2," 'foo'")
- 01-06-2012 |       2 | tag1  | (2," 'foo'")
- 01-04-2012 |       2 | tag1  | (2," 'foo'")
-(3 rows)
-
-reset optimizer_enable_dynamictablescan;
 reset optimizer_enable_constant_expression_evaluation;
 reset optimizer_enable_partial_index;
 -- test that constant expression evaluation works with integers
@@ -8422,20 +8497,19 @@ set optimizer_use_external_constant_expression_evaluation_for_ints = on;
 set optimizer_enumerate_plans=on;
 set optimizer_plan_id = 2;
 explain select * from orca.t_ceeval_ints where user_id=4;
-                                                              QUERY PLAN                                                               
----------------------------------------------------------------------------------------------------------------------------------------
+                                                             QUERY PLAN                                                              
+-------------------------------------------------------------------------------------------------------------------------------------
  Gather Motion 3:1  (slice1; segments: 3)  (cost=0.00..437.00 rows=1 width=21)
    ->  Sequence  (cost=0.00..437.00 rows=1 width=21)
          ->  Partition Selector for t_ceeval_ints (dynamic scan id: 1)  (cost=10.00..100.00 rows=34 width=4)
                Partitions selected: 3 (out of 3)
-         ->  Result  (cost=0.00..437.00 rows=1 width=21)
-               ->  Append  (cost=0.00..437.00 rows=1 width=21)
-                     ->  Dynamic Index Scan on t_ceeval_ints (dynamic scan id: 1)  (cost=0.00..6.00 rows=1 width=51)
-                           Index Cond: user_id = 4::numeric
-                     ->  Dynamic Table Scan on t_ceeval_ints t_ceeval_ints_1 (dynamic scan id: 1)  (cost=0.00..431.00 rows=1 width=51)
-                           Filter: user_id = 4::numeric
- Optimizer: PQO version 2.74.0
-(11 rows)
+         ->  Append  (cost=0.00..437.00 rows=1 width=21)
+               ->  Dynamic Index Scan on t_ceeval_ints (dynamic scan id: 1)  (cost=0.00..6.00 rows=1 width=21)
+                     Index Cond: (user_id = 4::numeric)
+               ->  Dynamic Seq Scan on t_ceeval_ints t_ceeval_ints_1 (dynamic scan id: 1)  (cost=0.00..431.00 rows=1 width=21)
+                     Filter: (user_id = 4::numeric)
+ Optimizer: Pivotal Optimizer (GPORCA) version 3.35.0
+(10 rows)
 
 select * from orca.t_ceeval_ints where user_id=4;
  user_id | category_id | tag1  | tag2  
@@ -8503,6 +8577,12 @@ select sum(f1.b) from orca.fooh1 f1 group by f1.a;
    5
    6
 (4 rows)
+
+select f1.a + 1 from fooh1 f1 group by f1.a+1 having sum(f1.a+1) + 1 > 20;
+ ?column? 
+----------
+        4
+(1 row)
 
 select 1 as one, f1.a from orca.fooh1 f1 group by f1.a having sum(f1.b) > 4;
  one | a 
@@ -8627,6 +8707,200 @@ select sum(f1.a+1)+avg(f1.a+1), sum(f1.a), sum(f1.a+1) from orca.fooh1 f1 group 
     18.0000000000000000 |  10 |  15
 (4 rows)
 
+--
+-- test algebrization of group by clause with subqueries
+--
+drop table if exists foo, bar, jazz;
+NOTICE:  table "jazz" does not exist, skipping
+create table foo (a int, b int, c int);
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause -- Using column named 'a' as the Greenplum Database data distribution key for this table.
+HINT:  The 'DISTRIBUTED BY' clause determines the distribution of data. Make sure column(s) chosen are the optimal data distribution key to minimize skew.
+create table bar (d int, e int, f int);
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause -- Using column named 'd' as the Greenplum Database data distribution key for this table.
+HINT:  The 'DISTRIBUTED BY' clause determines the distribution of data. Make sure column(s) chosen are the optimal data distribution key to minimize skew.
+create table jazz (g int, h int, j int);
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause -- Using column named 'g' as the Greenplum Database data distribution key for this table.
+HINT:  The 'DISTRIBUTED BY' clause determines the distribution of data. Make sure column(s) chosen are the optimal data distribution key to minimize skew.
+insert into foo values (1, 1, 1), (2, 2, 2), (3, 3, 3);
+insert into bar values (1, 1, 1), (2, 2, 2), (3, 3, 3);
+insert into jazz values (2, 2, 2);
+-- subquery with outer reference with aggfunc in target list
+select a, (select sum(e) from bar where foo.b = bar.f), b, count(*) from foo, jazz where foo.c = jazz.g group by b, a, h;
+ a | sum | b | count 
+---+-----+---+-------
+ 2 |   2 | 2 |     1
+(1 row)
+
+-- complex agg expr in subquery
+select foo.a, (select (foo.a + foo.b) * count(bar.e) from bar), b, count(*) from foo group by foo.a, foo.b, foo.a + foo.b;
+ a | ?column? | b | count 
+---+----------+---+-------
+ 3 |       18 | 3 |     1
+ 1 |        6 | 1 |     1
+ 2 |       12 | 2 |     1
+(3 rows)
+
+-- aggfunc over an outer reference in a subquery
+select (select sum(foo.a + bar.d) from bar) from foo group by a, b;
+ sum 
+-----
+   9
+  12
+  15
+(3 rows)
+
+-- complex expression of aggfunc over an outer reference in a subquery
+select (select sum(foo.a + bar.d) + 1 from bar) from foo group by a, b;
+ ?column? 
+----------
+       10
+       13
+       16
+(3 rows)
+
+-- aggrefs with multiple agglevelsup
+select (select (select sum(foo.a + bar.d) from jazz) from bar) from foo group by a, b;
+ sum 
+-----
+  12
+  15
+   9
+(3 rows)
+
+-- aggrefs with multiple agglevelsup in an expression
+select (select (select sum(foo.a + bar.d) * 2 from jazz) from bar) from foo group by a, b;
+ ?column? 
+----------
+       18
+       24
+       30
+(3 rows)
+
+-- nested group by
+select (select max(f) from bar where d = 1 group by a, e) from foo group by a;
+ max 
+-----
+   1
+   1
+   1
+(3 rows)
+
+-- cte with an aggfunc of outer ref
+select a, count(*), (with cte as (select min(d) dd from bar group by e) select max(a * dd) from cte) from foo group by a;
+ a | count | max 
+---+-------+-----
+ 1 |     1 |   3
+ 2 |     1 |   6
+ 3 |     1 |   9
+(3 rows)
+
+-- cte with an aggfunc of outer ref in an complex expression
+select a, count(*), (with cte as (select e, min(d) as dd from bar group by e) select max(a) * sum(dd) from cte) from foo group by a;
+ a | count | ?column? 
+---+-------+----------
+ 3 |     1 |       18
+ 1 |     1 |        6
+ 2 |     1 |       12
+(3 rows)
+
+-- subquery in group by
+select max(a) from foo group by (select e from bar where bar.e = foo.a);
+ max 
+-----
+   3
+   1
+   2
+(3 rows)
+
+-- nested subquery in group by
+select max(a) from foo group by (select g from jazz where foo.a = (select max(a) from foo where c = 1 group by b));
+ max 
+-----
+   3
+   1
+(2 rows)
+
+-- group by inside groupby inside group by ;S
+select max(a) from foo group by (select min(g) from jazz where foo.a = (select max(g) from jazz group by h) group by h);
+ max 
+-----
+   2
+   3
+(2 rows)
+
+-- cte subquery in group by
+select max(a) from foo group by b, (with cte as (select min(g) from jazz group by h) select a from cte);
+ max 
+-----
+   3
+   1
+   2
+(3 rows)
+
+-- group by subquery in order by
+select * from foo order by ((select min(bar.e + 1) * 2 from bar group by foo.a) - foo.a);
+ a | b | c 
+---+---+---
+ 3 | 3 | 3
+ 2 | 2 | 2
+ 1 | 1 | 1
+(3 rows)
+
+-- everything in the kitchen sink
+select max(b), (select foo.a * count(bar.e) from bar), (with cte as (select e, min(d) as dd from bar group by e) select max(a) * sum(dd) from cte), count(*) from foo group by foo.a, (select min(g) from jazz where foo.a = (select max(g) from jazz group by h) group by h), (with cte as (select min(g) from jazz group by h) select a from cte) order by ((select min(bar.e + 1) * 2 from bar group by foo.a) - foo.a);
+ max | ?column? | ?column? | count 
+-----+----------+----------+-------
+   3 |        9 |       18 |     1
+   2 |        6 |       12 |     1
+   1 |        3 |        6 |     1
+(3 rows)
+
+-- complex expression in group by & targetlist
+select b + (a+1) from foo group by b, a+1;
+ ?column? 
+----------
+        3
+        5
+        7
+(3 rows)
+
+-- subselects inside aggs
+SELECT  foo.b+1, avg (( SELECT bar.f FROM bar WHERE bar.d = foo.b)) AS t FROM foo GROUP BY foo.b;
+ ?column? |           t            
+----------+------------------------
+        2 | 1.00000000000000000000
+        3 |     2.0000000000000000
+        4 |     3.0000000000000000
+(3 rows)
+
+SELECT foo.b+1, sum( 1 + (SELECT bar.f FROM bar WHERE bar.d = ANY (SELECT jazz.g FROM jazz WHERE jazz.h = foo.b))) AS t FROM foo GROUP BY foo.b;
+ ?column? | t 
+----------+---
+        2 |  
+        3 | 3
+        4 |  
+(3 rows)
+
+select foo.b+1, sum((with cte as (select * from jazz) select 1 from cte where cte.h = foo.b)) as t FROM foo GROUP BY foo.b;
+ ?column? | t 
+----------+---
+        2 |  
+        3 | 1
+        4 |  
+(3 rows)
+
+-- ctes inside aggs
+select foo.b+1, sum((with cte as (select * from jazz) select 1 from cte cte1, cte cte2 where cte1.h = foo.b)) as t FROM foo GROUP BY foo.b;
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  No plan has been computed for required properties
+ ?column? | t 
+----------+---
+        3 | 1
+        4 |  
+        2 |  
+(3 rows)
+
+drop table foo, bar, jazz;
 create table orca.t77(C952 text) WITH (compresstype=zlib,compresslevel=2,appendonly=true,blocksize=393216,checksum=true);
 NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause -- Using column named 'c952' as the Greenplum Database data distribution key for this table.
 HINT:  The 'DISTRIBUTED BY' clause determines the distribution of data. Make sure column(s) chosen are the optimal data distribution key to minimize skew.
@@ -8662,7 +8936,7 @@ NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause -- Using column named 'a' as
 HINT:  The 'DISTRIBUTED BY' clause determines the distribution of data. Make sure column(s) chosen are the optimal data distribution key to minimize skew.
 insert into orca.toanalyze values (1,1), (2,2), (3,3);
 alter table orca.toanalyze drop column a;
-NOTICE:  Dropping a column that is part of the distribution policy forces a NULL distribution policy
+NOTICE:  dropping a column that is part of the distribution policy forces a NULL distribution policy
 analyze orca.toanalyze;
 -- union
 create table orca.ur (a int, b int);
@@ -9559,7 +9833,7 @@ where c.cid = s.cid and s.date_sk = d.date_sk and
  Gather Motion 3:1  (slice3; segments: 3)  (cost=0.00..1293.00 rows=1 width=24)
    ->  Hash Join  (cost=0.00..1293.00 rows=1 width=24)
          Hash Cond: cust.cid = sales.cid
-         ->  Table Scan on cust  (cost=0.00..431.00 rows=1 width=20)
+         ->  Seq Scan on cust  (cost=0.00..431.00 rows=1 width=20)
          ->  Hash  (cost=862.00..862.00 rows=1 width=8)
                ->  Redistribute Motion 3:3  (slice2; segments: 3)  (cost=0.00..862.00 rows=1 width=8)
                      Hash Key: sales.cid
@@ -9568,13 +9842,13 @@ where c.cid = s.cid and s.date_sk = d.date_sk and
                            Join Filter: (datedim.year = 2001 AND lower(sales.type) = 't1'::text AND plusone(datedim.moy) = 5) OR (datedim.moy = 4 AND upper(sales.type) = 'T2'::text)
                            ->  Redistribute Motion 3:3  (slice1; segments: 3)  (cost=0.00..431.00 rows=1 width=16)
                                  Hash Key: sales.date_sk
-                                 ->  Table Scan on sales  (cost=0.00..431.00 rows=1 width=16)
+                                 ->  Seq Scan on sales  (cost=0.00..431.00 rows=1 width=16)
                                        Filter: lower(type) = 't1'::text OR upper(type) = 'T2'::text
                            ->  Hash  (cost=431.00..431.00 rows=1 width=12)
-                                 ->  Table Scan on datedim  (cost=0.00..431.00 rows=1 width=12)
+                                 ->  Seq Scan on datedim  (cost=0.00..431.00 rows=1 width=12)
                                        Filter: year = 2001 OR moy = 4
  Settings:  optimizer=on; optimizer_segments=3
- Optimizer status: PQO version 1.602
+ Optimizer status: Pivotal Optimizer (GPORCA) version 1.602
 (19 rows)
 
 reset optimizer_segments;
@@ -9591,13 +9865,13 @@ explain select * from orca.bm_test where i=2 and t='2';
                                    QUERY PLAN
 --------------------------------------------------------------------------------
  Gather Motion 1:1  (slice1; segments: 1)  (cost=0.00..204.39 rows=2 width=6)
-   ->  Bitmap Table Scan on bm_test  (cost=0.00..204.39 rows=1 width=6)
+   ->  Bitmap Heap Scan on bm_test  (cost=0.00..204.39 rows=1 width=6)
          Recheck Cond: i = 2
          Filter: t = '2'::text
          ->  Bitmap Index Scan on bm_test_idx  (cost=0.00..0.00 rows=0 width=0)
                Index Cond: i = 2
  Settings:  optimizer=on
- Optimizer status: PQO version 1.602
+ Optimizer status: Pivotal Optimizer (GPORCA) version 1.602
 (8 rows)
 
 select * from orca.bm_test where i=2 and t='2';
@@ -9643,19 +9917,19 @@ insert into orca.bm_dyn_test values(2, 5, '2');
 set optimizer_enable_bitmapscan=on;
 -- gather on 1 segment because of direct dispatch
 explain select * from orca.bm_dyn_test where i=2 and t='2';
-                                                QUERY PLAN
------------------------------------------------------------------------------------------------------------
- Gather Motion 1:1  (slice1; segments: 1)  (cost=0.00..0.00 rows=1 width=16)
-   ->  Sequence  (cost=0.00..0.00 rows=1 width=16)
-         ->  Partition Selector for bm_dyn_test (dynamic scan id: 1)  (cost=10.00..100.00 rows=50 width=4)
-               Partitions selected:  6 (out of 6)
-         ->  Bitmap Table Scan on bm_dyn_test (dynamic scan id: 1)  (cost=0.00..0.00 rows=1 width=16)
-               Recheck Cond: i = 2
-               Filter: i = 2 AND t = '2'::text
-               ->  Dynamic Bitmap Index Scan on bm_dyn_test_idx_1_prt_part0  (cost=0.00..0.00 rows=0 width=0)
-                     Index Cond: i = 2
- Settings:  optimizer=on
- Optimizer status: PQO version 1.602
+                                                  QUERY PLAN                                                   
+---------------------------------------------------------------------------------------------------------------
+ Gather Motion 1:1  (slice1; segments: 1)  (cost=0.00..204.40 rows=2 width=8)
+   ->  Sequence  (cost=0.00..204.40 rows=1 width=8)
+         ->  Partition Selector for bm_dyn_test (dynamic scan id: 1)  (cost=10.00..100.00 rows=34 width=4)
+               Partitions selected: 6 (out of 6)
+         ->  Dynamic Bitmap Heap Scan on bm_dyn_test (dynamic scan id: 1)  (cost=0.00..204.40 rows=1 width=8)
+               Recheck Cond: (i = 2)
+               Filter: ((i = 2) AND (t = '2'::text))
+               ->  Dynamic Bitmap Index Scan on bm_dyn_test_idx  (cost=0.00..0.00 rows=0 width=0)
+                     Index Cond: (i = 2)
+ Planning time: 26.274 ms
+ Optimizer: Pivotal Optimizer (GPORCA) version 3.9.0
 (11 rows)
 
 select * from orca.bm_dyn_test where i=2 and t='2';
@@ -9701,15 +9975,15 @@ set optimizer_enable_dynamictablescan = off;
 explain select * from orca.bm_dyn_test_onepart where i=2 and t='2';
 INFO:  GPORCA failed to produce a plan, falling back to planner
 DETAIL:  No plan has been computed for required properties
-                                                 QUERY PLAN                                                  
--------------------------------------------------------------------------------------------------------------
+                                         QUERY PLAN                                         
+--------------------------------------------------------------------------------------------
  Gather Motion 1:1  (slice1; segments: 1)  (cost=0.00..13.52 rows=13 width=10)
    ->  Append  (cost=0.00..13.52 rows=5 width=10)
-         ->  Append-only Columnar Scan on bm_dyn_test_onepart_1_prt_part0  (cost=0.00..2.30 rows=1 width=10)
+         ->  Seq Scan on bm_dyn_test_onepart_1_prt_part0  (cost=0.00..2.30 rows=1 width=10)
                Filter: i = 2 AND t = '2'::text
          ->  Seq Scan on bm_dyn_test_onepart_1_prt_part1  (cost=0.00..2.30 rows=1 width=10)
                Filter: i = 2 AND t = '2'::text
-         ->  Append-only Scan on bm_dyn_test_onepart_1_prt_part2  (cost=0.00..3.30 rows=3 width=10)
+         ->  Seq Scan on bm_dyn_test_onepart_1_prt_part2  (cost=0.00..3.30 rows=3 width=10)
                Filter: i = 2 AND t = '2'::text
          ->  Seq Scan on bm_dyn_test_onepart_1_prt_part3  (cost=0.00..2.30 rows=1 width=10)
                Filter: i = 2 AND t = '2'::text
@@ -9717,7 +9991,7 @@ DETAIL:  No plan has been computed for required properties
                Filter: i = 2 AND t = '2'::text
          ->  Seq Scan on bm_dyn_test_onepart_1_prt_part5  (cost=0.00..1.01 rows=1 width=10)
                Filter: i = 2 AND t = '2'::text
- Optimizer: legacy query optimizer
+ Optimizer: Postgres query optimizer
 (15 rows)
 
 select * from orca.bm_dyn_test_onepart where i=2 and t='2';
@@ -9740,6 +10014,55 @@ DETAIL:  No plan has been computed for required properties
 
 reset optimizer_enable_dynamictablescan;
 reset optimizer_enable_bitmapscan;
+-- Multi-level partition with dynamic bitmap indexes
+create table orca.bm_dyn_test_multilvl_part (id int, year int, quarter int, region text)
+distributed by (id) partition by range (year)
+  subpartition by range (quarter)
+    subpartition template (
+      start (1) end (3) every (1) )
+      subpartition by list (region)
+      subpartition template (
+      subpartition usa values ('usa'),
+      default subpartition other_regions )
+  ( start (2018) end (2020) every (1) );
+NOTICE:  CREATE TABLE will create partition "bm_dyn_test_multilvl_part_1_prt_1" for table "bm_dyn_test_multilvl_part"
+NOTICE:  CREATE TABLE will create partition "bm_dyn_test_multilvl_part_1_prt_1_2_prt_1" for table "bm_dyn_test_multilvl_part_1_prt_1"
+NOTICE:  CREATE TABLE will create partition "bm_dyn_test_multilvl_part_1_prt_1_2_prt_1_3_prt_usa" for table "bm_dyn_test_multilvl_part_1_prt_1_2_prt_1"
+NOTICE:  CREATE TABLE will create partition "bm_dyn_test_multilvl_part_1_prt_1_2_prt_1_3_prt_other_regions" for table "bm_dyn_test_multilvl_part_1_prt_1_2_prt_1"
+NOTICE:  CREATE TABLE will create partition "bm_dyn_test_multilvl_part_1_prt_1_2_prt_2" for table "bm_dyn_test_multilvl_part_1_prt_1"
+NOTICE:  CREATE TABLE will create partition "bm_dyn_test_multilvl_part_1_prt_1_2_prt_2_3_prt_usa" for table "bm_dyn_test_multilvl_part_1_prt_1_2_prt_2"
+NOTICE:  CREATE TABLE will create partition "bm_dyn_test_multilvl_part_1_prt_1_2_prt_2_3_prt_other_regions" for table "bm_dyn_test_multilvl_part_1_prt_1_2_prt_2"
+NOTICE:  CREATE TABLE will create partition "bm_dyn_test_multilvl_part_1_prt_2" for table "bm_dyn_test_multilvl_part"
+NOTICE:  CREATE TABLE will create partition "bm_dyn_test_multilvl_part_1_prt_2_2_prt_1" for table "bm_dyn_test_multilvl_part_1_prt_2"
+NOTICE:  CREATE TABLE will create partition "bm_dyn_test_multilvl_part_1_prt_2_2_prt_1_3_prt_usa" for table "bm_dyn_test_multilvl_part_1_prt_2_2_prt_1"
+NOTICE:  CREATE TABLE will create partition "bm_dyn_test_multilvl_part_1_prt_2_2_prt_1_3_prt_other_regions" for table "bm_dyn_test_multilvl_part_1_prt_2_2_prt_1"
+NOTICE:  CREATE TABLE will create partition "bm_dyn_test_multilvl_part_1_prt_2_2_prt_2" for table "bm_dyn_test_multilvl_part_1_prt_2"
+NOTICE:  CREATE TABLE will create partition "bm_dyn_test_multilvl_part_1_prt_2_2_prt_2_3_prt_usa" for table "bm_dyn_test_multilvl_part_1_prt_2_2_prt_2"
+NOTICE:  CREATE TABLE will create partition "bm_dyn_test_multilvl_part_1_prt_2_2_prt_2_3_prt_other_regions" for table "bm_dyn_test_multilvl_part_1_prt_2_2_prt_2"
+insert into orca.bm_dyn_test_multilvl_part select i, 2018 + (i%2), i%2 + 1, 'usa' from generate_series(1,100)i;
+create index bm_multi_test_idx_part on orca.bm_dyn_test_multilvl_part using bitmap(year);
+analyze orca.bm_dyn_test_multilvl_part;
+-- print name of parent index
+explain select * from orca.bm_dyn_test_multilvl_part where year = 2019;
+                                                         QUERY PLAN                                                         
+----------------------------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)  (cost=0.00..68.13 rows=1 width=16)
+   ->  Sequence  (cost=0.00..68.13 rows=1 width=16)
+         ->  Partition Selector for bm_dyn_test_multilvl_part (dynamic scan id: 1)  (cost=10.00..100.00 rows=34 width=4)
+               Partitions selected: 4 (out of 8)
+         ->  Dynamic Bitmap Heap Scan on bm_dyn_test_multilvl_part (dynamic scan id: 1)  (cost=0.00..68.13 rows=1 width=16)
+               Recheck Cond: (year = 2019)
+               ->  Dynamic Bitmap Index Scan on bm_multi_test_idx_part  (cost=0.00..0.00 rows=0 width=0)
+                     Index Cond: (year = 2019)
+ Optimizer: Pivotal Optimizer (GPORCA) version 3.83.0
+(9 rows)
+
+select count(*) from orca.bm_dyn_test_multilvl_part where year = 2019;
+ count 
+-------
+    50
+(1 row)
+
 -- More BitmapTableScan & BitmapIndexScan tests
 set optimizer_enable_bitmapscan=on;
 create schema bm;
@@ -9914,11 +10237,7 @@ select sum(i) i_sum, sum(j) j_sum, sum(t::integer) t_sum from bm.het_bm where i=
 
 -- Drop and recreate index after we dropped column
 drop index bm.het_bm_i_idx;
-WARNING:  Only dropped the index "het_bm_i_idx"
-HINT:  To drop other indexes on child partitions, drop each one explicitly.
 drop index bm.het_bm_j_idx;
-WARNING:  Only dropped the index "het_bm_j_idx"
-HINT:  To drop other indexes on child partitions, drop each one explicitly.
 create index het_bm_i_idx on bm.het_bm using bitmap (i);
 NOTICE:  building index for child partition "het_bm_1_prt_part0"
 NOTICE:  building index for child partition "het_bm_1_prt_part1"
@@ -10083,43 +10402,42 @@ WHERE tq.sym = tt.symbol AND
       tt.event_ts <  tq.end_ts
 GROUP BY 1
 ORDER BY 1 asc ;
-                                                                                           QUERY PLAN                                                                                            
--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
- GroupAggregate  (cost=0.00..1305.01 rows=1 width=16)
-   Group Key: (share0_ref2.event_ts / 100000 / 5 * 5)
-   ->  Gather Motion 3:1  (slice3; segments: 3)  (cost=0.00..1305.01 rows=1 width=16)
-         Merge Key: (share0_ref2.event_ts / 100000 / 5 * 5)
-         ->  Result  (cost=0.00..1305.01 rows=1 width=16)
-               ->  GroupAggregate  (cost=0.00..1305.01 rows=1 width=16)
-                     Group Key: (share0_ref2.event_ts / 100000 / 5 * 5)
-                     ->  Sort  (cost=0.00..1305.01 rows=1 width=8)
-                           Sort Key: (share0_ref2.event_ts / 100000 / 5 * 5)
-                           ->  Result  (cost=0.00..1305.01 rows=1 width=8)
-                                 ->  Sequence  (cost=0.00..1305.01 rows=1 width=8)
-                                       ->  Shared Scan (share slice:id 3:0)  (cost=0.00..431.00 rows=1 width=1)
-                                             ->  Materialize  (cost=0.00..431.00 rows=1 width=1)
-                                                   ->  Table Scan on my_tt_agg_opt  (cost=0.00..431.00 rows=1 width=62)
-                                       ->  Sequence  (cost=0.00..874.01 rows=1 width=8)
-                                             ->  Partition Selector for my_tq_agg_opt_part (dynamic scan id: 1)  (cost=10.00..100.00 rows=34 width=4)
-                                                   Partitions selected: 2 (out of 2)
-                                             ->  Result  (cost=0.00..874.01 rows=1 width=8)
-                                                   ->  Append  (cost=0.00..874.01 rows=1 width=8)
-                                                         ->  Nested Loop  (cost=0.00..437.00 rows=1 width=132)
-                                                               Join Filter: true
-                                                               ->  Broadcast Motion 3:3  (slice1; segments: 3)  (cost=0.00..431.00 rows=1 width=62)
-                                                                     ->  Shared Scan (share slice:id 1:0)  (cost=0.00..431.00 rows=1 width=62)
-                                                               ->  Dynamic Index Scan on my_tq_agg_opt_part (dynamic scan id: 1)  (cost=0.00..6.00 rows=1 width=70)
-                                                                     Index Cond: ets <= share0_ref2.event_ts AND end_ts > share0_ref2.event_ts
-                                                                     Filter: sym::bpchar = share0_ref2.symbol AND bid_price::numeric < share0_ref2.trade_price
-                                                         ->  Nested Loop  (cost=0.00..437.00 rows=1 width=132)
-                                                               Join Filter: true
-                                                               ->  Broadcast Motion 3:3  (slice2; segments: 3)  (cost=0.00..431.00 rows=1 width=62)
-                                                                     ->  Shared Scan (share slice:id 2:0)  (cost=0.00..431.00 rows=1 width=62)
-                                                               ->  Dynamic Index Scan on my_tq_agg_opt_part my_tq_agg_opt_part_1 (dynamic scan id: 1)  (cost=0.00..6.00 rows=1 width=70)
-                                                                     Index Cond: ets <= share0_ref3.event_ts
-                                                                     Filter: sym::bpchar = share0_ref3.symbol AND bid_price::numeric < share0_ref3.trade_price AND share0_ref3.event_ts < end_ts
- Optimizer: PQO version 2.74.0
-(34 rows)
+                                                                                          QUERY PLAN                                                                                           
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Sort  (cost=0.00..1305.00 rows=1 width=16)
+   Sort Key: ((((share0_ref2.event_ts / 100000) / 5) * 5))
+   ->  GroupAggregate  (cost=0.00..1305.00 rows=1 width=16)
+         Group Key: ((((share0_ref2.event_ts / 100000) / 5) * 5))
+         ->  Sort  (cost=0.00..1305.00 rows=1 width=8)
+               Sort Key: ((((share0_ref2.event_ts / 100000) / 5) * 5))
+               ->  Gather Motion 3:1  (slice1; segments: 3)  (cost=0.00..1305.00 rows=1 width=8)
+                     ->  Result  (cost=0.00..1305.00 rows=1 width=8)
+                           ->  Sequence  (cost=0.00..1305.00 rows=1 width=8)
+                                 ->  Shared Scan (share slice:id 1:0)  (cost=0.00..431.00 rows=1 width=1)
+                                       ->  Materialize  (cost=0.00..431.00 rows=1 width=1)
+                                             ->  Seq Scan on my_tt_agg_opt  (cost=0.00..431.00 rows=1 width=54)
+                                 ->  Sequence  (cost=0.00..874.00 rows=1 width=8)
+                                       ->  Partition Selector for my_tq_agg_opt_part (dynamic scan id: 1)  (cost=10.00..100.00 rows=34 width=4)
+                                             Partitions selected: 2 (out of 2)
+                                       ->  Append  (cost=0.00..874.00 rows=1 width=8)
+                                             ->  Nested Loop  (cost=0.00..437.00 rows=1 width=8)
+                                                   Join Filter: true
+                                                   ->  Broadcast Motion 3:3  (slice2; segments: 3)  (cost=0.00..431.00 rows=1 width=24)
+                                                         ->  Result  (cost=0.00..431.00 rows=1 width=24)
+                                                               ->  Shared Scan (share slice:id 2:0)  (cost=0.00..431.00 rows=1 width=24)
+                                                   ->  Dynamic Index Scan on my_tq_agg_opt_part (dynamic scan id: 1)  (cost=0.00..6.00 rows=1 width=1)
+                                                         Index Cond: ((ets <= share0_ref2.event_ts) AND (end_ts > share0_ref2.event_ts))
+                                                         Filter: (((sym)::bpchar = share0_ref2.symbol) AND (plusone(bid_price) < share0_ref2.trade_price))
+                                             ->  Nested Loop  (cost=0.00..437.00 rows=1 width=8)
+                                                   Join Filter: true
+                                                   ->  Broadcast Motion 3:3  (slice3; segments: 3)  (cost=0.00..431.00 rows=1 width=24)
+                                                         ->  Result  (cost=0.00..431.00 rows=1 width=24)
+                                                               ->  Shared Scan (share slice:id 3:0)  (cost=0.00..431.00 rows=1 width=24)
+                                                   ->  Dynamic Index Scan on my_tq_agg_opt_part my_tq_agg_opt_part_1 (dynamic scan id: 1)  (cost=0.00..6.00 rows=1 width=1)
+                                                         Index Cond: (ets <= share0_ref3.event_ts)
+                                                         Filter: (((sym)::bpchar = share0_ref3.symbol) AND (plusone(bid_price) < share0_ref3.trade_price) AND (share0_ref3.event_ts < end_ts))
+ Optimizer: Pivotal Optimizer (GPORCA) version 3.64.0
+(33 rows)
 
 reset optimizer_segments;
 reset optimizer_enable_constant_expression_evaluation;
@@ -10191,16 +10509,16 @@ explain select id, comment from idxscan_outer as o join idxscan_inner as i on o.
 where ordernum between 10 and 20;
                                                        QUERY PLAN                                                       
 ------------------------------------------------------------------------------------------------------------------------
- Gather Motion 3:1  (slice2; segments: 3)  (cost=0.00..888833.21 rows=3 width=9)
+ Gather Motion 3:1  (slice1; segments: 3)  (cost=0.00..888833.21 rows=3 width=9)
    ->  Nested Loop  (cost=0.00..888833.21 rows=1 width=9)
          Join Filter: (idxscan_outer.id = idxscan_inner.productid)
-         ->  Table Scan on idxscan_outer  (cost=0.00..431.00 rows=3 width=4)
+         ->  Seq Scan on idxscan_outer  (cost=0.00..431.00 rows=3 width=4)
          ->  Materialize  (cost=0.00..6.00 rows=1 width=9)
-               ->  Redistribute Motion 3:3  (slice1; segments: 3)  (cost=0.00..6.00 rows=1 width=9)
+               ->  Redistribute Motion 3:3  (slice2; segments: 3)  (cost=0.00..6.00 rows=1 width=9)
                      Hash Key: idxscan_inner.productid
                      ->  Index Scan using idxscan_inner_ordernum_key on idxscan_inner  (cost=0.00..6.00 rows=1 width=9)
                            Index Cond: ((ordernum >= 10) AND (ordernum <= 20))
- Optimizer: PQO version 3.1.0
+ Optimizer: Pivotal Optimizer (GPORCA) version 3.1.0
 (10 rows)
 
 select id, comment from idxscan_outer as o join idxscan_inner as i on o.id = i.productid
@@ -10253,7 +10571,7 @@ explain select * from orca.index_test where a = 5;
    ->  Index Scan using index_test_pkey on index_test  (cost=0.00..2.00 rows=1 width=20)
          Index Cond: a = 5
  Settings:  optimizer=on
- Optimizer status: PQO version 1.602
+ Optimizer status: Pivotal Optimizer (GPORCA) version 1.602
 (5 rows)
 
 -- force_explain
@@ -10264,7 +10582,7 @@ explain select * from orca.index_test where c = 5;
    ->  Index Scan using index_test_pkey on index_test  (cost=0.00..2.00 rows=1 width=20)
          Index Cond: c = 5
  Settings:  optimizer=on
- Optimizer status: PQO version 1.602
+ Optimizer status: Pivotal Optimizer (GPORCA) version 1.602
 (5 rows)
 
 -- force_explain
@@ -10275,7 +10593,7 @@ explain select * from orca.index_test where a = 5 and c = 5;
    ->  Index Scan using index_test_pkey on index_test  (cost=0.00..2.00 rows=1 width=20)
          Index Cond: a = 5 AND c = 5
  Settings:  optimizer=on
- Optimizer status: PQO version 1.602
+ Optimizer status: Pivotal Optimizer (GPORCA) version 1.602
 (5 rows)
 
 -- renaming columns
@@ -10358,56 +10676,97 @@ drop function canSetTag_Func(x int);
 drop table canSetTag_bug_table;
 drop table canSetTag_input_data;
 -- Test B-Tree index scan with in list
-CREATE TABLE btree_test as SELECT * FROM generate_series(1,100) as a distributed randomly;
+CREATE TABLE btree_test as SELECT i a, i b FROM generate_series(1,100) i distributed randomly;
 CREATE INDEX btree_test_index ON btree_test(a);
+set optimizer_enable_tablescan = off;
+-- start_ignore
+select disable_xform('CXformSelect2IndexGet');
+           disable_xform           
+-----------------------------------
+ CXformSelect2IndexGet is disabled
+(1 row)
+
+-- end_ignore
 EXPLAIN SELECT * FROM btree_test WHERE a in (1, 47);
-INFO:  GPORCA failed to produce a plan, falling back to planner
-DETAIL:  DXL-to-PlStmt Translation: ScalarArrayOpExpr condition on index scan not supported
-                                 QUERY PLAN                                 
-----------------------------------------------------------------------------
- Gather Motion 3:1  (slice1; segments: 3)  (cost=0.00..2.25 rows=2 width=4)
-   ->  Seq Scan on btree_test  (cost=0.00..2.25 rows=1 width=4)
-         Filter: a = ANY ('{1,47}'::integer[])
- Settings:  optimizer=on; optimizer_metadata_caching=on
- Optimizer status: legacy query optimizer
-(5 rows)
+                                     QUERY PLAN                                      
+-------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)  (cost=0.00..204.38 rows=3 width=8)
+   ->  Bitmap Heap Scan on btree_test  (cost=0.00..204.38 rows=1 width=8)
+         Recheck Cond: (a = ANY ('{1,47}'::integer[]))
+         ->  Bitmap Index Scan on btree_test_index  (cost=0.00..0.00 rows=0 width=0)
+               Index Cond: (a = ANY ('{1,47}'::integer[]))
+ Optimizer: Pivotal Optimizer (GPORCA) version 3.82.0
+(6 rows)
 
 EXPLAIN SELECT * FROM btree_test WHERE a in ('2', 47);
-INFO:  GPORCA failed to produce a plan, falling back to planner
-DETAIL:  DXL-to-PlStmt Translation: ScalarArrayOpExpr condition on index scan not supported
-                                 QUERY PLAN                                 
-----------------------------------------------------------------------------
- Gather Motion 3:1  (slice1; segments: 3)  (cost=0.00..2.25 rows=2 width=4)
-   ->  Seq Scan on btree_test  (cost=0.00..2.25 rows=1 width=4)
-         Filter: a = ANY ('{2,47}'::integer[])
- Settings:  optimizer=on; optimizer_metadata_caching=on
- Optimizer status: legacy query optimizer
-(5 rows)
+                                     QUERY PLAN                                      
+-------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)  (cost=0.00..204.38 rows=3 width=8)
+   ->  Bitmap Heap Scan on btree_test  (cost=0.00..204.38 rows=1 width=8)
+         Recheck Cond: (a = ANY ('{2,47}'::integer[]))
+         ->  Bitmap Index Scan on btree_test_index  (cost=0.00..0.00 rows=0 width=0)
+               Index Cond: (a = ANY ('{2,47}'::integer[]))
+ Optimizer: Pivotal Optimizer (GPORCA) version 3.82.0
+(6 rows)
 
 EXPLAIN SELECT * FROM btree_test WHERE a in ('1', '2');
-INFO:  GPORCA failed to produce a plan, falling back to planner
-DETAIL:  DXL-to-PlStmt Translation: ScalarArrayOpExpr condition on index scan not supported
-                                 QUERY PLAN                                 
-----------------------------------------------------------------------------
- Gather Motion 3:1  (slice1; segments: 3)  (cost=0.00..2.25 rows=2 width=4)
-   ->  Seq Scan on btree_test  (cost=0.00..2.25 rows=1 width=4)
-         Filter: a = ANY ('{1,2}'::integer[])
- Settings:  optimizer=on; optimizer_metadata_caching=on
- Optimizer status: legacy query optimizer
-(5 rows)
+                                     QUERY PLAN                                      
+-------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)  (cost=0.00..204.38 rows=3 width=8)
+   ->  Bitmap Heap Scan on btree_test  (cost=0.00..204.38 rows=1 width=8)
+         Recheck Cond: (a = ANY ('{1,2}'::integer[]))
+         ->  Bitmap Index Scan on btree_test_index  (cost=0.00..0.00 rows=0 width=0)
+               Index Cond: (a = ANY ('{1,2}'::integer[]))
+ Optimizer: Pivotal Optimizer (GPORCA) version 3.82.0
+(6 rows)
 
 EXPLAIN SELECT * FROM btree_test WHERE a in ('1', '2', 47);
-INFO:  GPORCA failed to produce a plan, falling back to planner
-DETAIL:  DXL-to-PlStmt Translation: ScalarArrayOpExpr condition on index scan not supported
-                                 QUERY PLAN                                 
-----------------------------------------------------------------------------
- Gather Motion 3:1  (slice1; segments: 3)  (cost=0.00..2.38 rows=3 width=4)
-   ->  Seq Scan on btree_test  (cost=0.00..2.38 rows=1 width=4)
-         Filter: a = ANY ('{1,2,47}'::integer[])
- Settings:  optimizer=on; optimizer_metadata_caching=on
- Optimizer status: legacy query optimizer
-(5 rows)
+                                     QUERY PLAN                                      
+-------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)  (cost=0.00..613.15 rows=4 width=8)
+   ->  Bitmap Heap Scan on btree_test  (cost=0.00..613.15 rows=2 width=8)
+         Recheck Cond: (a = ANY ('{1,2,47}'::integer[]))
+         ->  Bitmap Index Scan on btree_test_index  (cost=0.00..0.00 rows=0 width=0)
+               Index Cond: (a = ANY ('{1,2,47}'::integer[]))
+ Optimizer: Pivotal Optimizer (GPORCA) version 3.82.0
+(6 rows)
 
+SELECT * FROM btree_test WHERE a in ('1', '2', 47);
+ a  | b  
+----+----
+  1 |  1
+  2 |  2
+ 47 | 47
+(3 rows)
+
+CREATE INDEX btree_test_index_ab ON btree_test using btree(a,b);
+EXPLAIN SELECT * FROM btree_test WHERE a in (1, 2, 47) AND b > 1;
+                                       QUERY PLAN                                       
+----------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)  (cost=0.00..431.06 rows=4 width=8)
+   ->  Bitmap Heap Scan on btree_test  (cost=0.00..431.06 rows=2 width=8)
+         Recheck Cond: ((a = ANY ('{1,2,47}'::integer[])) AND (b > 1))
+         ->  Bitmap Index Scan on btree_test_index_ab  (cost=0.00..0.00 rows=0 width=0)
+               Index Cond: ((a = ANY ('{1,2,47}'::integer[])) AND (b > 1))
+ Optimizer: Pivotal Optimizer (GPORCA) version 3.82.0
+(6 rows)
+
+SELECT * FROM btree_test WHERE a in (1, 2, 47) AND b > 1;
+ a  | b  
+----+----
+  2 |  2
+ 47 | 47
+(2 rows)
+
+-- start_ignore
+select enable_xform('CXformSelect2IndexGet');
+           enable_xform           
+----------------------------------
+ CXformSelect2IndexGet is enabled
+(1 row)
+
+-- end_ignore
+reset optimizer_enable_tablescan;
 -- Test Bitmap index scan with in list
 CREATE TABLE bitmap_test as SELECT * FROM generate_series(1,100) as a distributed randomly;
 CREATE INDEX bitmap_index ON bitmap_test USING BITMAP(a);
@@ -10415,58 +10774,58 @@ EXPLAIN SELECT * FROM bitmap_test WHERE a in (1);
                                    QUERY PLAN                                    
 ---------------------------------------------------------------------------------
  Gather Motion 3:1  (slice1; segments: 3)  (cost=0.00..204.38 rows=1 width=4)
-   ->  Bitmap Table Scan on bitmap_test  (cost=0.00..204.38 rows=1 width=4)
+   ->  Bitmap Heap Scan on bitmap_test  (cost=0.00..204.38 rows=1 width=4)
          Recheck Cond: a = 1
          ->  Bitmap Index Scan on bitmap_index  (cost=0.00..0.00 rows=0 width=0)
                Index Cond: a = 1
  Settings:  optimizer_cte_inlining_bound=1000; optimizer_metadata_caching=on
- Optimizer status: PQO version 2.48.9
+ Optimizer status: Pivotal Optimizer (GPORCA) version 2.48.9
 (7 rows)
 
 EXPLAIN SELECT * FROM bitmap_test WHERE a in (1, 47);
                                    QUERY PLAN                                    
 ---------------------------------------------------------------------------------
  Gather Motion 3:1  (slice1; segments: 3)  (cost=0.00..408.76 rows=3 width=4)
-   ->  Bitmap Table Scan on bitmap_test  (cost=0.00..408.76 rows=1 width=4)
+   ->  Bitmap Heap Scan on bitmap_test  (cost=0.00..408.76 rows=1 width=4)
          Recheck Cond: a = ANY ('{1,47}'::integer[])
          ->  Bitmap Index Scan on bitmap_index  (cost=0.00..0.00 rows=0 width=0)
                Index Cond: a = ANY ('{1,47}'::integer[])
  Settings:  optimizer=on; optimizer_metadata_caching=on
- Optimizer status: PQO version 1.647
+ Optimizer status: Pivotal Optimizer (GPORCA) version 1.647
 (7 rows)
 
 EXPLAIN SELECT * FROM bitmap_test WHERE a in ('2', 47);
                                    QUERY PLAN                                    
 ---------------------------------------------------------------------------------
  Gather Motion 3:1  (slice1; segments: 3)  (cost=0.00..408.76 rows=3 width=4)
-   ->  Bitmap Table Scan on bitmap_test  (cost=0.00..408.76 rows=1 width=4)
+   ->  Bitmap Heap Scan on bitmap_test  (cost=0.00..408.76 rows=1 width=4)
          Recheck Cond: a = ANY ('{2,47}'::integer[])
          ->  Bitmap Index Scan on bitmap_index  (cost=0.00..0.00 rows=0 width=0)
                Index Cond: a = ANY ('{2,47}'::integer[])
  Settings:  optimizer=on; optimizer_metadata_caching=on
- Optimizer status: PQO version 1.647
+ Optimizer status: Pivotal Optimizer (GPORCA) version 1.647
 (7 rows)
 
 EXPLAIN SELECT * FROM bitmap_test WHERE a in ('1', '2');
                                    QUERY PLAN
 ---------------------------------------------------------------------------------
  Gather Motion 3:1  (slice1; segments: 3)  (cost=0.00..408.76 rows=3 width=4)
-   ->  Bitmap Table Scan on bitmap_test  (cost=0.00..408.76 rows=1 width=4)
+   ->  Bitmap Heap Scan on bitmap_test  (cost=0.00..408.76 rows=1 width=4)
          Recheck Cond: a = ANY ('{1,2}'::integer[])
          ->  Bitmap Index Scan on bitmap_index  (cost=0.00..0.00 rows=0 width=0)
                Index Cond: a = ANY ('{1,2}'::integer[])
  Settings:  optimizer=on; optimizer_metadata_caching=on
- Optimizer status: PQO version 1.647
+ Optimizer status: Pivotal Optimizer (GPORCA) version 1.647
 (7 rows)
 
 EXPLAIN SELECT * FROM bitmap_test WHERE a in ('1', '2', 47);
                                   QUERY PLAN
 ------------------------------------------------------------------------------
  Gather Motion 3:1  (slice1; segments: 3)  (cost=0.00..431.00 rows=4 width=4)
-   ->  Table Scan on bitmap_test  (cost=0.00..431.00 rows=2 width=4)
+   ->  Seq Scan on bitmap_test  (cost=0.00..431.00 rows=2 width=4)
          Filter: a = ANY ('{1,2,47}'::integer[])
  Settings:  optimizer=on; optimizer_metadata_caching=on
- Optimizer status: PQO version 1.647
+ Optimizer status: Pivotal Optimizer (GPORCA) version 1.647
 (5 rows)
 
 -- Test Logging for unsupported features in ORCA
@@ -10482,44 +10841,24 @@ set log_statement='none';
 set log_min_duration_statement=-1;
 set client_min_messages='log';
 explain select count(*) from foo group by cube(a,b);
-LOG:  2018-03-29 10:22:52:869837 PDT,THD000,NOTICE,"Feature not supported: Cube",
+LOG:  2019-05-31 15:13:50:374760 PDT,THD000,NOTICE,"Feature not supported: Grouping Sets",
 INFO:  GPORCA failed to produce a plan, falling back to planner
-DETAIL:  Feature not supported: Cube
-LOG:  Planner produced plan :0
-                                                                   QUERY PLAN                                                                   
-------------------------------------------------------------------------------------------------------------------------------------------------
- Gather Motion 3:1  (slice3; segments: 3)  (cost=10128.79..20306.02 rows=40897 width=28)
-   ->  Append  (cost=10128.79..20306.02 rows=13633 width=28)
-         ->  HashAggregate  (cost=10128.79..10408.61 rows=9328 width=28)
-               Group Key: "rollup".unnamed_attr_2, "rollup".unnamed_attr_1, "rollup"."grouping", "rollup"."group_id"
-               ->  Subquery Scan on "rollup"  (cost=8552.10..10074.98 rows=1435 width=28)
-                     ->  Redistribute Motion 3:3  (slice1; segments: 3)  (cost=8552.10..10031.93 rows=1435 width=28)
-                           Hash Key: rollup_1.unnamed_attr_2, rollup_1.unnamed_attr_1, (Grouping), group_id()
-                           ->  GroupAggregate  (cost=8552.10..9945.83 rows=1435 width=28)
-                                 Group Key: rollup_1."grouping", rollup_1."group_id"
-                                 ->  Subquery Scan on rollup_1  (cost=8552.10..9822.06 rows=2153 width=28)
-                                       ->  GroupAggregate  (cost=8552.10..9757.49 rows=2153 width=28)
-                                             Group Key: rollup_2.unnamed_attr_2, rollup_2."grouping", rollup_2."group_id"
-                                             ->  Subquery Scan on rollup_2  (cost=8552.10..9585.30 rows=2870 width=28)
-                                                   ->  GroupAggregate  (cost=8552.10..9499.20 rows=2870 width=28)
-                                                         Group Key: b, a
-                                                         ->  Sort  (cost=8552.10..8767.35 rows=28700 width=8)
-                                                               Sort Key: b, a
-                                                               ->  Shared Scan (share slice:id 1:0)  (cost=1391.50..1494.60 rows=28700 width=8)
-                                                                     ->  Materialize  (cost=0.00..1391.50 rows=28700 width=8)
-                                                                           ->  Seq Scan on foo  (cost=0.00..961.00 rows=28700 width=8)
-         ->  HashAggregate  (cost=9639.11..9768.26 rows=4305 width=28)
-               Group Key: rollup_3.unnamed_attr_1, rollup_3.unnamed_attr_2, rollup_3."grouping", rollup_3."group_id"
-               ->  Subquery Scan on rollup_3  (cost=8552.10..9585.30 rows=1435 width=28)
-                     ->  Redistribute Motion 3:3  (slice2; segments: 3)  (cost=8552.10..9542.25 rows=1435 width=28)
-                           Hash Key: a, b, (Grouping), group_id()
-                           ->  GroupAggregate  (cost=8552.10..9456.15 rows=1435 width=28)
-                                 Group Key: a
-                                 ->  Sort  (cost=8552.10..8767.35 rows=28700 width=8)
-                                       Sort Key: a, b
-                                       ->  Shared Scan (share slice:id 2:0)  (cost=1391.50..1494.60 rows=28700 width=8)
- Optimizer: legacy query optimizer
-(31 rows)
+DETAIL:  Feature not supported: Grouping Sets
+                                         QUERY PLAN                                         
+--------------------------------------------------------------------------------------------
+ GroupAggregate  (cost=8018.50..16794.97 rows=10611 width=16)
+   Group Key: a, b
+   Group Key: a
+   Group Key: ()
+   Sort Key: b
+     Group Key: b
+   ->  Gather Motion 3:1  (slice1; segments: 3)  (cost=8018.50..8233.75 rows=86100 width=8)
+         Merge Key: a, b
+         ->  Sort  (cost=8018.50..8233.75 rows=28700 width=8)
+               Sort Key: a, b
+               ->  Seq Scan on foo  (cost=0.00..961.00 rows=28700 width=8)
+ Optimizer: Postgres query optimizer
+(12 rows)
 
 reset client_min_messages;
 reset log_statement;
@@ -10643,9 +10982,9 @@ explain select * from foo where b in ('1', '2');
                                   QUERY PLAN                                   
 -------------------------------------------------------------------------------
  Gather Motion 3:1  (slice1; segments: 3)  (cost=0.00..431.00 rows=1 width=12)
-   ->  Table Scan on foo  (cost=0.00..431.00 rows=1 width=12)
+   ->  Seq Scan on foo  (cost=0.00..431.00 rows=1 width=12)
          Filter: b::text = ANY ('{1,2}'::text[])
- Optimizer: PQO version 2.64.0
+ Optimizer: Pivotal Optimizer (GPORCA) version 2.64.0
 (4 rows)
 
 set optimizer_enable_ctas = off;
@@ -10656,8 +10995,6 @@ create table foo_ctas(a) as (select generate_series(1,10)) distributed by (a);
 LOG:  2017-05-31 14:43:22:338568 PDT,THD000,NOTICE,"Feature not supported: CTAS. Set optimizer_enable_ctas to on to enable CTAS with GPORCA",
 INFO:  GPORCA failed to produce a plan, falling back to planner
 DETAIL:  Feature not supported: CTAS. Set optimizer_enable_ctas to on to enable CTAS with GPORCA
-LOG:  Planner produced plan :0
-LOG:  Computing Scalar Stats : column a
 reset client_min_messages;
 reset log_min_duration_statement;
 reset log_statement;
@@ -10676,27 +11013,26 @@ set optimizer_force_multistage_agg = off;
 set optimizer_force_three_stage_scalar_dqa = off;
 -- end_ignore
 explain (costs off) select count(*), t2.c from input_tab1 t1 left join input_tab2 t2 on t1.a = t2.c group by t2.c;
-                                      QUERY PLAN                                      
---------------------------------------------------------------------------------------
- Gather Motion 3:1  (slice2; segments: 3)
-   ->  GroupAggregate
+                                   QUERY PLAN                                   
+--------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  Finalize GroupAggregate
          Group Key: input_tab2.c
          ->  Sort
                Sort Key: input_tab2.c
-               ->  Redistribute Motion 3:3  (slice1; segments: 3)
+               ->  Redistribute Motion 3:3  (slice2; segments: 3)
                      Hash Key: input_tab2.c
-                     ->  Result
-                           ->  GroupAggregate
-                                 Group Key: input_tab2.c
-                                 ->  Sort
-                                       Sort Key: input_tab2.c
-                                       ->  Hash Left Join
-                                             Hash Cond: (input_tab1.a = input_tab2.c)
-                                             ->  Table Scan on input_tab1
-                                             ->  Hash
-                                                   ->  Table Scan on input_tab2
- Optimizer: PQO version 2.70.1
-(18 rows)
+                     ->  Partial GroupAggregate
+                           Group Key: input_tab2.c
+                           ->  Sort
+                                 Sort Key: input_tab2.c
+                                 ->  Hash Left Join
+                                       Hash Cond: (input_tab1.a = input_tab2.c)
+                                       ->  Seq Scan on input_tab1
+                                       ->  Hash
+                                             ->  Seq Scan on input_tab2
+ Optimizer: Pivotal Optimizer (GPORCA) version 3.83.0
+(17 rows)
 
 select count(*), t2.c from input_tab1 t1 left join input_tab2 t2 on t1.a = t2.c group by t2.c;
  count | c 
@@ -10734,26 +11070,20 @@ FROM   (SELECT *
         SELECT region,
                code
         FROM   tab_3)a;
-                                                          QUERY PLAN                                                          
-------------------------------------------------------------------------------------------------------------------------------
+                                                  QUERY PLAN                                                   
+---------------------------------------------------------------------------------------------------------------
  Aggregate  (cost=0.00..1293.00 rows=1 width=8)
-   ->  Gather Motion 3:1  (slice3; segments: 3)  (cost=0.00..1293.00 rows=1 width=8)
-         ->  Aggregate  (cost=0.00..1293.00 rows=1 width=8)
-               ->  Append  (cost=0.00..1293.00 rows=2 width=1)
-                     ->  Result  (cost=0.00..862.00 rows=1 width=11)
-                           ->  Hash Left Join  (cost=0.00..862.00 rows=1 width=3)
-                                 Hash Cond: tab_1.id::text = tab_2.id::text
-                                 ->  Redistribute Motion 3:3  (slice1; segments: 3)  (cost=0.00..431.00 rows=1 width=5)
-                                       Hash Key: tab_1.id
-                                       ->  Table Scan on tab_1  (cost=0.00..431.00 rows=1 width=5)
-                                 ->  Hash  (cost=431.00..431.00 rows=1 width=7)
-                                       ->  Redistribute Motion 3:3  (slice2; segments: 3)  (cost=0.00..431.00 rows=1 width=7)
-                                             Hash Key: tab_2.id::text
-                                             ->  Table Scan on tab_2  (cost=0.00..431.00 rows=1 width=7)
-                     ->  Result  (cost=0.00..431.00 rows=1 width=16)
-                           ->  Table Scan on tab_3  (cost=0.00..431.00 rows=1 width=8)
- Optimizer: PQO version 2.70.2
-(17 rows)
+   ->  Gather Motion 3:1  (slice1; segments: 3)  (cost=0.00..1293.00 rows=4 width=1)
+         ->  Append  (cost=0.00..1293.00 rows=2 width=1)
+               ->  Hash Left Join  (cost=0.00..862.00 rows=1 width=3)
+                     Hash Cond: ((tab_1.id)::text = (tab_2.id)::text)
+                     ->  Seq Scan on tab_1  (cost=0.00..431.00 rows=1 width=5)
+                     ->  Hash  (cost=431.00..431.00 rows=1 width=7)
+                           ->  Broadcast Motion 3:3  (slice2; segments: 3)  (cost=0.00..431.00 rows=1 width=7)
+                                 ->  Seq Scan on tab_2  (cost=0.00..431.00 rows=1 width=7)
+               ->  Seq Scan on tab_3  (cost=0.00..431.00 rows=1 width=8)
+ Optimizer: Pivotal Optimizer (GPORCA) version 3.83.0
+(11 rows)
 
 SELECT Count(*)
 FROM   (SELECT *
@@ -10819,6 +11149,31 @@ select c1 from t_outer where not c1 =all (select c2 from t_inner);
 (10 rows)
 
 reset optimizer_enable_streaming_material;
+-- Ensure that ORCA rescans the subquery in case of skip-level correlation with
+-- materialization
+drop table if exists wst0, wst1, wst2;
+NOTICE:  table "wst0" does not exist, skipping
+NOTICE:  table "wst1" does not exist, skipping
+NOTICE:  table "wst2" does not exist, skipping
+create table wst0(a0 int, b0 int);
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause -- Using column named 'a0' as the Greenplum Database data distribution key for this table.
+HINT:  The 'DISTRIBUTED BY' clause determines the distribution of data. Make sure column(s) chosen are the optimal data distribution key to minimize skew.
+create table wst1(a1 int, b1 int);
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause -- Using column named 'a1' as the Greenplum Database data distribution key for this table.
+HINT:  The 'DISTRIBUTED BY' clause determines the distribution of data. Make sure column(s) chosen are the optimal data distribution key to minimize skew.
+create table wst2(a2 int, b2 int);
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause -- Using column named 'a2' as the Greenplum Database data distribution key for this table.
+HINT:  The 'DISTRIBUTED BY' clause determines the distribution of data. Make sure column(s) chosen are the optimal data distribution key to minimize skew.
+insert into wst0 select i, i from generate_series(1,10) i;
+insert into wst1 select i, i from generate_series(1,10) i;
+insert into wst2 select i, i from generate_series(1,10) i;
+-- NB: the rank() is need to force materialization (via Sort) in the subplan
+select count(*) from wst0 where exists (select 1, rank() over (order by wst1.a1) from wst1 where a1 = (select b2 from wst2 where a0=a2+5));
+ count 
+-------
+     5
+(1 row)
+
 --
 -- Test to ensure sane behavior when DML queries are optimized by ORCA by
 -- enforcing a non-master gather motion, controlled by
@@ -10960,20 +11315,18 @@ INSERT INTO csq_cast_param_inner VALUES
 	(11, '11'),
 	(101, '12');
 EXPLAIN SELECT a FROM csq_cast_param_outer WHERE b in (SELECT CASE WHEN a > 1 THEN d ELSE '42' END FROM csq_cast_param_inner);
-                                                   QUERY PLAN                                                    
------------------------------------------------------------------------------------------------------------------
- Gather Motion 3:1  (slice2; segments: 3)  (cost=0.00..1324032.56 rows=2 width=4)
-   ->  Result  (cost=0.00..1324032.56 rows=1 width=4)
-         ->  Table Scan on csq_cast_param_outer  (cost=0.00..1324032.56 rows=1 width=4)
-               Filter: (SubPlan 1)
-               SubPlan 1  (slice2; segments: 3)
-                 ->  Result  (cost=0.00..431.00 rows=2 width=4)
-                       ->  Materialize  (cost=0.00..431.00 rows=2 width=4)
-                             ->  Broadcast Motion 3:3  (slice1; segments: 3)  (cost=0.00..431.00 rows=2 width=4)
-                                   ->  Table Scan on csq_cast_param_inner  (cost=0.00..431.00 rows=1 width=4)
- Settings:  optimizer_cte_inlining_bound=1000; optimizer_metadata_caching=on
- Optimizer status: PQO version 2.51.3
-(11 rows)
+                                                QUERY PLAN                                                 
+-----------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)  (cost=0.00..1324032.56 rows=2 width=4)
+   ->  Seq Scan on csq_cast_param_outer  (cost=0.00..1324032.56 rows=1 width=4)
+         Filter: (SubPlan 1)
+         SubPlan 1
+           ->  Result  (cost=0.00..431.00 rows=2 width=4)
+                 ->  Materialize  (cost=0.00..431.00 rows=2 width=4)
+                       ->  Broadcast Motion 3:3  (slice2; segments: 3)  (cost=0.00..431.00 rows=2 width=4)
+                             ->  Seq Scan on csq_cast_param_inner  (cost=0.00..431.00 rows=1 width=4)
+ Optimizer: Pivotal Optimizer (GPORCA) version 3.83.0
+(9 rows)
 
 SELECT a FROM csq_cast_param_outer WHERE b in (SELECT CASE WHEN a > 1 THEN d ELSE '42' END FROM csq_cast_param_inner);
  a 
@@ -10986,20 +11339,18 @@ DROP CAST (myint as int8);
 CREATE FUNCTION myint_numeric(myint) RETURNS numeric AS 'int4_numeric' LANGUAGE INTERNAL STRICT IMMUTABLE;
 CREATE CAST (myint AS numeric) WITH FUNCTION myint_numeric(myint) AS IMPLICIT;
 EXPLAIN SELECT a FROM csq_cast_param_outer WHERE b in (SELECT CASE WHEN a > 1 THEN d ELSE '42' END FROM csq_cast_param_inner);
-                                                   QUERY PLAN                                                    
------------------------------------------------------------------------------------------------------------------
- Gather Motion 3:1  (slice2; segments: 3)  (cost=0.00..1324032.56 rows=2 width=4)
-   ->  Result  (cost=0.00..1324032.56 rows=1 width=4)
-         ->  Table Scan on csq_cast_param_outer  (cost=0.00..1324032.56 rows=1 width=4)
-               Filter: (SubPlan 1)
-               SubPlan 1  (slice2; segments: 3)
-                 ->  Result  (cost=0.00..431.00 rows=2 width=4)
-                       ->  Materialize  (cost=0.00..431.00 rows=2 width=4)
-                             ->  Broadcast Motion 3:3  (slice1; segments: 3)  (cost=0.00..431.00 rows=2 width=4)
-                                   ->  Table Scan on csq_cast_param_inner  (cost=0.00..431.00 rows=1 width=4)
- Settings:  optimizer_cte_inlining_bound=1000; optimizer_metadata_caching=on
- Optimizer status: PQO version 2.51.3
-(11 rows)
+                                                QUERY PLAN                                                 
+-----------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)  (cost=0.00..1324032.56 rows=2 width=4)
+   ->  Seq Scan on csq_cast_param_outer  (cost=0.00..1324032.56 rows=1 width=4)
+         Filter: (SubPlan 1)
+         SubPlan 1
+           ->  Result  (cost=0.00..431.00 rows=2 width=4)
+                 ->  Materialize  (cost=0.00..431.00 rows=2 width=4)
+                       ->  Broadcast Motion 3:3  (slice2; segments: 3)  (cost=0.00..431.00 rows=2 width=4)
+                             ->  Seq Scan on csq_cast_param_inner  (cost=0.00..431.00 rows=1 width=4)
+ Optimizer: Pivotal Optimizer (GPORCA) version 3.83.0
+(9 rows)
 
 SELECT a FROM csq_cast_param_outer WHERE b in (SELECT CASE WHEN a > 1 THEN d ELSE '42' END FROM csq_cast_param_inner);
  a 
@@ -11020,19 +11371,19 @@ EXPLAIN SELECT a FROM ggg WHERE a NOT IN (NULL, '');
                                   QUERY PLAN                                  
 ------------------------------------------------------------------------------
  Gather Motion 3:1  (slice1; segments: 3)  (cost=0.00..431.00 rows=1 width=2)
-   ->  Table Scan on ggg  (cost=0.00..431.00 rows=1 width=2)
+   ->  Seq Scan on ggg  (cost=0.00..431.00 rows=1 width=2)
          Filter: a <> ALL ('{NULL,""}'::bpchar[])
- Optimizer: PQO version 2.54.5
+ Optimizer: Pivotal Optimizer (GPORCA) version 2.54.5
 (4 rows)
 
 EXPLAIN SELECT a FROM ggg WHERE a IN (NULL, 'x');
                                   QUERY PLAN                                  
 ------------------------------------------------------------------------------
  Gather Motion 3:1  (slice1; segments: 3)  (cost=0.00..431.00 rows=1 width=2)
-   ->  Table Scan on ggg  (cost=0.00..431.00 rows=1 width=2)
+   ->  Seq Scan on ggg  (cost=0.00..431.00 rows=1 width=2)
          Filter: (a = ANY ('{NULL,x}'::bpchar[]))
  Planning time: 4.708 ms
- Optimizer: PQO version 3.9.0
+ Optimizer: Pivotal Optimizer (GPORCA) version 3.9.0
 (5 rows)
 
 -- result node with one time filter and filter
@@ -11049,53 +11400,51 @@ ANALYZE onetimefilter2;
 EXPLAIN WITH abc AS (SELECT onetimefilter1.a, onetimefilter1.b FROM onetimefilter1, onetimefilter2 WHERE onetimefilter1.a=onetimefilter2.a) SELECT (SELECT 1 FROM abc WHERE f1.b = f2.b LIMIT 1), COALESCE((SELECT 2 FROM abc WHERE f1.a=random() AND f1.a=2), 0), (SELECT b FROM abc WHERE b=f1.b) FROM onetimefilter1 f1, onetimefilter2 f2 WHERE f1.b = f2.b;
                                                           QUERY PLAN                                                          
 ------------------------------------------------------------------------------------------------------------------------------
- Gather Motion 3:1  (slice6; segments: 3)  (cost=0.00..1852062876647.47 rows=11 width=12)
+ Gather Motion 3:1  (slice1; segments: 3)  (cost=0.00..1852062876647.47 rows=11 width=12)
    ->  Sequence  (cost=0.00..1852062876647.47 rows=4 width=12)
-         ->  Shared Scan (share slice:id 6:0)  (cost=0.00..862.00 rows=4 width=1)
+         ->  Shared Scan (share slice:id 1:0)  (cost=0.00..862.00 rows=4 width=1)
                ->  Materialize  (cost=0.00..862.00 rows=4 width=1)
                      ->  Hash Join  (cost=0.00..862.00 rows=4 width=8)
                            Hash Cond: (onetimefilter1_1.a = onetimefilter2_1.a)
-                           ->  Table Scan on onetimefilter1 onetimefilter1_1  (cost=0.00..431.00 rows=4 width=8)
+                           ->  Seq Scan on onetimefilter1 onetimefilter1_1  (cost=0.00..431.00 rows=4 width=8)
                            ->  Hash  (cost=431.00..431.00 rows=4 width=4)
-                                 ->  Table Scan on onetimefilter2 onetimefilter2_1  (cost=0.00..431.00 rows=4 width=4)
-         ->  Result  (cost=0.00..1852062875785.47 rows=4 width=12)
-               ->  Hash Join  (cost=0.00..862.00 rows=4 width=12)
-                     Hash Cond: (onetimefilter1.b = onetimefilter2.b)
-                     ->  Redistribute Motion 3:3  (slice1; segments: 3)  (cost=0.00..431.00 rows=4 width=8)
-                           Hash Key: onetimefilter1.b
-                           ->  Table Scan on onetimefilter1  (cost=0.00..431.00 rows=4 width=8)
-                     ->  Hash  (cost=431.00..431.00 rows=4 width=4)
-                           ->  Redistribute Motion 3:3  (slice2; segments: 3)  (cost=0.00..431.00 rows=4 width=4)
-                                 Hash Key: onetimefilter2.b
-                                 ->  Table Scan on onetimefilter2  (cost=0.00..431.00 rows=4 width=4)
-               SubPlan 1  (slice6; segments: 3)
+                                 ->  Seq Scan on onetimefilter2 onetimefilter2_1  (cost=0.00..431.00 rows=4 width=4)
+         ->  Hash Join  (cost=0.00..862.00 rows=4 width=12)
+               Hash Cond: (onetimefilter1.b = onetimefilter2.b)
+               ->  Redistribute Motion 3:3  (slice2; segments: 3)  (cost=0.00..431.00 rows=4 width=8)
+                     Hash Key: onetimefilter1.b
+                     ->  Seq Scan on onetimefilter1  (cost=0.00..431.00 rows=4 width=8)
+               ->  Hash  (cost=431.00..431.00 rows=4 width=4)
+                     ->  Redistribute Motion 3:3  (slice3; segments: 3)  (cost=0.00..431.00 rows=4 width=4)
+                           Hash Key: onetimefilter2.b
+                           ->  Seq Scan on onetimefilter2  (cost=0.00..431.00 rows=4 width=4)
+               SubPlan 1
                  ->  Result  (cost=0.00..431.01 rows=1 width=4)
                        ->  Limit  (cost=0.00..431.01 rows=1 width=1)
                              ->  Result  (cost=0.00..431.01 rows=5 width=1)
                                    One-Time Filter: (onetimefilter1.b = onetimefilter2.b)
                                    ->  Materialize  (cost=0.00..431.00 rows=11 width=1)
-                                         ->  Broadcast Motion 3:3  (slice3; segments: 3)  (cost=0.00..431.00 rows=11 width=1)
+                                         ->  Broadcast Motion 3:3  (slice4; segments: 3)  (cost=0.00..431.00 rows=11 width=1)
                                                ->  Result  (cost=0.00..431.00 rows=4 width=1)
-                                                     ->  Shared Scan (share slice:id 3:0)  (cost=0.00..431.00 rows=4 width=1)
-               SubPlan 2  (slice6; segments: 3)
+                                                     ->  Shared Scan (share slice:id 4:0)  (cost=0.00..431.00 rows=4 width=1)
+               SubPlan 2
                  ->  Result  (cost=0.00..431.33 rows=3 width=4)
                        ->  Result  (cost=0.00..431.33 rows=3 width=1)
                              One-Time Filter: (onetimefilter1.a = 2)
                              Filter: ((onetimefilter1.a)::double precision = random())
                              ->  Materialize  (cost=0.00..431.00 rows=11 width=1)
-                                   ->  Broadcast Motion 3:3  (slice4; segments: 3)  (cost=0.00..431.00 rows=11 width=1)
+                                   ->  Broadcast Motion 3:3  (slice5; segments: 3)  (cost=0.00..431.00 rows=11 width=1)
                                          ->  Result  (cost=0.00..431.00 rows=4 width=1)
-                                               ->  Shared Scan (share slice:id 4:0)  (cost=0.00..431.00 rows=4 width=1)
-               SubPlan 3  (slice6; segments: 3)
+                                               ->  Shared Scan (share slice:id 5:0)  (cost=0.00..431.00 rows=4 width=1)
+               SubPlan 3
                  ->  Result  (cost=0.00..431.66 rows=1 width=4)
                        Filter: (share0_ref3.b = onetimefilter1.b)
                        ->  Materialize  (cost=0.00..431.00 rows=11 width=4)
-                             ->  Broadcast Motion 3:3  (slice5; segments: 3)  (cost=0.00..431.00 rows=11 width=4)
+                             ->  Broadcast Motion 3:3  (slice6; segments: 3)  (cost=0.00..431.00 rows=11 width=4)
                                    ->  Result  (cost=0.00..431.00 rows=4 width=4)
-                                         ->  Shared Scan (share slice:id 5:0)  (cost=0.00..431.00 rows=4 width=4)
- Planning time: 65.338 ms
- Optimizer: PQO version 3.9.0
-(46 rows)
+                                         ->  Shared Scan (share slice:id 6:0)  (cost=0.00..431.00 rows=4 width=4)
+ Optimizer: Pivotal Optimizer (GPORCA) version 3.83.0
+(44 rows)
 
 WITH abc AS (SELECT onetimefilter1.a, onetimefilter1.b FROM onetimefilter1, onetimefilter2 WHERE onetimefilter1.a=onetimefilter2.a) SELECT (SELECT 1 FROM abc WHERE f1.b = f2.b LIMIT 1), COALESCE((SELECT 2 FROM abc WHERE f1.a=random() AND f1.a=2), 0), (SELECT b FROM abc WHERE b=f1.b) FROM onetimefilter1 f1, onetimefilter2 f2 WHERE f1.b = f2.b;
  ?column? | coalesce | b  
@@ -11112,3 +11461,730 @@ WITH abc AS (SELECT onetimefilter1.a, onetimefilter1.b FROM onetimefilter1, onet
         1 |        0 | 10
 (10 rows)
 
+-- full joins with predicates
+DROP TABLE IF EXISTS ffoo, fbar;
+NOTICE:  table "ffoo" does not exist, skipping
+NOTICE:  table "fbar" does not exist, skipping
+CREATE TABLE ffoo (a, b) AS (VALUES (1, 2), (2, 3), (4, 5), (5, 6), (6, 7)) DISTRIBUTED BY (a);
+CREATE TABLE fbar (c, d) AS (VALUES (1, 42), (2, 43), (4, 45), (5, 46)) DISTRIBUTED BY (c);
+SELECT d FROM ffoo FULL OUTER JOIN fbar ON a = c WHERE b BETWEEN 5 and 9;
+ d  
+----
+ 46
+   
+ 45
+(3 rows)
+
+-- test index left outer joins on bitmap and btree indexes on partitioned tables with and without select clause
+DROP TABLE IF EXISTS touter, tinner;
+NOTICE:  table "touter" does not exist, skipping
+NOTICE:  table "tinner" does not exist, skipping
+CREATE TABLE touter(a int, b int) DISTRIBUTED BY (a);
+CREATE TABLE tinnerbitmap(a int, b int) DISTRIBUTED BY (a) PARTITION BY range(b) (start (0) end (6) every (3));
+NOTICE:  CREATE TABLE will create partition "tinnerbitmap_1_prt_1" for table "tinnerbitmap"
+NOTICE:  CREATE TABLE will create partition "tinnerbitmap_1_prt_2" for table "tinnerbitmap"
+CREATE TABLE tinnerbtree(a int, b int) DISTRIBUTED BY (a) PARTITION BY range(b) (start (0) end (6) every (3));
+NOTICE:  CREATE TABLE will create partition "tinnerbtree_1_prt_1" for table "tinnerbtree"
+NOTICE:  CREATE TABLE will create partition "tinnerbtree_1_prt_2" for table "tinnerbtree"
+INSERT INTO touter SELECT i, i%6 FROM generate_series(1,10) i;
+INSERT INTO tinnerbitmap select i, i%6 FROM generate_series(1,1000) i;
+INSERT INTO tinnerbtree select i, i%6 FROM generate_series(1,1000) i;
+CREATE INDEX tinnerbitmap_ix ON tinnerbitmap USING bitmap(a);
+CREATE INDEX tinnerbtree_ix ON tinnerbtree USING btree(a);
+SELECT * FROM touter LEFT JOIN tinnerbitmap ON touter.a = tinnerbitmap.a;
+ a  | b | a  | b 
+----+---+----+---
+  1 | 1 |  1 | 1
+  6 | 0 |  6 | 0
+  5 | 5 |  5 | 5
+  9 | 3 |  9 | 3
+ 10 | 4 | 10 | 4
+  2 | 2 |  2 | 2
+  7 | 1 |  7 | 1
+  8 | 2 |  8 | 2
+  3 | 3 |  3 | 3
+  4 | 4 |  4 | 4
+(10 rows)
+
+SELECT * FROM touter LEFT JOIN tinnerbitmap ON touter.a = tinnerbitmap.a AND tinnerbitmap.b=10;
+ a  | b | a | b 
+----+---+---+---
+  2 | 2 |   |  
+  3 | 3 |   |  
+  4 | 4 |   |  
+  7 | 1 |   |  
+  8 | 2 |   |  
+  1 | 1 |   |  
+  5 | 5 |   |  
+  6 | 0 |   |  
+  9 | 3 |   |  
+ 10 | 4 |   |  
+(10 rows)
+
+SELECT * FROM touter LEFT JOIN tinnerbtree ON touter.a = tinnerbtree.a;
+ a  | b | a  | b 
+----+---+----+---
+  1 | 1 |  1 | 1
+  6 | 0 |  6 | 0
+  5 | 5 |  5 | 5
+  9 | 3 |  9 | 3
+ 10 | 4 | 10 | 4
+  2 | 2 |  2 | 2
+  7 | 1 |  7 | 1
+  8 | 2 |  8 | 2
+  3 | 3 |  3 | 3
+  4 | 4 |  4 | 4
+(10 rows)
+
+SELECT * FROM touter LEFT JOIN tinnerbtree ON touter.a = tinnerbtree.a AND tinnerbtree.b=10;
+ a  | b | a | b 
+----+---+---+---
+  1 | 1 |   |  
+  5 | 5 |   |  
+  6 | 0 |   |  
+  9 | 3 |   |  
+ 10 | 4 |   |  
+  2 | 2 |   |  
+  3 | 3 |   |  
+  4 | 4 |   |  
+  7 | 1 |   |  
+  8 | 2 |   |  
+(10 rows)
+
+-- test subplan in a qual under dynamic scan
+CREATE TABLE ds_part ( a INT, b INT, c INT) PARTITION BY RANGE(c)( START(1) END (10) EVERY (2), DEFAULT PARTITION deflt);
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause -- Using column named 'a' as the Greenplum Database data distribution key for this table.
+HINT:  The 'DISTRIBUTED BY' clause determines the distribution of data. Make sure column(s) chosen are the optimal data distribution key to minimize skew.
+NOTICE:  CREATE TABLE will create partition "ds_part_1_prt_deflt" for table "ds_part"
+NOTICE:  CREATE TABLE will create partition "ds_part_1_prt_2" for table "ds_part"
+NOTICE:  CREATE TABLE will create partition "ds_part_1_prt_3" for table "ds_part"
+NOTICE:  CREATE TABLE will create partition "ds_part_1_prt_4" for table "ds_part"
+NOTICE:  CREATE TABLE will create partition "ds_part_1_prt_5" for table "ds_part"
+NOTICE:  CREATE TABLE will create partition "ds_part_1_prt_6" for table "ds_part"
+CREATE TABLE non_part1 (c INT);
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause -- Using column named 'c' as the Greenplum Database data distribution key for this table.
+HINT:  The 'DISTRIBUTED BY' clause determines the distribution of data. Make sure column(s) chosen are the optimal data distribution key to minimize skew.
+CREATE TABLE non_part2 (e INT, f INT);
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause -- Using column named 'e' as the Greenplum Database data distribution key for this table.
+HINT:  The 'DISTRIBUTED BY' clause determines the distribution of data. Make sure column(s) chosen are the optimal data distribution key to minimize skew.
+INSERT INTO ds_part SELECT i, i, i FROM generate_series (1, 1000)i; 
+INSERT INTO non_part1 SELECT i FROM generate_series(1, 100)i; 
+INSERT INTO non_part2 SELECT i, i FROM generate_series(1, 100)i;
+SET optimizer_enforce_subplans TO ON;
+analyze ds_part;
+analyze non_part1;
+analyze non_part2;
+SELECT * FROM ds_part, non_part2 WHERE ds_part.c = non_part2.e AND non_part2.f = 10 AND a IN ( SELECT b + 1 FROM non_part1);
+ a | b | c | e | f 
+---+---+---+---+---
+(0 rows)
+
+explain SELECT * FROM ds_part, non_part2 WHERE ds_part.c = non_part2.e AND non_part2.f = 10 AND a IN ( SELECT b + 1 FROM non_part1);
+                                                     QUERY PLAN                                                     
+--------------------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)  (cost=0.00..1324481.28 rows=1000 width=20)
+   ->  Hash Join  (cost=0.00..1324481.20 rows=334 width=20)
+         Hash Cond: (ds_part.c = non_part2.e)
+         ->  Dynamic Seq Scan on ds_part (dynamic scan id: 1)  (cost=0.00..1324050.11 rows=334 width=12)
+               Filter: ((a = (b + 1)) AND (SubPlan 1))
+               SubPlan 1
+                 ->  Materialize  (cost=0.00..431.00 rows=1 width=4)
+                       ->  Broadcast Motion 1:3  (slice2)  (cost=0.00..431.00 rows=3 width=4)
+                             ->  Limit  (cost=0.00..431.00 rows=1 width=4)
+                                   ->  Gather Motion 3:1  (slice3; segments: 3)  (cost=0.00..431.00 rows=1 width=4)
+                                         ->  Limit  (cost=0.00..431.00 rows=1 width=4)
+                                               ->  Seq Scan on non_part1  (cost=0.00..431.00 rows=34 width=4)
+         ->  Hash  (cost=100.00..100.00 rows=34 width=4)
+               ->  Partition Selector for ds_part (dynamic scan id: 1)  (cost=10.00..100.00 rows=34 width=4)
+                     ->  Broadcast Motion 3:3  (slice4; segments: 3)  (cost=0.00..431.00 rows=1 width=8)
+                           ->  Seq Scan on non_part2  (cost=0.00..431.00 rows=1 width=8)
+                                 Filter: (f = 10)
+ Optimizer: Pivotal Optimizer (GPORCA) version 3.65.0
+(18 rows)
+
+SELECT *, a IN ( SELECT b + 1 FROM non_part1) FROM ds_part, non_part2 WHERE ds_part.c = non_part2.e AND non_part2.f = 10 AND a IN ( SELECT b FROM non_part1);
+ a  | b  | c  | e  | f  | ?column? 
+----+----+----+----+----+----------
+ 10 | 10 | 10 | 10 | 10 | f
+(1 row)
+
+CREATE INDEX ds_idx ON ds_part(a);
+analyze ds_part;
+SELECT *, a IN ( SELECT b + 1 FROM non_part1) FROM ds_part, non_part2 WHERE ds_part.c = non_part2.e AND non_part2.f = 10 AND a IN ( SELECT b FROM non_part1);
+ a  | b  | c  | e  | f  | ?column? 
+----+----+----+----+----+----------
+ 10 | 10 | 10 | 10 | 10 | f
+(1 row)
+
+RESET optimizer_enforce_subplans;
+-- implied predicate must be generated for the type cast(ident) scalar array cmp const array
+CREATE TABLE varchar_sc_array_cmp(a varchar);
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause -- Using column named 'a' as the Greenplum Database data distribution key for this table.
+HINT:  The 'DISTRIBUTED BY' clause determines the distribution of data. Make sure column(s) chosen are the optimal data distribution key to minimize skew.
+INSERT INTO varchar_sc_array_cmp VALUES ('a'), ('b'), ('c'), ('d');
+EXPLAIN SELECT * FROM varchar_sc_array_cmp t1, varchar_sc_array_cmp t2 where t1.a = t2.a and t1.a in ('b', 'c');
+                                                      QUERY PLAN                                                      
+----------------------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)  (cost=0.00..862.00 rows=4 width=4)
+   ->  Hash Join  (cost=0.00..862.00 rows=2 width=4)
+         Hash Cond: ((varchar_sc_array_cmp.a)::text = (varchar_sc_array_cmp_1.a)::text)
+         ->  Seq Scan on varchar_sc_array_cmp  (cost=0.00..431.00 rows=1 width=2)
+               Filter: (((a)::text = ANY ('{b,c}'::text[])) AND (((a)::text = 'b'::text) OR ((a)::text = 'c'::text)))
+         ->  Hash  (cost=431.00..431.00 rows=1 width=2)
+               ->  Seq Scan on varchar_sc_array_cmp varchar_sc_array_cmp_1  (cost=0.00..431.00 rows=1 width=2)
+                     Filter: (((a)::text = 'b'::text) OR ((a)::text = 'c'::text))
+ Optimizer: Pivotal Optimizer (GPORCA) version 3.65.2
+(9 rows)
+
+SELECT * FROM varchar_sc_array_cmp t1, varchar_sc_array_cmp t2 where t1.a = t2.a and t1.a in ('b', 'c');
+ a | a 
+---+---
+ b | b
+ c | c
+(2 rows)
+
+SET optimizer_array_constraints=on;
+EXPLAIN SELECT * FROM varchar_sc_array_cmp t1, varchar_sc_array_cmp t2 where t1.a = t2.a and (t1.a in ('b', 'c') OR t1.a = 'a');
+                                                  QUERY PLAN                                                   
+---------------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)  (cost=0.00..862.00 rows=4 width=4)
+   ->  Hash Join  (cost=0.00..862.00 rows=2 width=4)
+         Hash Cond: ((varchar_sc_array_cmp.a)::text = (varchar_sc_array_cmp_1.a)::text)
+         ->  Seq Scan on varchar_sc_array_cmp  (cost=0.00..431.00 rows=1 width=2)
+               Filter: (a = ANY ('{a,b,c}'::character varying[]))
+         ->  Hash  (cost=431.00..431.00 rows=1 width=2)
+               ->  Seq Scan on varchar_sc_array_cmp varchar_sc_array_cmp_1  (cost=0.00..431.00 rows=1 width=2)
+                     Filter: (a = ANY ('{a,b,c}'::character varying[]))
+ Optimizer: Pivotal Optimizer (GPORCA) version 3.65.2
+(9 rows)
+
+SELECT * FROM varchar_sc_array_cmp t1, varchar_sc_array_cmp t2 where t1.a = t2.a and (t1.a in ('b', 'c') OR t1.a = 'a');
+ a | a 
+---+---
+ a | a
+ c | c
+ b | b
+(3 rows)
+
+DROP TABLE varchar_sc_array_cmp;
+-- table constraints on nullable columns
+-- start_ignore
+DROP TABLE IF EXISTS tc0, tc1, tc2, tc3, tc4;
+NOTICE:  table "tc0" does not exist, skipping
+NOTICE:  table "tc1" does not exist, skipping
+NOTICE:  table "tc2" does not exist, skipping
+NOTICE:  table "tc3" does not exist, skipping
+NOTICE:  table "tc4" does not exist, skipping
+-- end_ignore
+CREATE TABLE tc0 (a int check (a = 5));
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause -- Using column named 'a' as the Greenplum Database data distribution key for this table.
+HINT:  The 'DISTRIBUTED BY' clause determines the distribution of data. Make sure column(s) chosen are the optimal data distribution key to minimize skew.
+INSERT INTO tc0 VALUES (NULL);
+-- FIXME: Planner gives wrong result
+SELECT * from tc0 where a IS NULL;
+ a 
+---
+  
+(1 row)
+
+CREATE TABLE tc1 (a int check (a between 1 and 2 or a != 3 and a > 5));
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause -- Using column named 'a' as the Greenplum Database data distribution key for this table.
+HINT:  The 'DISTRIBUTED BY' clause determines the distribution of data. Make sure column(s) chosen are the optimal data distribution key to minimize skew.
+INSERT INTO tc1 VALUES (NULL);
+SELECT * from tc1 where a IS NULL;
+ a 
+---
+  
+(1 row)
+
+CREATE TABLE tc2 (a int check (a in (1,2)));
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause -- Using column named 'a' as the Greenplum Database data distribution key for this table.
+HINT:  The 'DISTRIBUTED BY' clause determines the distribution of data. Make sure column(s) chosen are the optimal data distribution key to minimize skew.
+INSERT INTO tc2 VALUES (NULL);
+SELECT * from tc2 where a IS NULL;
+ a 
+---
+  
+(1 row)
+
+set optimizer_array_constraints = on;
+CREATE TABLE tc3 (a int check (a = ANY (ARRAY[1,2])));
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause -- Using column named 'a' as the Greenplum Database data distribution key for this table.
+HINT:  The 'DISTRIBUTED BY' clause determines the distribution of data. Make sure column(s) chosen are the optimal data distribution key to minimize skew.
+INSERT INTO tc3 VALUES (NULL);
+SELECT * from tc3 where a IS NULL;
+ a 
+---
+  
+(1 row)
+
+reset optimizer_array_constraints;
+CREATE TABLE tc4 (a int, b int, check(a + b > 1 and a = b));
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause -- Using column named 'a' as the Greenplum Database data distribution key for this table.
+HINT:  The 'DISTRIBUTED BY' clause determines the distribution of data. Make sure column(s) chosen are the optimal data distribution key to minimize skew.
+INSERT INTO tc4 VALUES(NULL, NULL);
+SELECT * from tc4 where a IS NULL;
+ a | b 
+---+---
+   |  
+(1 row)
+
+CREATE EXTENSION IF NOT EXISTS citext;
+drop table if exists tt, tc;
+NOTICE:  table "tt" does not exist, skipping
+NOTICE:  table "tc" does not exist, skipping
+create table tc (a int, c citext) distributed by (a);
+create table tt (b int, v varchar) distributed by (v);
+insert into tc values (1, 'a'), (1, 'A');
+insert into tt values (1, 'a'), (1, 'A');
+insert into tc values (1, 'b'), (1, 'B');
+insert into tt values (1, 'b'), (1, 'B');
+select * from tc, tt where c = v;
+ a | c | b | v 
+---+---+---+---
+ 1 | a | 1 | a
+ 1 | A | 1 | A
+ 1 | B | 1 | B
+ 1 | b | 1 | b
+(4 rows)
+
+-- test gpexpand phase 1
+-- right now, these will fall back to planner
+drop table if exists noexp_hash, gpexp_hash, gpexp_rand, gpexp_repl;
+NOTICE:  table "noexp_hash" does not exist, skipping
+NOTICE:  table "gpexp_hash" does not exist, skipping
+NOTICE:  table "gpexp_rand" does not exist, skipping
+NOTICE:  table "gpexp_repl" does not exist, skipping
+create table noexp_hash(a int, b int) distributed by (a);
+insert into  noexp_hash select i, i from generate_series(1,50) i;
+-- three tables that will be expanded (simulated)
+create table gpexp_hash(a int, b int) distributed by (a);
+create table gpexp_rand(a int, b int) distributed randomly;
+create table gpexp_repl(a int, b int) distributed replicated;
+-- simulate a cluster with one segment less than we have now
+set allow_system_table_mods = true;
+update gp_distribution_policy set numsegments = numsegments-1 where localoid = 'gpexp_hash'::regclass and numsegments > 1;
+update gp_distribution_policy set numsegments = numsegments-1 where localoid = 'gpexp_rand'::regclass and numsegments > 1;
+update gp_distribution_policy set numsegments = numsegments-1 where localoid = 'gpexp_repl'::regclass and numsegments > 1;
+reset allow_system_table_mods;
+-- populate the tables on this smaller cluster
+explain insert into gpexp_hash select i, i from generate_series(1,50) i;
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  Unknown error: Partially Distributed Data
+                                         QUERY PLAN                                         
+--------------------------------------------------------------------------------------------
+ Insert on gpexp_hash  (cost=0.00..30.00 rows=500 width=8)
+   ->  Redistribute Motion 1:2  (slice1; segments: 1)  (cost=0.00..30.00 rows=1000 width=8)
+         Hash Key: i.i
+         ->  Function Scan on generate_series i  (cost=0.00..10.00 rows=500 width=8)
+ Optimizer: Postgres query optimizer
+(5 rows)
+
+insert into gpexp_hash select i, i from generate_series(1,50) i;
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  Unknown error: Partially Distributed Data
+insert into gpexp_rand select i, i from generate_series(1,50) i;
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  Unknown error: Partially Distributed Data
+insert into gpexp_repl select i, i from generate_series(1,50) i;
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  Unknown error: Partially Distributed Data
+-- the segment ids in the unmodified table should have one extra number
+select max(noexp_hash.gp_segment_id) - max(gpexp_hash.gp_segment_id) as expect_one
+from noexp_hash, gpexp_hash;
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  Unknown error: Partially Distributed Data
+ expect_one 
+------------
+          1
+(1 row)
+
+-- join should have a redistribute motion for gpexp_hash
+explain select count(*) from noexp_hash n join gpexp_hash x on n.a=x.a;
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  Unknown error: Partially Distributed Data
+                                                   QUERY PLAN                                                    
+-----------------------------------------------------------------------------------------------------------------
+ Finalize Aggregate  (cost=8.47..8.48 rows=1 width=8)
+   ->  Gather Motion 3:1  (slice2; segments: 3)  (cost=8.44..8.47 rows=1 width=8)
+         ->  Partial Aggregate  (cost=8.44..8.45 rows=1 width=8)
+               ->  Hash Join  (cost=4.12..8.31 rows=17 width=0)
+                     Hash Cond: (n.a = x.a)
+                     ->  Seq Scan on noexp_hash n  (cost=0.00..3.50 rows=17 width=4)
+                     ->  Hash  (cost=3.50..3.50 rows=17 width=4)
+                           ->  Redistribute Motion 2:3  (slice1; segments: 2)  (cost=0.00..3.50 rows=25 width=4)
+                                 Hash Key: x.a
+                                 ->  Seq Scan on gpexp_hash x  (cost=0.00..2.50 rows=25 width=4)
+ Optimizer: Postgres query optimizer
+(11 rows)
+
+select count(*) from noexp_hash n join gpexp_hash x on n.a=x.a;
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  Unknown error: Partially Distributed Data
+ count 
+-------
+    50
+(1 row)
+
+delete from gpexp_hash where b between 21 and 50;
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  Unknown error: Partially Distributed Data
+select count(*) from gpexp_hash;
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  Unknown error: Partially Distributed Data
+ count 
+-------
+    20
+(1 row)
+
+update gpexp_hash set b=-1 where b between 11 and 100;
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  Unknown error: Partially Distributed Data
+select b, count(*) from gpexp_hash group by b order by b;
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  Unknown error: Partially Distributed Data
+ b  | count 
+----+-------
+ -1 |    10
+  1 |     1
+  2 |     1
+  3 |     1
+  4 |     1
+  5 |     1
+  6 |     1
+  7 |     1
+  8 |     1
+  9 |     1
+ 10 |     1
+(11 rows)
+
+explain update gpexp_rand set b=(select b from gpexp_hash where gpexp_rand.a = gpexp_hash.a);
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  Unknown error: Partially Distributed Data
+                                                QUERY PLAN                                                
+----------------------------------------------------------------------------------------------------------
+ Update on gpexp_rand  (cost=0.00..216.00 rows=25 width=18)
+   ->  Seq Scan on gpexp_rand  (cost=0.00..215.00 rows=25 width=18)
+         SubPlan 1
+           ->  Result  (cost=0.00..4.25 rows=50 width=4)
+                 Filter: (gpexp_rand.a = gpexp_hash.a)
+                 ->  Materialize  (cost=0.00..3.75 rows=50 width=8)
+                       ->  Broadcast Motion 2:2  (slice1; segments: 2)  (cost=0.00..3.50 rows=25 width=8)
+                             ->  Seq Scan on gpexp_hash  (cost=0.00..2.50 rows=25 width=8)
+ Optimizer: Postgres query optimizer
+(9 rows)
+
+update gpexp_rand set b=(select b from gpexp_hash where gpexp_rand.a = gpexp_hash.a);
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  Unknown error: Partially Distributed Data
+select b, count(*) from gpexp_rand group by b order by b;
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  Unknown error: Partially Distributed Data
+ b  | count 
+----+-------
+ -1 |    10
+  1 |     1
+  2 |     1
+  3 |     1
+  4 |     1
+  5 |     1
+  6 |     1
+  7 |     1
+  8 |     1
+  9 |     1
+ 10 |     1
+    |    30
+(12 rows)
+
+delete from gpexp_repl where b >= 20;
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  Unknown error: Partially Distributed Data
+explain insert into gpexp_repl values (20, 20);
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  Unknown error: Partially Distributed Data
+                       QUERY PLAN                       
+--------------------------------------------------------
+ Insert on gpexp_repl  (cost=0.00..0.01 rows=1 width=8)
+   ->  Result  (cost=0.00..0.01 rows=1 width=8)
+ Optimizer: Postgres query optimizer
+(3 rows)
+
+insert into gpexp_repl values (20, 20);
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  Unknown error: Partially Distributed Data
+explain select count(*) from gpexp_hash h join gpexp_repl r on h.a=r.a;
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  Unknown error: Partially Distributed Data
+                                        QUERY PLAN                                         
+-------------------------------------------------------------------------------------------
+ Finalize Aggregate  (cost=5.47..5.48 rows=1 width=8)
+   ->  Gather Motion 2:1  (slice1; segments: 2)  (cost=5.44..5.47 rows=1 width=8)
+         ->  Partial Aggregate  (cost=5.44..5.45 rows=1 width=8)
+               ->  Hash Join  (cost=2.12..5.31 rows=25 width=0)
+                     Hash Cond: (h.a = r.a)
+                     ->  Seq Scan on gpexp_hash h  (cost=0.00..2.50 rows=25 width=4)
+                     ->  Hash  (cost=1.50..1.50 rows=17 width=4)
+                           ->  Seq Scan on gpexp_repl r  (cost=0.00..1.50 rows=50 width=4)
+ Optimizer: Postgres query optimizer
+(9 rows)
+
+select count(*) as expect_20 from gpexp_hash h join gpexp_repl r on h.a=r.a;
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  Unknown error: Partially Distributed Data
+ expect_20 
+-----------
+        20
+(1 row)
+
+explain select count(*) as expect_20 from noexp_hash h join gpexp_repl r on h.a=r.a;
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  Unknown error: Partially Distributed Data
+                                                   QUERY PLAN                                                    
+-----------------------------------------------------------------------------------------------------------------
+ Finalize Aggregate  (cost=7.47..7.48 rows=1 width=8)
+   ->  Gather Motion 3:1  (slice2; segments: 3)  (cost=7.44..7.47 rows=1 width=8)
+         ->  Partial Aggregate  (cost=7.44..7.45 rows=1 width=8)
+               ->  Hash Join  (cost=3.12..7.31 rows=17 width=0)
+                     Hash Cond: (h.a = r.a)
+                     ->  Seq Scan on noexp_hash h  (cost=0.00..3.50 rows=17 width=4)
+                     ->  Hash  (cost=2.50..2.50 rows=17 width=4)
+                           ->  Redistribute Motion 1:3  (slice1; segments: 1)  (cost=0.00..2.50 rows=50 width=4)
+                                 Hash Key: r.a
+                                 ->  Seq Scan on gpexp_repl r  (cost=0.00..1.50 rows=50 width=4)
+ Optimizer: Postgres query optimizer
+(11 rows)
+
+select count(*) as expect_20 from noexp_hash h join gpexp_repl r on h.a=r.a;
+INFO:  GPORCA failed to produce a plan, falling back to planner
+DETAIL:  Unknown error: Partially Distributed Data
+ expect_20 
+-----------
+        20
+(1 row)
+
+create table part1(a int, b int) partition by range(b) (start(1) end(5) every(1));
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause -- Using column named 'a' as the Greenplum Database data distribution key for this table.
+HINT:  The 'DISTRIBUTED BY' clause determines the distribution of data. Make sure column(s) chosen are the optimal data distribution key to minimize skew.
+NOTICE:  CREATE TABLE will create partition "part1_1_prt_1" for table "part1"
+NOTICE:  CREATE TABLE will create partition "part1_1_prt_2" for table "part1"
+NOTICE:  CREATE TABLE will create partition "part1_1_prt_3" for table "part1"
+NOTICE:  CREATE TABLE will create partition "part1_1_prt_4" for table "part1"
+create table part2(a int, b int) partition by range(b) (start(1) end(5) every(1));
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause -- Using column named 'a' as the Greenplum Database data distribution key for this table.
+HINT:  The 'DISTRIBUTED BY' clause determines the distribution of data. Make sure column(s) chosen are the optimal data distribution key to minimize skew.
+NOTICE:  CREATE TABLE will create partition "part2_1_prt_1" for table "part2"
+NOTICE:  CREATE TABLE will create partition "part2_1_prt_2" for table "part2"
+NOTICE:  CREATE TABLE will create partition "part2_1_prt_3" for table "part2"
+NOTICE:  CREATE TABLE will create partition "part2_1_prt_4" for table "part2"
+insert into part1 select i, (i % 2) + 1 from generate_series(1, 1000) i;
+insert into part2 select i, (i % 2) + 1 from generate_series(1, 100) i;
+-- make sure some child partitions have not been analyzed. This just means that
+-- stats are missing for some child partition but not necessarily that the relation
+-- is empty. So we should not flag this as an empty relation 
+analyze part1_1_prt_1;
+analyze part1_1_prt_2;
+analyze part2_1_prt_1;
+analyze part2_1_prt_2;
+-- the plan should contain a 2 stage limit. If we incorrectly estimate that the
+-- relation is empty, we would end up choosing a single stage limit. 
+explain select * from part1, part2 where part1.b = part2.b limit 5;
+                                                               QUERY PLAN                                                                
+-----------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=0.00..862.14 rows=5 width=16)
+   ->  Gather Motion 3:1  (slice1; segments: 3)  (cost=0.00..862.14 rows=5 width=16)
+         ->  Limit  (cost=0.00..862.13 rows=2 width=16)
+               ->  Hash Join  (cost=0.00..862.13 rows=334 width=16)
+                     Hash Cond: (part1.b = part2.b)
+                     ->  Dynamic Seq Scan on part1 (dynamic scan id: 1)  (cost=0.00..431.01 rows=334 width=8)
+                     ->  Hash  (cost=100.00..100.00 rows=34 width=4)
+                           ->  Partition Selector for part1 (dynamic scan id: 1)  (cost=10.00..100.00 rows=34 width=4)
+                                 ->  Broadcast Motion 3:3  (slice2; segments: 3)  (cost=0.00..431.02 rows=100 width=8)
+                                       ->  Sequence  (cost=0.00..431.00 rows=34 width=8)
+                                             ->  Partition Selector for part2 (dynamic scan id: 2)  (cost=10.00..100.00 rows=34 width=4)
+                                                   Partitions selected: 4 (out of 4)
+                                             ->  Dynamic Seq Scan on part2 (dynamic scan id: 2)  (cost=0.00..431.00 rows=34 width=8)
+ Optimizer: Pivotal Optimizer (GPORCA) version 3.93.0
+(13 rows)
+
+-- test opfamily handling in ORCA
+CREATE FUNCTION abseq(int, int) RETURNS BOOL AS
+$$
+  begin return abs($1) = abs($2); end;
+$$ LANGUAGE plpgsql STRICT IMMUTABLE;
+CREATE OPERATOR |=| (
+  PROCEDURE = abseq,
+  LEFTARG = int,
+  RIGHTARG = int,
+  COMMUTATOR = |=|,
+  hashes, merges);
+CREATE FUNCTION abshashfunc(int) RETURNS int AS
+$$
+  begin return hashint4(abs($1)); end;
+$$ LANGUAGE plpgsql STRICT IMMUTABLE;
+CREATE FUNCTION abslt(int, int) RETURNS BOOL AS
+$$
+  begin return abs($1) < abs($2); end;
+$$ LANGUAGE plpgsql STRICT IMMUTABLE;
+CREATE OPERATOR |<| (
+  PROCEDURE = abslt,
+  LEFTARG = int,
+  RIGHTARG = int);
+CREATE FUNCTION absgt(int, int) RETURNS BOOL AS
+$$
+  begin return abs($1) > abs($2); end;
+$$ LANGUAGE plpgsql STRICT IMMUTABLE;
+CREATE OPERATOR |>| (
+  PROCEDURE = absgt,
+  LEFTARG = int,
+  RIGHTARG = int);
+CREATE FUNCTION abscmp(int, int) RETURNS int AS
+$$
+  begin return btint4cmp(abs($1),abs($2)); end;
+$$ LANGUAGE plpgsql STRICT IMMUTABLE;
+DROP TABLE IF EXISTS atab_old_hash;
+NOTICE:  table "atab_old_hash" does not exist, skipping
+DROP TABLE IF EXISTS btab_old_hash;
+NOTICE:  table "btab_old_hash" does not exist, skipping
+CREATE TABLE atab_old_hash (a int) DISTRIBUTED BY (a);
+CREATE TABLE btab_old_hash (b int) DISTRIBUTED BY (b);
+INSERT INTO atab_old_hash VALUES (-1), (0), (1);
+INSERT INTO btab_old_hash VALUES (-1), (0), (1), (2);
+-- Test simple join using the new operator(s) before creating the opclass/opfamily
+EXPLAIN SELECT a, b FROM atab_old_hash INNER JOIN btab_old_hash ON a |=| b;
+                                            QUERY PLAN                                             
+---------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice2; segments: 3)  (cost=0.00..1324032.87 rows=5 width=8)
+   ->  Nested Loop  (cost=0.00..1324032.87 rows=2 width=8)
+         Join Filter: (atab_old_hash.a |=| btab_old_hash.b)
+         ->  Seq Scan on btab_old_hash  (cost=0.00..431.00 rows=2 width=4)
+         ->  Materialize  (cost=0.00..431.00 rows=3 width=4)
+               ->  Broadcast Motion 3:3  (slice1; segments: 3)  (cost=0.00..431.00 rows=3 width=4)
+                     ->  Seq Scan on atab_old_hash  (cost=0.00..431.00 rows=1 width=4)
+ Optimizer: Pivotal Optimizer (GPORCA) version 3.93.0
+(8 rows)
+
+SELECT a, b FROM atab_old_hash INNER JOIN btab_old_hash ON a |=| b;
+ a  | b  
+----+----
+  0 |  0
+ -1 |  1
+  1 |  1
+ -1 | -1
+  1 | -1
+(5 rows)
+
+CREATE OPERATOR CLASS abs_int_hash_ops FOR TYPE int4
+  USING hash AS
+  OPERATOR 1 |=|,
+  FUNCTION 1 abshashfunc(int);
+CREATE OPERATOR CLASS abs_int_btree_ops FOR TYPE int4
+  USING btree AS
+  OPERATOR 1 |<|,
+  OPERATOR 3 |=|,
+  OPERATOR 5 |>|,
+  FUNCTION 1 abscmp(int, int);
+-- OK test different kinds of joins
+EXPLAIN SELECT a, b FROM atab_old_hash INNER JOIN btab_old_hash ON a |=| b;
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice3; segments: 3)  (cost=0.00..862.00 rows=5 width=8)
+   ->  Hash Join  (cost=0.00..862.00 rows=2 width=8)
+         Hash Cond: (btab_old_hash.b |=| atab_old_hash.a)
+         ->  Redistribute Motion 3:3  (slice1; segments: 3)  (cost=0.00..431.00 rows=2 width=4)
+               Hash Key: btab_old_hash.b
+               ->  Seq Scan on btab_old_hash  (cost=0.00..431.00 rows=2 width=4)
+         ->  Hash  (cost=431.00..431.00 rows=1 width=4)
+               ->  Redistribute Motion 3:3  (slice2; segments: 3)  (cost=0.00..431.00 rows=1 width=4)
+                     Hash Key: atab_old_hash.a
+                     ->  Seq Scan on atab_old_hash  (cost=0.00..431.00 rows=1 width=4)
+ Optimizer: Pivotal Optimizer (GPORCA) version 3.93.0
+(11 rows)
+
+SELECT a, b FROM atab_old_hash INNER JOIN btab_old_hash ON a |=| b;
+ a  | b  
+----+----
+  0 |  0
+  1 |  1
+ -1 |  1
+  1 | -1
+ -1 | -1
+(5 rows)
+
+EXPLAIN SELECT a, b FROM btab_old_hash LEFT OUTER JOIN atab_old_hash ON a |=| b;
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice3; segments: 3)  (cost=0.00..862.00 rows=7 width=8)
+   ->  Hash Left Join  (cost=0.00..862.00 rows=3 width=8)
+         Hash Cond: (btab_old_hash.b |=| atab_old_hash.a)
+         ->  Redistribute Motion 3:3  (slice1; segments: 3)  (cost=0.00..431.00 rows=2 width=4)
+               Hash Key: btab_old_hash.b
+               ->  Seq Scan on btab_old_hash  (cost=0.00..431.00 rows=2 width=4)
+         ->  Hash  (cost=431.00..431.00 rows=1 width=4)
+               ->  Redistribute Motion 3:3  (slice2; segments: 3)  (cost=0.00..431.00 rows=1 width=4)
+                     Hash Key: atab_old_hash.a
+                     ->  Seq Scan on atab_old_hash  (cost=0.00..431.00 rows=1 width=4)
+ Optimizer: Pivotal Optimizer (GPORCA) version 3.93.0
+(11 rows)
+
+SELECT a, b FROM btab_old_hash LEFT OUTER JOIN atab_old_hash ON a |=| b;
+ a  | b  
+----+----
+    |  2
+  0 |  0
+ -1 |  1
+  1 |  1
+ -1 | -1
+  1 | -1
+(6 rows)
+
+set optimizer_expand_fulljoin = on;
+EXPLAIN SELECT a, b FROM atab_old_hash FULL JOIN btab_old_hash ON a |=| b;
+                                                       QUERY PLAN                                                       
+------------------------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)  (cost=0.00..2586.00 rows=10 width=8)
+   ->  Sequence  (cost=0.00..2586.00 rows=4 width=8)
+         ->  Shared Scan (share slice:id 1:0)  (cost=0.00..431.00 rows=1 width=1)
+               ->  Materialize  (cost=0.00..431.00 rows=1 width=1)
+                     ->  Seq Scan on atab_old_hash  (cost=0.00..431.00 rows=1 width=34)
+         ->  Sequence  (cost=0.00..2155.00 rows=4 width=8)
+               ->  Shared Scan (share slice:id 1:1)  (cost=0.00..431.00 rows=2 width=1)
+                     ->  Materialize  (cost=0.00..431.00 rows=2 width=1)
+                           ->  Seq Scan on btab_old_hash  (cost=0.00..431.00 rows=2 width=34)
+               ->  Append  (cost=0.00..1724.00 rows=4 width=8)
+                     ->  Hash Left Join  (cost=0.00..862.00 rows=2 width=8)
+                           Hash Cond: (share0_ref2.a |=| share1_ref2.b)
+                           ->  Redistribute Motion 3:3  (slice2; segments: 3)  (cost=0.00..431.00 rows=1 width=4)
+                                 Hash Key: share0_ref2.a
+                                 ->  Result  (cost=0.00..431.00 rows=1 width=4)
+                                       ->  Shared Scan (share slice:id 2:0)  (cost=0.00..431.00 rows=1 width=4)
+                           ->  Hash  (cost=431.00..431.00 rows=2 width=4)
+                                 ->  Redistribute Motion 3:3  (slice3; segments: 3)  (cost=0.00..431.00 rows=2 width=4)
+                                       Hash Key: share1_ref2.b
+                                       ->  Result  (cost=0.00..431.00 rows=2 width=4)
+                                             ->  Shared Scan (share slice:id 3:1)  (cost=0.00..431.00 rows=2 width=4)
+                     ->  Hash Anti Join  (cost=0.00..862.00 rows=2 width=4)
+                           Hash Cond: (share1_ref3.b |=| share0_ref3.a)
+                           ->  Redistribute Motion 3:3  (slice4; segments: 3)  (cost=0.00..431.00 rows=2 width=4)
+                                 Hash Key: share1_ref3.b
+                                 ->  Result  (cost=0.00..431.00 rows=2 width=4)
+                                       ->  Shared Scan (share slice:id 4:1)  (cost=0.00..431.00 rows=2 width=4)
+                           ->  Hash  (cost=431.00..431.00 rows=1 width=4)
+                                 ->  Redistribute Motion 3:3  (slice5; segments: 3)  (cost=0.00..431.00 rows=1 width=4)
+                                       Hash Key: share0_ref3.a
+                                       ->  Result  (cost=0.00..431.00 rows=1 width=4)
+                                             ->  Shared Scan (share slice:id 5:0)  (cost=0.00..431.00 rows=1 width=4)
+ Optimizer: Pivotal Optimizer (GPORCA) version 3.95.0
+(33 rows)
+
+SELECT a, b FROM atab_old_hash FULL JOIN btab_old_hash ON a |=| b;
+ a  | b  
+----+----
+    |  2
+  0 |  0
+  1 | -1
+  1 |  1
+ -1 | -1
+ -1 |  1
+(6 rows)
+
+reset optimizer_expand_fulljoin;

@@ -3,7 +3,7 @@
  * ipci.c
  *	  POSTGRES inter-process communication initialization code.
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -17,25 +17,28 @@
 #include <signal.h>
 
 #include "access/clog.h"
+#include "access/commit_ts.h"
 #include "access/heapam.h"
 #include "access/multixact.h"
 #include "access/nbtree.h"
 #include "access/subtrans.h"
 #include "access/twophase.h"
 #include "access/distributedlog.h"
-#include "access/appendonlywriter.h"
 #include "cdb/cdblocaldistribxact.h"
 #include "cdb/cdbvars.h"
 #include "commands/async.h"
+#include "executor/nodeShareInputScan.h"
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "postmaster/autovacuum.h"
 #include "postmaster/bgworker_internals.h"
 #include "postmaster/bgwriter.h"
 #include "postmaster/postmaster.h"
+#include "postmaster/fts.h"
 #include "replication/slot.h"
 #include "replication/walreceiver.h"
 #include "replication/walsender.h"
+#include "replication/origin.h"
 #include "storage/bufmgr.h"
 #include "storage/dsm.h"
 #include "storage/ipc.h"
@@ -52,6 +55,7 @@
 #include "utils/faultinjector.h"
 #include "utils/sharedsnapshot.h"
 #include "utils/gpexpand.h"
+#include "utils/snapmgr.h"
 
 #include "libpq-fe.h"
 #include "libpq-int.h"
@@ -136,9 +140,6 @@ CreateSharedMemoryAndSemaphores(bool makePrivate, int port)
 		size = add_size(size, BufferShmemSize());
 		size = add_size(size, LockShmemSize());
 		size = add_size(size, PredicateLockShmemSize());
-		size = add_size(size, workfile_mgr_shmem_size());
-		if (Gp_role == GP_ROLE_DISPATCH)
-			size = add_size(size, AppendOnlyWriterShmemSize());
 
 		if (IsResQueueEnabled() && Gp_role == GP_ROLE_DISPATCH)
 		{
@@ -147,11 +148,14 @@ CreateSharedMemoryAndSemaphores(bool makePrivate, int port)
 		}
 		else if (IsResGroupEnabled())
 			size = add_size(size, ResGroupShmemSize());
+		size = add_size(size, SharedSnapshotShmemSize());
+		size = add_size(size, FtsShmemSize());
 
 		size = add_size(size, ProcGlobalShmemSize());
 		size = add_size(size, XLOGShmemSize());
 		size = add_size(size, DistributedLog_ShmemSize());
 		size = add_size(size, CLOGShmemSize());
+		size = add_size(size, CommitTsShmemSize());
 		size = add_size(size, SUBTRANSShmemSize());
 		size = add_size(size, TwoPhaseShmemSize());
 		size = add_size(size, BackgroundWorkerShmemSize());
@@ -165,8 +169,10 @@ CreateSharedMemoryAndSemaphores(bool makePrivate, int port)
 		size = add_size(size, CheckpointerShmemSize());
 		size = add_size(size, AutoVacuumShmemSize());
 		size = add_size(size, ReplicationSlotsShmemSize());
+		size = add_size(size, ReplicationOriginShmemSize());
 		size = add_size(size, WalSndShmemSize());
 		size = add_size(size, WalRcvShmemSize());
+		size = add_size(size, SnapMgrShmemSize());
 		size = add_size(size, BTreeShmemSize());
 		size = add_size(size, SyncScanShmemSize());
 		size = add_size(size, AsyncShmemSize());
@@ -174,11 +180,11 @@ CreateSharedMemoryAndSemaphores(bool makePrivate, int port)
 		size = add_size(size, ShmemBackendArraySize());
 #endif
 
-		size = add_size(size, SharedSnapshotShmemSize());
-		size = add_size(size, FtsShmemSize());
 		size = add_size(size, tmShmemSize());
 		size = add_size(size, CheckpointerShmemSize());
 		size = add_size(size, CancelBackendMsgShmemSize());
+		size = add_size(size, WorkFileShmemSize());
+		size = add_size(size, ShareInputShmemSize());
 
 #ifdef FAULT_INJECTOR
 		size = add_size(size, FaultInjector_ShmemSize());
@@ -221,7 +227,6 @@ CreateSharedMemoryAndSemaphores(bool makePrivate, int port)
 
 		elog(DEBUG3,"reserving %d semaphores",numSemas);
 		PGReserveSemaphores(numSemas, port);
-		
 	}
 	else
 	{
@@ -260,6 +265,7 @@ CreateSharedMemoryAndSemaphores(bool makePrivate, int port)
 	XLOGShmemInit();
 	CLOGShmemInit();
 	DistributedLog_ShmemInit();
+	CommitTsShmemInit();
 	SUBTRANSShmemInit();
 	MultiXactShmemInit();
     FtsShmemInit();
@@ -275,12 +281,6 @@ CreateSharedMemoryAndSemaphores(bool makePrivate, int port)
 	 * Set up predicate lock manager
 	 */
 	InitPredicateLocks();
-
-	/*
-	 * Set up append only writer
-	 */
-	if (Gp_role == GP_ROLE_DISPATCH)
-		InitAppendOnlyWriter();
 
 	/*
 	 * Set up resource manager 
@@ -326,6 +326,7 @@ CreateSharedMemoryAndSemaphores(bool makePrivate, int port)
 	CheckpointerShmemInit();
 	AutoVacuumShmemInit();
 	ReplicationSlotsShmemInit();
+	ReplicationOriginShmemInit();
 	WalSndShmemInit();
 	WalRcvShmemInit();
 
@@ -336,11 +337,13 @@ CreateSharedMemoryAndSemaphores(bool makePrivate, int port)
 	/*
 	 * Set up other modules that need some shared memory space
 	 */
+	SnapMgrInit();
 	BTreeShmemInit();
 	SyncScanShmemInit();
 	AsyncShmemInit();
-	workfile_mgr_cache_init();
 	BackendCancelShmemInit();
+	WorkFileShmemInit();
+	ShareInputShmemInit();
 
 	/*
 	 * Set up Instrumentation free list
@@ -349,6 +352,9 @@ CreateSharedMemoryAndSemaphores(bool makePrivate, int port)
 		InstrShmemInit();
 
 	GpExpandVersionShmemInit();
+
+	FtsProbeShmemInit();
+
 #ifdef EXEC_BACKEND
 
 	/*

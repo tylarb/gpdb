@@ -222,6 +222,58 @@ from int8_tbl group by q1 order by q1;
 (2 rows)
 
 --
+-- Check EXISTS simplification with LIMIT
+--
+explain (costs off)
+select * from int4_tbl o where exists
+  (select 1 from int4_tbl i where i.f1=o.f1 limit null);
+                      QUERY PLAN                      
+------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  Hash Semi Join
+         Hash Cond: (int4_tbl.f1 = int4_tbl_1.f1)
+         ->  Seq Scan on int4_tbl
+         ->  Hash
+               ->  Seq Scan on int4_tbl int4_tbl_1
+ Optimizer: Pivotal Optimizer (GPORCA) version 3.83.0
+(7 rows)
+
+explain (costs off)
+select * from int4_tbl o where not exists
+  (select 1 from int4_tbl i where i.f1=o.f1 limit 1);
+                                QUERY PLAN                                
+--------------------------------------------------------------------------
+ Result
+   Filter: (SubPlan 1)
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Seq Scan on int4_tbl
+   SubPlan 1
+     ->  Result
+           ->  Limit
+                 ->  Result
+                       Filter: (int4_tbl_1.f1 = int4_tbl.f1)
+                       ->  Materialize
+                             ->  Gather Motion 3:1  (slice2; segments: 3)
+                                   ->  Seq Scan on int4_tbl int4_tbl_1
+ Optimizer: Pivotal Optimizer (GPORCA) version 3.83.0
+(13 rows)
+
+explain (costs off)
+select * from int4_tbl o where exists
+  (select 1 from int4_tbl i where i.f1=o.f1 limit 0);
+                      QUERY PLAN                      
+------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  Nested Loop Semi Join
+         Join Filter: true
+         ->  Seq Scan on int4_tbl
+         ->  Limit
+               ->  Result
+                     One-Time Filter: false
+ Optimizer: Pivotal Optimizer (GPORCA) version 3.83.0
+(8 rows)
+
+--
 -- Test cases to catch unpleasant interactions between IN-join processing
 -- and subquery pullup.
 --
@@ -612,6 +664,28 @@ from
 (0 rows)
 
 --
+-- Test case for subselect within UPDATE of INSERT...ON CONFLICT DO UPDATE
+--
+create temp table upsert(key int4 primary key, val text);
+insert into upsert values(1, 'val') on conflict (key) do update set val = 'not seen';
+insert into upsert values(1, 'val') on conflict (key) do update set val = 'seen with subselect ' || (select f1 from int4_tbl where f1 != 0 order by f1 limit 1)::text;
+select * from upsert;
+ key |               val               
+-----+---------------------------------
+   1 | seen with subselect -2147483647
+(1 row)
+
+with aa as (select 'int4_tbl' u from int4_tbl limit 1)
+insert into upsert values (1, 'x'), (999, 'y')
+on conflict (key) do update set val = (select u from aa)
+returning *;
+ key |   val    
+-----+----------
+   1 | int4_tbl
+ 999 | y
+(2 rows)
+
+--
 -- Test case for cross-type partial matching in hashed subplan (bug #7597)
 --
 create temp table outer_7597 (f1 int4, f2 int4);
@@ -642,52 +716,6 @@ select '1'::text in (select '1'::name union all select '1'::name);
 (1 row)
 
 --
--- Check for incorrect optimization when IN subquery contains a SRF
---
-set enable_hashjoin to 0;
-explain select * from int4_tbl o where (f1, f1) in
-  (select f1, generate_series(1,2) / 10 g from int4_tbl i group by f1);
-                                            QUERY PLAN                                             
----------------------------------------------------------------------------------------------------
- Gather Motion 3:1  (slice2; segments: 3)  (cost=1.02..2.03 rows=1 width=4)
-   ->  Seq Scan on int4_tbl o  (cost=1.02..2.03 rows=1 width=4)
-         Filter: (hashed SubPlan 1)
-         SubPlan 1
-           ->  Materialize  (cost=1.02..1.03 rows=1 width=4)
-                 ->  Broadcast Motion 3:3  (slice1; segments: 3)  (cost=0.00..1.01 rows=1 width=4)
-                       ->  Result  (cost=0.00..1.01 rows=1 width=4)
-                             ->  Seq Scan on int4_tbl i  (cost=0.00..1.01 rows=1 width=4)
- Settings:  enable_hashjoin=off; optimizer=on
- Optimizer status: legacy query optimizer
-(10 rows)
-
-select * from int4_tbl o where (f1, f1) in
-  (select f1, generate_series(1,2) / 10 g from int4_tbl i group by f1);
- f1 
-----
-  0
-(1 row)
-
-reset enable_hashjoin;
---
--- check for over-optimization of whole-row Var referencing an Append plan
---
-select (select q from
-         (select 1,2,3 where f1 > 0
-          union all
-          select 4,5,6.0 where f1 <= 0
-         ) q )
-from int4_tbl;
-     q     
------------
- (4,5,6.0)
- (1,2,3)
- (4,5,6.0)
- (1,2,3)
- (4,5,6.0)
-(5 rows)
-
---
 -- Test case for planner bug with nested EXISTS handling
 --
 select a.thousand from tenk1 a, tenk1 b
@@ -709,24 +737,18 @@ where a.thousand = b.thousand
 explain (verbose, costs off)
   select x, x from
     (select (select current_database()) as x from (values(1),(2)) v(y)) ss;
-                   QUERY PLAN                   
-------------------------------------------------
- Result
-   Output: current_database, current_database
+                      QUERY PLAN                      
+------------------------------------------------------
+ Nested Loop Left Join
+   Output: ('regression'::name), ('regression'::name)
+   Join Filter: true
+   ->  Values Scan on "Values"
+         Output: column1
    ->  Result
-         Output: current_database
-         ->  Nested Loop Left Join
-               Output: current_database
-               Join Filter: true
-               ->  Values Scan on "Values"
-                     Output: column1
-               ->  Result
-                     Output: 'regression'::name
-                     ->  Result
-                           Output: true
- Optimizer: PQO version 3.1.0
+         Output: 'regression'::name
+ Optimizer: Pivotal Optimizer (GPORCA) version 3.83.0
  Settings: optimizer=on
-(15 rows)
+(9 rows)
 
 explain (verbose, costs off)
   select x, x from
@@ -740,30 +762,24 @@ explain (verbose, costs off)
          InitPlan 1 (returns $0)
            ->  Result
                  Output: random()
- Optimizer: legacy query optimizer
+ Optimizer: Postgres query optimizer
 (8 rows)
 
 explain (verbose, costs off)
   select x, x from
     (select (select current_database() where y=y) as x from (values(1),(2)) v(y)) ss;
-                            QUERY PLAN                            
-------------------------------------------------------------------
- Result
-   Output: current_database, current_database
+                      QUERY PLAN                      
+------------------------------------------------------
+ Nested Loop Left Join
+   Output: ('regression'::name), ('regression'::name)
+   Join Filter: ("Values".column1 = "Values".column1)
+   ->  Values Scan on "Values"
+         Output: column1
    ->  Result
-         Output: current_database
-         ->  Nested Loop Left Join
-               Output: current_database
-               Join Filter: ("Values".column1 = "Values".column1)
-               ->  Values Scan on "Values"
-                     Output: column1
-               ->  Result
-                     Output: 'regression'::name
-                     ->  Result
-                           Output: true
- Optimizer: PQO version 3.1.0
+         Output: 'regression'::name
+ Optimizer: Pivotal Optimizer (GPORCA) version 3.83.0
  Settings: optimizer=on
-(15 rows)
+(9 rows)
 
 explain (verbose, costs off)
   select x, x from
@@ -778,7 +794,7 @@ explain (verbose, costs off)
            ->  Result
                  Output: random()
                  One-Time Filter: ("*VALUES*".column1 = "*VALUES*".column1)
- Optimizer: legacy query optimizer
+ Optimizer: Postgres query optimizer
 (9 rows)
 
 --
@@ -793,6 +809,36 @@ select exists(select * from nocolumns);
 (1 row)
 
 --
+-- Check behavior with a SubPlan in VALUES (bug #14924)
+--
+select val.x
+  from generate_series(1,10) as s(i),
+  lateral (
+    values ((select s.i + 1)), (s.i + 101)
+  ) as val(x)
+where s.i < 10 and (select val.x) < 110;
+  x  
+-----
+   2
+ 102
+   3
+ 103
+   4
+ 104
+   5
+ 105
+   6
+ 106
+   7
+ 107
+   8
+ 108
+   9
+ 109
+  10
+(17 rows)
+
+--
 -- Check sane behavior with nested IN SubLinks
 -- GPDB_94_MERGE_FIXME: ORCA plan is correct but very pricy. Should we fallback to planner?
 --
@@ -800,36 +846,34 @@ explain (verbose, costs off)
 select * from int4_tbl where
   (case when f1 in (select unique1 from tenk1 a) then f1 else null end) in
   (select ten from tenk1 b);
-                             QUERY PLAN                             
---------------------------------------------------------------------
+                          QUERY PLAN                          
+--------------------------------------------------------------
  Result
    Output: int4_tbl.f1
    Filter: (SubPlan 2)
    ->  Gather Motion 3:1  (slice1; segments: 3)
          Output: int4_tbl.f1
-         ->  Table Scan on public.int4_tbl
+         ->  Seq Scan on public.int4_tbl
                Output: int4_tbl.f1
-   SubPlan 1  (slice0)
+   SubPlan 1
      ->  Result
            Output: tenk1.unique1
-           ->  Result
-                 Output: true, tenk1.unique1
-                 ->  Materialize
+           ->  Materialize
+                 Output: tenk1.unique1
+                 ->  Gather Motion 3:1  (slice2; segments: 3)
                        Output: tenk1.unique1
-                       ->  Gather Motion 3:1  (slice2; segments: 3)
+                       ->  Seq Scan on public.tenk1
                              Output: tenk1.unique1
-                             ->  Table Scan on public.tenk1
-                                   Output: tenk1.unique1
-   SubPlan 2  (slice0)
+   SubPlan 2
      ->  Materialize
            Output: tenk1_1.ten
            ->  Gather Motion 3:1  (slice3; segments: 3)
                  Output: tenk1_1.ten
-                 ->  Table Scan on public.tenk1 tenk1_1
+                 ->  Seq Scan on public.tenk1 tenk1_1
                        Output: tenk1_1.ten
- Optimizer: PQO version 3.1.0
+ Optimizer: Pivotal Optimizer (GPORCA) version 3.83.0
  Settings: optimizer=on
-(27 rows)
+(25 rows)
 
 select * from int4_tbl where
   (case when f1 in (select unique1 from tenk1 a) then f1 else null end) in
@@ -839,3 +883,98 @@ select * from int4_tbl where
   0
 (1 row)
 
+--
+-- Check for incorrect optimization when IN subquery contains a SRF
+--
+explain (verbose, costs off)
+select * from int4_tbl o where (f1, f1) in
+  (select f1, generate_series(1,2) / 10 g from int4_tbl i group by f1);
+                              QUERY PLAN                              
+----------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   Output: o.f1
+   ->  Hash Semi Join
+         Output: o.f1
+         Hash Cond: (o.f1 = "ANY_subquery".f1)
+         ->  Seq Scan on public.int4_tbl o
+               Output: o.f1
+         ->  Hash
+               Output: "ANY_subquery".f1, "ANY_subquery".g
+               ->  Subquery Scan on "ANY_subquery"
+                     Output: "ANY_subquery".f1, "ANY_subquery".g
+                     Filter: ("ANY_subquery".f1 = "ANY_subquery".g)
+                     ->  Result
+                           Output: i.f1, (generate_series(1, 2) / 10)
+                           ->  Seq Scan on public.int4_tbl i
+                                 Output: i.f1
+ Optimizer: Postgres query optimizer
+(17 rows)
+
+select * from int4_tbl o where (f1, f1) in
+  (select f1, generate_series(1,2) / 10 g from int4_tbl i group by f1);
+ f1 
+----
+  0
+(1 row)
+
+--
+-- check for over-optimization of whole-row Var referencing an Append plan
+--
+select (select q from
+         (select 1,2,3 where f1 > 0
+          union all
+          select 4,5,6.0 where f1 <= 0
+         ) q )
+from int4_tbl;
+     q     
+-----------
+ (4,5,6.0)
+ (4,5,6.0)
+ (1,2,3)
+ (1,2,3)
+ (4,5,6.0)
+(5 rows)
+
+--
+-- Check that volatile quals aren't pushed down past a DISTINCT:
+-- nextval() should not be called more than the nominal number of times
+--
+create temp sequence ts1;
+select * from
+  (select distinct ten from tenk1) ss
+  where ten < 10 + nextval('ts1')
+  order by 1;
+ ten 
+-----
+   0
+   1
+   2
+   3
+   4
+   5
+   6
+   7
+   8
+   9
+(10 rows)
+
+select nextval('ts1');
+ nextval 
+---------
+      11
+(1 row)
+
+--
+-- Ensure that backward scan direction isn't propagated into
+-- expression subqueries (bug #15336)
+--
+--start_ignore
+begin;
+declare c1 scroll cursor for
+ select * from generate_series(1,4) i
+  where i <> all (values (2),(3));
+move forward all in c1;
+fetch backward all in c1;
+ERROR:  backward scan is not supported in this version of Greenplum Database
+commit;
+--end_ignore

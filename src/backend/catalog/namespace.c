@@ -9,7 +9,7 @@
  * and implementing search-path-controlled searches.
  *
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -26,7 +26,9 @@
 #include "catalog/namespace.h"
 #include "catalog/oid_dispatch.h"
 #include "access/htup_details.h"
+#include "access/parallel.h"
 #include "access/xact.h"
+#include "access/xlog.h"
 #include "catalog/dependency.h"
 #include "catalog/objectaccess.h"
 #include "catalog/pg_authid.h"
@@ -224,7 +226,6 @@ Datum		pg_ts_template_is_visible(PG_FUNCTION_ARGS);
 Datum		pg_ts_config_is_visible(PG_FUNCTION_ARGS);
 Datum		pg_my_temp_schema(PG_FUNCTION_ARGS);
 Datum		pg_is_other_temp_schema(PG_FUNCTION_ARGS);
-Datum       pg_objname_to_oid(PG_FUNCTION_ARGS);
 
 
 /*
@@ -274,9 +275,9 @@ RangeVarGetRelidExtended(const RangeVar *relation, LOCKMODE lockmode,
 	 * with the answer changing under them, or that they already hold some
 	 * appropriate lock, and therefore return the first answer we get without
 	 * checking for invalidation messages.  Also, if the requested lock is
-	 * already held, no LockRelationOid will not AcceptInvalidationMessages,
-	 * so we may fail to notice a change.  We could protect against that case
-	 * by calling AcceptInvalidationMessages() before beginning this loop, but
+	 * already held, LockRelationOid will not AcceptInvalidationMessages, so
+	 * we may fail to notice a change.  We could protect against that case by
+	 * calling AcceptInvalidationMessages() before beginning this loop, but
 	 * that would add a significant amount overhead, so for now we don't.
 	 */
 	for (;;)
@@ -309,7 +310,7 @@ RangeVarGetRelidExtended(const RangeVar *relation, LOCKMODE lockmode,
 					namespaceId = LookupExplicitNamespace(relation->schemaname, missing_ok);
 
 					/*
-					 * For missing_ok, allow a non-existant schema name to
+					 * For missing_ok, allow a non-existent schema name to
 					 * return InvalidOid.
 					 */
 					if (namespaceId != myTempNamespace)
@@ -516,7 +517,7 @@ RangeVarGetCreationNamespace(const RangeVar *newRelation)
  * the same name which already exists in that namespace, or to InvalidOid if
  * no such relation exists.
  *
- * If lockmode != NoLock, the specified lock mode is acquire on the existing
+ * If lockmode != NoLock, the specified lock mode is acquired on the existing
  * relation, if any, provided that the current user owns the target relation.
  * However, if lockmode != NoLock and the user does not own the target
  * relation, we throw an ERROR, as we must not try to lock relations the
@@ -525,9 +526,9 @@ RangeVarGetCreationNamespace(const RangeVar *newRelation)
  * As a side effect, this function acquires AccessShareLock on the target
  * namespace.  Without this, the namespace could be dropped before our
  * transaction commits, leaving behind relations with relnamespace pointing
- * to a no-longer-exstant namespace.
+ * to a no-longer-existent namespace.
  *
- * As a further side-effect, if the select namespace is a temporary namespace,
+ * As a further side-effect, if the selected namespace is a temporary namespace,
  * we mark the RangeVar as RELPERSISTENCE_TEMP.
  */
 Oid
@@ -643,7 +644,7 @@ RangeVarAdjustRelationPersistence(RangeVar *newRelation, Oid nspid)
 	switch (newRelation->relpersistence)
 	{
 		case RELPERSISTENCE_TEMP:
-			if (!isTempOrToastNamespace(nspid))
+			if (!isTempOrTempToastNamespace(nspid))
 			{
 				if (isAnyTempNamespace(nspid))
 					ereport(ERROR,
@@ -656,7 +657,7 @@ RangeVarAdjustRelationPersistence(RangeVar *newRelation, Oid nspid)
 			}
 			break;
 		case RELPERSISTENCE_PERMANENT:
-			if (isTempOrToastNamespace(nspid))
+			if (isTempOrTempToastNamespace(nspid))
 				newRelation->relpersistence = RELPERSISTENCE_TEMP;
 			else if (isAnyTempNamespace(nspid))
 				ereport(ERROR,
@@ -1130,8 +1131,8 @@ FuncnameGetCandidates(List *names, int nargs, List *argnames,
 		 */
 		effective_nargs = Max(pronargs, nargs);
 		newResult = (FuncCandidateList)
-			palloc(sizeof(struct _FuncCandidateList) - sizeof(Oid)
-				   + effective_nargs * sizeof(Oid));
+			palloc(offsetof(struct _FuncCandidateList, args) +
+				   effective_nargs * sizeof(Oid));
 		newResult->pathpos = pathpos;
 		newResult->oid = HeapTupleGetOid(proctup);
 		newResult->nargs = effective_nargs;
@@ -1652,7 +1653,8 @@ OpernameGetCandidates(List *names, char oprkind, bool missing_schema_ok)
 	 * separate palloc for each operator, but profiling revealed that the
 	 * pallocs used an unreasonably large fraction of parsing time.
 	 */
-#define SPACE_PER_OP MAXALIGN(sizeof(struct _FuncCandidateList) + sizeof(Oid))
+#define SPACE_PER_OP MAXALIGN(offsetof(struct _FuncCandidateList, args) + \
+							  2 * sizeof(Oid))
 
 	if (catlist->n_members > 0)
 		resultSpace = palloc(catlist->n_members * SPACE_PER_OP);
@@ -2830,24 +2832,13 @@ LookupCreationNamespace(const char *nspname)
 /*
  * Common checks on switching namespaces.
  *
- * We complain if (1) the old and new namespaces are the same, (2) either the
- * old or new namespaces is a temporary schema (or temporary toast schema), or
- * (3) either the old or new namespaces is the TOAST schema.
+ * We complain if either the old or new namespaces is a temporary schema
+ * (or temporary toast schema), or if either the old or new namespaces is the
+ * TOAST schema.
  */
 void
-CheckSetNamespace(Oid oldNspOid, Oid nspOid, Oid classid, Oid objid)
+CheckSetNamespace(Oid oldNspOid, Oid nspOid)
 {
-	if (oldNspOid == nspOid)
-		ereport(ERROR,
-				(classid == RelationRelationId ?
-				 errcode(ERRCODE_DUPLICATE_TABLE) :
-				 classid == ProcedureRelationId ?
-				 errcode(ERRCODE_DUPLICATE_FUNCTION) :
-				 errcode(ERRCODE_DUPLICATE_OBJECT),
-				 errmsg("%s is already in schema \"%s\"",
-						getObjectDescriptionOids(classid, objid),
-						get_namespace_name(nspOid))));
-
 	/* disallow renaming into or out of temp schemas */
 	if (isAnyTempNamespace(nspOid) || isAnyTempNamespace(oldNspOid))
 		ereport(ERROR,
@@ -3004,7 +2995,7 @@ NameListToString(List *names)
 		if (IsA(name, String))
 			appendStringInfoString(&string, strVal(name));
 		else if (IsA(name, A_Star))
-			appendStringInfoString(&string, "*");
+			appendStringInfoChar(&string, '*');
 		else
 			elog(ERROR, "unexpected node type in name list: %d",
 				 (int) nodeTag(name));
@@ -3073,11 +3064,11 @@ isTempToastNamespace(Oid namespaceId)
 }
 
 /*
- * isTempOrToastNamespace - is the given namespace my temporary-table
+ * isTempOrTempToastNamespace - is the given namespace my temporary-table
  *		namespace or my temporary-toast-table namespace?
  */
 bool
-isTempOrToastNamespace(Oid namespaceId)
+isTempOrTempToastNamespace(Oid namespaceId)
 {
 	if (OidIsValid(myTempNamespace) &&
 	 (myTempNamespace == namespaceId || myTempToastNamespace == namespaceId))
@@ -3123,7 +3114,7 @@ bool
 isOtherTempNamespace(Oid namespaceId)
 {
 	/* If it's my own temp namespace, say "false" */
-	if (isTempOrToastNamespace(namespaceId))
+	if (isTempOrTempToastNamespace(namespaceId))
 		return false;
 	/* Else, if it's any temp namespace, say "true" */
 	return isAnyTempNamespace(namespaceId);
@@ -3165,6 +3156,51 @@ GetTempToastNamespace(void)
 {
 	Assert(OidIsValid(myTempToastNamespace));
 	return myTempToastNamespace;
+}
+
+
+/*
+ * GetTempNamespaceState - fetch status of session's temporary namespace
+ *
+ * This is used for conveying state to a parallel worker, and is not meant
+ * for general-purpose access.
+ */
+void
+GetTempNamespaceState(Oid *tempNamespaceId, Oid *tempToastNamespaceId)
+{
+	/* Return namespace OIDs, or 0 if session has not created temp namespace */
+	*tempNamespaceId = myTempNamespace;
+	*tempToastNamespaceId = myTempToastNamespace;
+}
+
+/*
+ * SetTempNamespaceState - set status of session's temporary namespace
+ *
+ * This is used for conveying state to a parallel worker, and is not meant for
+ * general-purpose access.  By transferring these namespace OIDs to workers,
+ * we ensure they will have the same notion of the search path as their leader
+ * does.
+ */
+void
+SetTempNamespaceState(Oid tempNamespaceId, Oid tempToastNamespaceId)
+{
+	/* Worker should not have created its own namespaces ... */
+	Assert(myTempNamespace == InvalidOid);
+	Assert(myTempToastNamespace == InvalidOid);
+	Assert(myTempNamespaceSubID == InvalidSubTransactionId);
+
+	/* Assign same namespace OIDs that leader has */
+	myTempNamespace = tempNamespaceId;
+	myTempToastNamespace = tempToastNamespaceId;
+
+	/*
+	 * It's fine to leave myTempNamespaceSubID == InvalidSubTransactionId.
+	 * Even if the namespace is new so far as the leader is concerned, it's
+	 * not new to the worker, and we certainly wouldn't want the worker trying
+	 * to destroy it.
+	 */
+
+	baseSearchPathValid = false;	/* may need to rebuild list */
 }
 
 
@@ -3231,20 +3267,44 @@ CopyOverrideSearchPath(OverrideSearchPath *path)
 bool
 OverrideSearchPathMatchesCurrent(OverrideSearchPath *path)
 {
-	/* Easiest way to do this is GetOverrideSearchPath() and compare */
-	bool		result;
-	OverrideSearchPath *cur;
+	ListCell   *lc,
+			   *lcp;
 
-	cur = GetOverrideSearchPath(CurrentMemoryContext);
-	if (path->addCatalog == cur->addCatalog &&
-		path->addTemp == cur->addTemp &&
-		equal(path->schemas, cur->schemas))
-		result = true;
-	else
-		result = false;
-	list_free(cur->schemas);
-	pfree(cur);
-	return result;
+	recomputeNamespacePath();
+
+	/* We scan down the activeSearchPath to see if it matches the input. */
+	lc = list_head(activeSearchPath);
+
+	/* If path->addTemp, first item should be my temp namespace. */
+	if (path->addTemp)
+	{
+		if (lc && lfirst_oid(lc) == myTempNamespace)
+			lc = lnext(lc);
+		else
+			return false;
+	}
+	/* If path->addCatalog, next item should be pg_catalog. */
+	if (path->addCatalog)
+	{
+		if (lc && lfirst_oid(lc) == PG_CATALOG_NAMESPACE)
+			lc = lnext(lc);
+		else
+			return false;
+	}
+	/* We should now be looking at the activeCreationNamespace. */
+	if (activeCreationNamespace != (lc ? lfirst_oid(lc) : InvalidOid))
+		return false;
+	/* The remainder of activeSearchPath should match path->schemas. */
+	foreach(lcp, path->schemas)
+	{
+		if (lc && lfirst_oid(lc) == lfirst_oid(lcp))
+			lc = lnext(lc);
+		else
+			return false;
+	}
+	if (lc)
+		return false;
+	return true;
 }
 
 /*
@@ -3689,6 +3749,7 @@ InitTempTableNamespace(void)
 	Oid			namespaceId;
 	Oid			toastspaceId;
 	int			session_suffix;
+	const char *session_infix;
 
 	/*
 	 * First, do permission check to see if we are authorized to make temp
@@ -3716,16 +3777,34 @@ InitTempTableNamespace(void)
 		case GP_ROLE_DISPATCH:
 		case GP_ROLE_EXECUTE:
 			session_suffix = gp_session_id;
+			session_infix = "";
 			break;
 
 		case GP_ROLE_UTILITY:
 			session_suffix = MyBackendId;
+
+			/*
+			 * Backend id is used as the suffix of schema name in utility mode
+			 * while session id is used in normal mode.  It is possible for a
+			 * utility-mode session's backend id to be equal to a normal-mode
+			 * session's session id at runtime, if we use the same name pattern
+			 * for them then they would conflict with each other and corrupt
+			 * the catalog on the segment.  So a different name pattern must be
+			 * used in utility mode.  However a temp schema name is expected to
+			 * match the pattern "pg_temp_[0-9]+", so we put a 0 before the
+			 * backend id in utility mode to distinct with normal mode:
+			 *
+			 * - utility mode: pg_temp_0[0-9]+
+			 * - normal mode:  pg_temp_[1-9][0-9]*
+			 */
+			session_infix = "0";
 			break;
 
 		default:
 			/* Should never hit this */
 			elog(ERROR, "invalid backend temp schema creation");
 			session_suffix = -1;	/* keep compiler quiet */
+			session_infix = NULL;	/* keep compiler quiet */
 			break;
 	}
 
@@ -3744,7 +3823,14 @@ InitTempTableNamespace(void)
 				(errcode(ERRCODE_READ_ONLY_SQL_TRANSACTION),
 				 errmsg("cannot create temporary tables during recovery")));
 
-	snprintf(namespaceName, sizeof(namespaceName), "pg_temp_%d", session_suffix);
+	/* Parallel workers can't create temporary tables, either. */
+	if (IsParallelWorker())
+		ereport(ERROR,
+				(errcode(ERRCODE_READ_ONLY_SQL_TRANSACTION),
+				 errmsg("cannot create temporary tables in parallel mode")));
+
+	snprintf(namespaceName, sizeof(namespaceName),
+			 "pg_temp_%s%d", session_infix, session_suffix);
 
 	namespaceId = get_namespace_oid(namespaceName, true);
 
@@ -3791,8 +3877,8 @@ InitTempTableNamespace(void)
 	 * (in GPDB, though, we drop and recreate it anyway, to make sure it has
 	 * the same OID on master and segments.)
 	 */
-	snprintf(namespaceName, sizeof(namespaceName), "pg_toast_temp_%d",
-			 session_suffix);
+	snprintf(namespaceName, sizeof(namespaceName),
+			 "pg_toast_temp_%s%d", session_infix, session_suffix);
 
 	toastspaceId = get_namespace_oid(namespaceName, true);
 	if (OidIsValid(toastspaceId))
@@ -3921,7 +4007,7 @@ ResetTempNamespace(void)
  * End-of-transaction cleanup for namespaces.
  */
 void
-AtEOXact_Namespace(bool isCommit)
+AtEOXact_Namespace(bool isCommit, bool parallel)
 {
 	/*
 	 * If we abort the transaction in which a temp namespace was selected,
@@ -3931,7 +4017,7 @@ AtEOXact_Namespace(bool isCommit)
 	 * at backend shutdown.  (We only want to register the callback once per
 	 * session, so this is a good place to do it.)
 	 */
-	if (myTempNamespaceSubID != InvalidSubTransactionId)
+	if (myTempNamespaceSubID != InvalidSubTransactionId && !parallel)
 	{
 		if (isCommit)
 			before_shmem_exit(RemoveTempRelationsCallback, 0);
@@ -4138,6 +4224,7 @@ check_search_path(char **newval, void **extra, GucSource source)
 	 * here and so can't consult the system catalogs anyway.  So now, the only
 	 * requirement is syntactic validity of the identifier list.
 	 */
+
 	pfree(rawname);
 	list_free(namelist);
 
@@ -4485,14 +4572,4 @@ pg_is_other_temp_schema(PG_FUNCTION_ARGS)
 	Oid			oid = PG_GETARG_OID(0);
 
 	PG_RETURN_BOOL(isOtherTempNamespace(oid));
-}
-
-Datum
-pg_objname_to_oid(PG_FUNCTION_ARGS)
-{
-    text *s = PG_GETARG_TEXT_P(0); 
-    RangeVar *rv = makeRangeVarFromNameList(textToQualifiedNameList(s));
-    Oid relid = RangeVarGetRelid(rv, NoLock, true);
-
-    PG_RETURN_OID(relid);
 }

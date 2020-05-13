@@ -31,6 +31,9 @@ CREATE TYPE shell;   -- fail, type already present
 DROP TYPE shell;
 DROP TYPE shell;     -- fail, type not exist
 
+-- also, let's leave one around for purposes of pg_dump testing
+CREATE TYPE myshell;
+
 --
 -- Test type-related default values (broken in releases before PG 7.2)
 --
@@ -44,19 +47,19 @@ CREATE TYPE text_w_default;
 CREATE FUNCTION int42_in(cstring)
    RETURNS int42
    AS 'int4in'
-   LANGUAGE internal IMMUTABLE STRICT;
+   LANGUAGE internal STRICT IMMUTABLE;
 CREATE FUNCTION int42_out(int42)
    RETURNS cstring
    AS 'int4out'
-   LANGUAGE internal IMMUTABLE STRICT;
+   LANGUAGE internal STRICT IMMUTABLE;
 CREATE FUNCTION text_w_default_in(cstring)
    RETURNS text_w_default
    AS 'textin'
-   LANGUAGE internal IMMUTABLE STRICT;
+   LANGUAGE internal STRICT IMMUTABLE;
 CREATE FUNCTION text_w_default_out(text_w_default)
    RETURNS cstring
    AS 'textout'
-   LANGUAGE internal IMMUTABLE STRICT;
+   LANGUAGE internal STRICT IMMUTABLE;
 
 CREATE TYPE int42 (
    internallength = 4,
@@ -105,6 +108,23 @@ CREATE TYPE text_w_default;		-- should fail
 DROP TYPE default_test_row CASCADE;
 
 DROP TABLE default_test;
+
+-- Check type create with input/output incompatibility
+CREATE TYPE not_existing_type (INPUT = array_in,
+    OUTPUT = array_out,
+    ELEMENT = int,
+    INTERNALLENGTH = 32);
+
+-- Check dependency transfer of opaque functions when creating a new type
+CREATE FUNCTION base_fn_in(cstring) RETURNS opaque AS 'boolin'
+    LANGUAGE internal IMMUTABLE STRICT;
+CREATE FUNCTION base_fn_out(opaque) RETURNS opaque AS 'boolout'
+    LANGUAGE internal IMMUTABLE STRICT;
+CREATE TYPE base_type(INPUT = base_fn_in, OUTPUT = base_fn_out);
+DROP FUNCTION base_fn_in(cstring); -- error
+DROP FUNCTION base_fn_out(opaque); -- error
+DROP TYPE base_type; -- error
+DROP TYPE base_type CASCADE;
 
 -- Check usage of typmod with a user-defined type
 -- (we have borrowed numeric's typmod functions)

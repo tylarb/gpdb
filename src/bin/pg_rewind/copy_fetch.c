@@ -3,7 +3,7 @@
  * copy_fetch.c
  *	  Functions for using a data directory as the source.
  *
- * Portions Copyright (c) 2013-2015, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2013-2016, PostgreSQL Global Development Group
  *
  *-------------------------------------------------------------------------
  */
@@ -101,6 +101,11 @@ recurse_dir(const char *datadir, const char *parentpath,
 
 		if (S_ISREG(fst.st_mode))
 			callback(path, FILE_TYPE_REGULAR, fst.st_size, NULL);
+		else if (S_ISFIFO(fst.st_mode))
+		{
+			/* Greenplum uses FIFO for pgsql_tmp files. */
+			callback(path, FILE_TYPE_FIFO, fst.st_size, NULL);
+		}
 		else if (S_ISDIR(fst.st_mode))
 		{
 			callback(path, FILE_TYPE_DIRECTORY, 0, NULL);
@@ -125,6 +130,13 @@ recurse_dir(const char *datadir, const char *parentpath,
 				pg_fatal("symbolic link \"%s\" target is too long\n",
 						 fullpath);
 			link_target[len] = '\0';
+
+			if(parentpath && strcmp(parentpath, "pg_tblspc") == 0)
+			{
+				/* Lop off the dbid before sending the link target. */
+				char *file_sep_before_dbid_in_link_target = strrchr(link_target, '/');
+				*file_sep_before_dbid_in_link_target = '\0';
+			}
 
 			callback(path, FILE_TYPE_SYMLINK, 0, link_target);
 

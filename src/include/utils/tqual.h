@@ -5,7 +5,7 @@
  *
  *	  Should be moved/renamed...    - vadim 07/28/98
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/utils/tqual.h
@@ -17,25 +17,16 @@
 
 #include "utils/rel.h"	/* Relation */
 #include "utils/snapshot.h"
+#include "access/xlogdefs.h"
 
 
 /* Static variables representing various special snapshot semantics */
 extern PGDLLIMPORT SnapshotData SnapshotSelfData;
 extern PGDLLIMPORT SnapshotData SnapshotAnyData;
-extern PGDLLIMPORT SnapshotData SnapshotToastData;
 extern PGDLLIMPORT SnapshotData CatalogSnapshotData;
 
 #define SnapshotSelf		(&SnapshotSelfData)
 #define SnapshotAny			(&SnapshotAnyData)
-#define SnapshotToast		(&SnapshotToastData)
-
-/*
- * We don't provide a static SnapshotDirty variable because it would be
- * non-reentrant.  Instead, users of that snapshot type should declare a
- * local variable of type SnapshotData, and initialize it with this macro.
- */
-#define InitDirtySnapshot(snapshotdata)  \
-	((snapshotdata).satisfies = HeapTupleSatisfiesDirty)
 
 /* This macro encodes the knowledge of which snapshots are MVCC-safe */
 #define IsMVCCSnapshot(snapshot)  \
@@ -90,12 +81,22 @@ extern HTSV_Result HeapTupleSatisfiesVacuum(Relation relation, HeapTuple htup,
 extern bool HeapTupleIsSurelyDead(HeapTuple htup,
 					  TransactionId OldestXmin);
 
+typedef enum
+{
+	XID_NOT_IN_SNAPSHOT,
+	XID_IN_SNAPSHOT,
+	XID_SURELY_COMMITTED
+} XidInMVCCSnapshotCheckResult;
+extern XidInMVCCSnapshotCheckResult XidInMVCCSnapshot(TransactionId xid, Snapshot snapshot,
+							  bool distributedSnapshotIgnore, bool *setDistributedSnapshotIgnore);
+extern bool XidInMVCCSnapshot_Local(TransactionId xid, Snapshot snapshot);
+
 extern void HeapTupleSetHintBits(HeapTupleHeader tuple, Buffer buffer, Relation rel,
 					 uint16 infomask, TransactionId xid);
 extern bool HeapTupleHeaderIsOnlyLocked(HeapTupleHeader tuple);
 
 /*
- * To avoid leaking to much knowledge about reorderbuffer implementation
+ * To avoid leaking too much knowledge about reorderbuffer implementation
  * details this is implemented in reorderbuffer.c not tqual.c.
  */
 struct HTAB;
@@ -104,4 +105,22 @@ extern bool ResolveCminCmaxDuringDecoding(struct HTAB *tuplecid_data,
 							  HeapTuple htup,
 							  Buffer buffer,
 							  CommandId *cmin, CommandId *cmax);
+
+/*
+ * We don't provide a static SnapshotDirty variable because it would be
+ * non-reentrant.  Instead, users of that snapshot type should declare a
+ * local variable of type SnapshotData, and initialize it with this macro.
+ */
+#define InitDirtySnapshot(snapshotdata)  \
+	((snapshotdata).satisfies = HeapTupleSatisfiesDirty)
+
+/*
+ * Similarly, some initialization is required for SnapshotToast.  We need
+ * to set lsn and whenTaken correctly to support snapshot_too_old.
+ */
+#define InitToastSnapshot(snapshotdata, l, w)  \
+	((snapshotdata).satisfies = HeapTupleSatisfiesToast, \
+	 (snapshotdata).lsn = (l),					\
+	 (snapshotdata).whenTaken = (w))
+
 #endif   /* TQUAL_H */

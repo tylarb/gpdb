@@ -27,7 +27,7 @@
  * the backend's "backend/libpq" is quite separate from "interfaces/libpq".
  * All that remains is similarities of names to trap the unwary...
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *	src/backend/libpq/pqcomm.c
@@ -100,15 +100,32 @@
 #include "tcop/tcopprot.h"
 
 /*
+ * Cope with the various platform-specific ways to spell TCP keepalive socket
+ * options.  This doesn't cover Windows, which as usual does its own thing.
+ */
+#if defined(TCP_KEEPIDLE)
+/* TCP_KEEPIDLE is the name of this option on Linux and *BSD */
+#define PG_TCP_KEEPALIVE_IDLE TCP_KEEPIDLE
+#define PG_TCP_KEEPALIVE_IDLE_STR "TCP_KEEPIDLE"
+#elif defined(TCP_KEEPALIVE_THRESHOLD)
+/* TCP_KEEPALIVE_THRESHOLD is the name of this option on Solaris >= 11 */
+#define PG_TCP_KEEPALIVE_IDLE TCP_KEEPALIVE_THRESHOLD
+#define PG_TCP_KEEPALIVE_IDLE_STR "TCP_KEEPALIVE_THRESHOLD"
+#elif defined(TCP_KEEPALIVE) && defined(__darwin__)
+/* TCP_KEEPALIVE is the name of this option on macOS */
+/* Caution: Solaris has this symbol but it means something different */
+#define PG_TCP_KEEPALIVE_IDLE TCP_KEEPALIVE
+#define PG_TCP_KEEPALIVE_IDLE_STR "TCP_KEEPALIVE"
+#endif
+
+/*
  * Configuration options
  */
 int			Unix_socket_permissions;
 char	   *Unix_socket_group;
 
-
 /* Where the Unix socket files are (list of palloc'd strings) */
 static List *sock_paths = NIL;
-
 
 /*
  * Buffers for low-level I/O.
@@ -129,28 +146,48 @@ static char PqRecvBuffer[PQ_RECV_BUFFER_SIZE];
 static int	PqRecvPointer;		/* Next index to read a byte from PqRecvBuffer */
 static int	PqRecvLength;		/* End of data available in PqRecvBuffer */
 
-static pthread_mutex_t send_mutex = PTHREAD_MUTEX_INITIALIZER;
-
 /*
  * Message status
  */
 static bool PqCommBusy;			/* busy sending data to the client */
-/* XXX This flag is used by frontend protocal 1 and 2 only.  That is 
- * VERY OLD (We should be on Protocol 3).
- */
-static bool DoingCopyOut;
+static bool PqCommReadingMsg;	/* in the middle of reading a message */
+static bool DoingCopyOut;		/* in old-protocol COPY OUT processing */
+
 
 /* Internal functions */
-static void pq_close(int code, Datum arg);
+static void socket_comm_reset(void);
+static void socket_close(int code, Datum arg);
+static void socket_set_nonblocking(bool nonblocking);
+static int	socket_flush(void);
+static int	socket_flush_if_writable(void);
+static bool socket_is_send_pending(void);
+static int	socket_putmessage(char msgtype, const char *s, size_t len);
+static void socket_putmessage_noblock(char msgtype, const char *s, size_t len);
+static void socket_startcopyout(void);
+static void socket_endcopyout(bool errorAbort);
 static int	internal_putbytes(const char *s, size_t len);
 static int	internal_flush(void);
-static void pq_set_nonblocking(bool nonblocking);
-static bool pq_send_mutex_lock();
+static void socket_set_nonblocking(bool nonblocking);
 
 #ifdef HAVE_UNIX_SOCKETS
 static int	Lock_AF_UNIX(char *unixSocketDir, char *unixSocketPath);
 static int	Setup_AF_UNIX(char *sock_path);
 #endif   /* HAVE_UNIX_SOCKETS */
+
+static PQcommMethods PqCommSocketMethods = {
+	socket_comm_reset,
+	socket_flush,
+	socket_flush_if_writable,
+	socket_is_send_pending,
+	socket_putmessage,
+	socket_putmessage_noblock,
+	socket_startcopyout,
+	socket_endcopyout
+};
+
+PQcommMethods *PqCommMethods = &PqCommSocketMethods;
+
+WaitEventSet *FeBeWaitSet;
 
 
 /* --------------------------------
@@ -160,31 +197,57 @@ static int	Setup_AF_UNIX(char *sock_path);
 void
 pq_init(void)
 {
+	/* initialize state variables */
 	PqSendBufferSize = PQ_SEND_BUFFER_SIZE;
 	PqSendBuffer = MemoryContextAlloc(TopMemoryContext, PqSendBufferSize);
 	PqSendPointer = PqSendStart = PqRecvPointer = PqRecvLength = 0;
 	PqCommBusy = false;
+	PqCommReadingMsg = false;
 	DoingCopyOut = false;
-	on_proc_exit(pq_close, 0);
+
+	/* set up process-exit hook to close the socket */
+	on_proc_exit(socket_close, 0);
+
+	/*
+	 * In backends (as soon as forked) we operate the underlying socket in
+	 * nonblocking mode and use latches to implement blocking semantics if
+	 * needed. That allows us to provide safely interruptible reads and
+	 * writes.
+	 *
+	 * Use COMMERROR on failure, because ERROR would try to send the error to
+	 * the client, which might require changing the mode again, leading to
+	 * infinite recursion.
+	 */
+#ifndef WIN32
+	if (!pg_set_noblock(MyProcPort->sock))
+		ereport(COMMERROR,
+				(errmsg("could not set socket to nonblocking mode: %m")));
+#endif
+
+	FeBeWaitSet = CreateWaitEventSet(TopMemoryContext, 3);
+	AddWaitEventToSet(FeBeWaitSet, WL_SOCKET_WRITEABLE, MyProcPort->sock,
+					  NULL, NULL);
+	AddWaitEventToSet(FeBeWaitSet, WL_LATCH_SET, -1, MyLatch, NULL);
+	AddWaitEventToSet(FeBeWaitSet, WL_POSTMASTER_DEATH, -1, NULL, NULL);
 }
 
 /* --------------------------------
- *		pq_comm_reset - reset libpq during error recovery
+ *		socket_comm_reset - reset libpq during error recovery
  *
  * This is called from error recovery at the outer idle loop.  It's
  * just to get us out of trouble if we somehow manage to elog() from
  * inside a pqcomm.c routine (which ideally will never happen, but...)
  * --------------------------------
  */
-void
-pq_comm_reset(void)
+static void
+socket_comm_reset(void)
 {
 	/* We can abort any old-style COPY OUT, too */
 	pq_endcopyout(true);
 }
 
 /* --------------------------------
- *		pq_close - shutdown libpq at backend exit
+ *		socket_close - shutdown libpq at backend exit
  *
  * This is the one pg_on_exit_callback in place during BackendInitialize().
  * That function's unusual signal handling constrains that this callback be
@@ -192,7 +255,7 @@ pq_comm_reset(void)
  * --------------------------------
  */
 static void
-pq_close(int code, Datum arg)
+socket_close(int code, Datum arg)
 {
 	/* Nothing to do in a standalone backend, where MyProcPort is NULL. */
 	if (MyProcPort != NULL)
@@ -206,10 +269,10 @@ pq_close(int code, Datum arg)
 		 * BackendInitialize(), because pg_GSS_recvauth() makes first use of
 		 * "ctx" and "cred".
 		 */
-		if (MyProcPort->gss && (MyProcPort->gss->ctx != GSS_C_NO_CONTEXT))
+		if (MyProcPort->gss->ctx != GSS_C_NO_CONTEXT)
 			gss_delete_sec_context(&min_s, &MyProcPort->gss->ctx, NULL);
 
-		if (MyProcPort->gss && (MyProcPort->gss->cred != GSS_C_NO_CREDENTIAL))
+		if (MyProcPort->gss->cred != GSS_C_NO_CREDENTIAL)
 			gss_release_cred(&min_s, &MyProcPort->gss->cred);
 #endif   /* ENABLE_GSS */
 
@@ -268,28 +331,6 @@ pq_comm_close_fatal(void)
  *		Stream functions are used for vanilla TCP connection protocol.
  */
 
-
-/* StreamDoUnlink()
- * Shutdown routine for backend connection
- * If any Unix sockets are used for communication, explicitly close them.
- */
-#ifdef HAVE_UNIX_SOCKETS
-static void
-StreamDoUnlink(int code, Datum arg)
-{
-	ListCell   *l;
-
-	/* Loop through all created sockets... */
-	foreach(l, sock_paths)
-	{
-		char	   *sock_path = (char *) lfirst(l);
-
-		unlink(sock_path);
-	}
-	/* Since we're about to exit, no need to reclaim storage */
-	sock_paths = NIL;
-}
-#endif   /* HAVE_UNIX_SOCKETS */
 
 /*
  * StreamServerPort -- open a "listening" port to accept connections.
@@ -459,7 +500,8 @@ StreamServerPort(int family, char *hostName, unsigned short portNumber,
 			{
 				ereport(LOG,
 						(errcode_for_socket_access(),
-						 errmsg("setsockopt(SO_REUSEADDR) failed: %m")));
+						 errmsg("setsockopt(%s) failed: %m",
+								"SO_REUSEADDR")));
 				closesocket(fd);
 				continue;
 			}
@@ -474,7 +516,8 @@ StreamServerPort(int family, char *hostName, unsigned short portNumber,
 			{
 				ereport(LOG,
 						(errcode_for_socket_access(),
-						 errmsg("setsockopt(IPV6_V6ONLY) failed: %m")));
+						 errmsg("setsockopt(%s) failed: %m",
+								"IPV6_V6ONLY")));
 				closesocket(fd);
 				continue;
 			}
@@ -572,16 +615,11 @@ Lock_AF_UNIX(char *unixSocketDir, char *unixSocketPath)
 	 * Once we have the interlock, we can safely delete any pre-existing
 	 * socket file to avoid failure at bind() time.
 	 */
-	unlink(unixSocketPath);
+	(void) unlink(unixSocketPath);
 
 	/*
-	 * Arrange to unlink the socket file(s) at proc_exit.  If this is the
-	 * first one, set up the on_proc_exit function to do it; then add this
-	 * socket file to the list of files to unlink.
+	 * Remember socket file pathnames for later maintenance.
 	 */
-	if (sock_paths == NIL)
-		on_proc_exit(StreamDoUnlink, 0);
-
 	sock_paths = lappend(sock_paths, pstrdup(unixSocketPath));
 
 	return STATUS_OK;
@@ -727,13 +765,18 @@ StreamConnection(pgsocket server_fd, Port *port)
 	if (!IS_AF_UNIX(port->laddr.addr.ss_family))
 	{
 		int			on;
+#ifdef WIN32
+		int			oldopt;
+		int			optlen;
+		int			newopt;
+#endif
 
 #ifdef	TCP_NODELAY
 		on = 1;
 		if (setsockopt(port->sock, IPPROTO_TCP, TCP_NODELAY,
 					   (char *) &on, sizeof(on)) < 0)
 		{
-			elog(LOG, "setsockopt(TCP_NODELAY) failed: %m");
+			elog(LOG, "setsockopt(%s) failed: %m", "TCP_NODELAY");
 			return STATUS_ERROR;
 		}
 #endif
@@ -741,22 +784,49 @@ StreamConnection(pgsocket server_fd, Port *port)
 		if (setsockopt(port->sock, SOL_SOCKET, SO_KEEPALIVE,
 					   (char *) &on, sizeof(on)) < 0)
 		{
-			elog(LOG, "setsockopt(SO_KEEPALIVE) failed: %m");
+			elog(LOG, "setsockopt(%s) failed: %m", "SO_KEEPALIVE");
 			return STATUS_ERROR;
 		}
 
 #ifdef WIN32
 
 		/*
-		 * This is a Win32 socket optimization.  The ideal size is 32k.
-		 * http://support.microsoft.com/kb/823764/EN-US/
+		 * This is a Win32 socket optimization.  The OS send buffer should be
+		 * large enough to send the whole Postgres send buffer in one go, or
+		 * performance suffers.  The Postgres send buffer can be enlarged if a
+		 * very large message needs to be sent, but we won't attempt to
+		 * enlarge the OS buffer if that happens, so somewhat arbitrarily
+		 * ensure that the OS buffer is at least PQ_SEND_BUFFER_SIZE * 4.
+		 * (That's 32kB with the current default).
+		 *
+		 * The default OS buffer size used to be 8kB in earlier Windows
+		 * versions, but was raised to 64kB in Windows 2012.  So it shouldn't
+		 * be necessary to change it in later versions anymore.  Changing it
+		 * unnecessarily can even reduce performance, because setting
+		 * SO_SNDBUF in the application disables the "dynamic send buffering"
+		 * feature that was introduced in Windows 7.  So before fiddling with
+		 * SO_SNDBUF, check if the current buffer size is already large enough
+		 * and only increase it if necessary.
+		 *
+		 * See https://support.microsoft.com/kb/823764/EN-US/ and
+		 * https://msdn.microsoft.com/en-us/library/bb736549%28v=vs.85%29.aspx
 		 */
-		on = PQ_SEND_BUFFER_SIZE * 4;
-		if (setsockopt(port->sock, SOL_SOCKET, SO_SNDBUF, (char *) &on,
-					   sizeof(on)) < 0)
+		optlen = sizeof(oldopt);
+		if (getsockopt(port->sock, SOL_SOCKET, SO_SNDBUF, (char *) &oldopt,
+					   &optlen) < 0)
 		{
-			elog(LOG, "setsockopt(SO_SNDBUF) failed: %m");
+			elog(LOG, "getsockopt(SO_SNDBUF) failed: %m");
 			return STATUS_ERROR;
+		}
+		newopt = PQ_SEND_BUFFER_SIZE * 4;
+		if (oldopt < newopt)
+		{
+			if (setsockopt(port->sock, SOL_SOCKET, SO_SNDBUF, (char *) &newopt,
+						   sizeof(newopt)) < 0)
+			{
+				elog(LOG, "setsockopt(SO_SNDBUF) failed: %m");
+				return STATUS_ERROR;
+			}
 		}
 #endif
 
@@ -827,6 +897,26 @@ TouchSocketFiles(void)
 	}
 }
 
+/*
+ * RemoveSocketFiles -- unlink socket files at postmaster shutdown
+ */
+void
+RemoveSocketFiles(void)
+{
+	ListCell   *l;
+
+	/* Loop through all created sockets... */
+	foreach(l, sock_paths)
+	{
+		char	   *sock_path = (char *) lfirst(l);
+
+		/* Ignore any error. */
+		(void) unlink(sock_path);
+	}
+	/* Since we're about to exit, no need to reclaim storage */
+	sock_paths = NIL;
+}
+
 
 /* --------------------------------
  * Low-level I/O routines begin here.
@@ -837,40 +927,20 @@ TouchSocketFiles(void)
  */
 
 /* --------------------------------
- *			  pq_set_nonblocking - set socket blocking/non-blocking
+ *			  socket_set_nonblocking - set socket blocking/non-blocking
  *
  * Sets the socket non-blocking if nonblocking is TRUE, or sets it
  * blocking otherwise.
  * --------------------------------
  */
 static void
-pq_set_nonblocking(bool nonblocking)
+socket_set_nonblocking(bool nonblocking)
 {
-	if (MyProcPort->noblock == nonblocking)
-		return;
+	if (MyProcPort == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_CONNECTION_DOES_NOT_EXIST),
+				 errmsg("there is no client connection")));
 
-#ifdef WIN32
-	pgwin32_noblock = nonblocking ? 1 : 0;
-#else
-
-	/*
-	 * Use COMMERROR on failure, because ERROR would try to send the error to
-	 * the client, which might require changing the mode again, leading to
-	 * infinite recursion.
-	 */
-	if (nonblocking)
-	{
-		if (!pg_set_noblock(MyProcPort->sock))
-			ereport(COMMERROR,
-					(errmsg("could not set socket to nonblocking mode: %m")));
-	}
-	else
-	{
-		if (!pg_set_block(MyProcPort->sock))
-			ereport(COMMERROR,
-					(errmsg("could not set socket to blocking mode: %m")));
-	}
-#endif
 	MyProcPort->noblock = nonblocking;
 }
 
@@ -898,7 +968,7 @@ pq_recvbuf(void)
 	}
 
 	/* Ensure that we're in blocking mode */
-	pq_set_nonblocking(false);
+	socket_set_nonblocking(false);
 
 	/* Can fill buffer from PqRecvLength and upwards */
 	for (;;)
@@ -1005,6 +1075,8 @@ pq_waitForDataUsingSelect(void)
 int
 pq_getbyte(void)
 {
+	Assert(PqCommReadingMsg);
+
 	while (PqRecvPointer >= PqRecvLength)
 	{
 		if (pq_recvbuf())		/* If nothing in buffer, then recv some */
@@ -1022,6 +1094,8 @@ pq_getbyte(void)
 int
 pq_peekbyte(void)
 {
+	Assert(PqCommReadingMsg);
+
 	while (PqRecvPointer >= PqRecvLength)
 	{
 		if (pq_recvbuf())		/* If nothing in buffer, then recv some */
@@ -1043,6 +1117,8 @@ pq_getbyte_if_available(unsigned char *c)
 {
 	int			r;
 
+	Assert(PqCommReadingMsg);
+
 	if (PqRecvPointer < PqRecvLength)
 	{
 		*c = PqRecvBuffer[PqRecvPointer++];
@@ -1050,7 +1126,7 @@ pq_getbyte_if_available(unsigned char *c)
 	}
 
 	/* Put the socket into non-blocking mode */
-	pq_set_nonblocking(true);
+	socket_set_nonblocking(true);
 
 	r = secure_read(MyProcPort, c, 1);
 	if (r < 0)
@@ -1095,6 +1171,8 @@ pq_getbytes(char *s, size_t len)
 {
 	size_t		amount;
 
+	Assert(PqCommReadingMsg);
+
 	while (len > 0)
 	{
 		while (PqRecvPointer >= PqRecvLength)
@@ -1126,6 +1204,8 @@ static int
 pq_discardbytes(size_t len)
 {
 	size_t		amount;
+
+	Assert(PqCommReadingMsg);
 
 	while (len > 0)
 	{
@@ -1163,6 +1243,8 @@ pq_getstring(StringInfo s)
 {
 	int			i;
 
+	Assert(PqCommReadingMsg);
+
 	resetStringInfo(s);
 
 	/* Read until we get the terminating '\0' */
@@ -1195,6 +1277,58 @@ pq_getstring(StringInfo s)
 
 
 /* --------------------------------
+ *		pq_startmsgread - begin reading a message from the client.
+ *
+ *		This must be called before any of the pq_get* functions.
+ * --------------------------------
+ */
+void
+pq_startmsgread(void)
+{
+	/*
+	 * There shouldn't be a read active already, but let's check just to be
+	 * sure.
+	 */
+	if (PqCommReadingMsg)
+		ereport(FATAL,
+				(errcode(ERRCODE_PROTOCOL_VIOLATION),
+				 errmsg("terminating connection because protocol synchronization was lost")));
+
+	PqCommReadingMsg = true;
+}
+
+
+/* --------------------------------
+ *		pq_endmsgread	- finish reading message.
+ *
+ *		This must be called after reading a V2 protocol message with
+ *		pq_getstring() and friends, to indicate that we have read the whole
+ *		message. In V3 protocol, pq_getmessage() does this implicitly.
+ * --------------------------------
+ */
+void
+pq_endmsgread(void)
+{
+	Assert(PqCommReadingMsg);
+
+	PqCommReadingMsg = false;
+}
+
+/* --------------------------------
+ *		pq_is_reading_msg - are we currently reading a message?
+ *
+ * This is used in error recovery at the outer idle loop to detect if we have
+ * lost protocol sync, and need to terminate the connection. pq_startmsgread()
+ * will check for that too, but it's nicer to detect it earlier.
+ * --------------------------------
+ */
+bool
+pq_is_reading_msg(void)
+{
+	return PqCommReadingMsg;
+}
+
+/* --------------------------------
  *		pq_getmessage	- get a message with length word from connection
  *
  *		The return value is placed in an expansible StringInfo, which has
@@ -1214,6 +1348,8 @@ int
 pq_getmessage(StringInfo s, int maxlen)
 {
 	int32		len;
+
+	Assert(PqCommReadingMsg);
 
 	resetStringInfo(s);
 
@@ -1256,6 +1392,9 @@ pq_getmessage(StringInfo s, int maxlen)
 				ereport(COMMERROR,
 						(errcode(ERRCODE_PROTOCOL_VIOLATION),
 						 errmsg("incomplete message from client")));
+
+			/* we discarded the rest of the message so we're back in sync. */
+			PqCommReadingMsg = false;
 			PG_RE_THROW();
 		}
 		PG_END_TRY();
@@ -1273,78 +1412,10 @@ pq_getmessage(StringInfo s, int maxlen)
 		s->data[len] = '\0';
 	}
 
+	/* finished reading the message. */
+	PqCommReadingMsg = false;
+
 	return 0;
-}
-
-/*
- * Wrapper of simple pthread locking functionality, using pthread_mutex_trylock
- * and loop to make it interruptible when waiting the lock;
- *
- * return true if successfully acquires the lock, false if unable to get the lock
- * and interrupted by SIGTERM, otherwise, infinitely loop to acquire the mutex.
- *
- * If we are going to return false, we close the socket to client; this is crucial
- * for exiting dispatch thread if it is stuck on sending NOTICE to client, and hence
- * avoid mutex deadlock;
- *
- * NOTE: should not call CHECK_FOR_INTERRUPTS and ereport in this routine, since
- * it is in multi-thread context;
- */
-static bool
-pq_send_mutex_lock()
-{
-	int count = PQ_BUSY_TEST_COUNT_IN_EXITING;
-	int mutex_res;
-
-	do
-	{
-		mutex_res = pthread_mutex_trylock(&send_mutex);
-
-		if (mutex_res == 0)
-		{
-			return true;
-		}
-
-		if (mutex_res == EBUSY)
-		{
-			/* No need to acquire lock for TermSignalReceived, since we are in
- 			 * a loop here */
-			if (TermSignalReceived)
-			{
-				/*
- 				 * try PQ_BUSY_TEST_COUNT_IN_EXITING times before going to
- 				 * close the socket, in case real concurrent writing is in
- 				 * progress(compared to stuck send call in secure_write);
- 				 *
- 				 * It cannot help completely eliminate the false negative
- 				 * cases, but giving the process is exiting, it is acceptable
- 				 * to discard some messages, contrasted with the chance of
- 				 * infinite stuck;
- 				 */
-				if (count-- < 0)
-				{
-					/* On Redhat and Suse, simple closing the socket would not get
-					 * send() out of hanging state, shutdown() can do this(though not
-					 * explicitly mentioned in manual page); however, if send over a
-					 * socket which has been shutdown, process would be terminated by
-					 * SIGPIPE; to avoid this race condition, we set the socket to be
-					 * invalid before calling shutdown()
-					 *
-					 * On OSX, close() can get send() out of hanging state, while
-					 * shutdown() would lead to SIGPIPE */
-					int saved_fd = MyProcPort->sock;
-					MyProcPort->sock = -1;
-					whereToSendOutput = DestNone;
-#ifndef __darwin__
-					shutdown(saved_fd, SHUT_WR);
-#endif
-					closesocket(saved_fd);
-					return false;
-				}
-			}
-		}
-		pg_usleep(1000L);
-	} while (true);
 }
 
 
@@ -1361,14 +1432,12 @@ pq_putbytes(const char *s, size_t len)
 
 	/* Should only be called by old-style COPY OUT */
 	Assert(DoingCopyOut);
-	if (!pq_send_mutex_lock())
-	{
-		return EOF;
-	}
-
+	/* No-op if reentrant call */
+	if (PqCommBusy)
+		return 0;
+	PqCommBusy = true;
 	res = internal_putbytes(s, len);
-
-	pthread_mutex_unlock(&send_mutex);
+	PqCommBusy = false;
 	return res;
 }
 
@@ -1382,7 +1451,7 @@ internal_putbytes(const char *s, size_t len)
 		/* If buffer is full, then flush it out */
 		if (PqSendPointer >= PqSendBufferSize)
 		{
-			pq_set_nonblocking(false);
+			socket_set_nonblocking(false);
 			if (internal_flush())
 				return EOF;
 		}
@@ -1398,38 +1467,23 @@ internal_putbytes(const char *s, size_t len)
 }
 
 /* --------------------------------
- *		pq_flush		- flush pending output
+ *		socket_flush		- flush pending output
  *
  *		returns 0 if OK, EOF if trouble
  * --------------------------------
  */
-int
-pq_flush(void)
+static int
+socket_flush(void)
 {
 	int			res;
 
-	if (Gp_role == GP_ROLE_DISPATCH && IsUnderPostmaster)
-	{
-		if (!pq_send_mutex_lock())
-		{
-			return EOF;
-		}
-	}
-
 	/* No-op if reentrant call */
 	if (PqCommBusy)
-	{
-		if (Gp_role == GP_ROLE_DISPATCH && IsUnderPostmaster)
-			pthread_mutex_unlock(&send_mutex);
 		return 0;
-	}
 	PqCommBusy = true;
-	pq_set_nonblocking(false);
+	socket_set_nonblocking(false);
 	res = internal_flush();
 	PqCommBusy = false;
-
-	if (Gp_role == GP_ROLE_DISPATCH && IsUnderPostmaster)
-		pthread_mutex_unlock(&send_mutex);
 	return res;
 }
 
@@ -1518,8 +1572,8 @@ internal_flush(void)
  * Returns 0 if OK, or EOF if trouble.
  * --------------------------------
  */
-int
-pq_flush_if_writable(void)
+static int
+socket_flush_if_writable(void)
 {
 	int			res;
 
@@ -1527,39 +1581,25 @@ pq_flush_if_writable(void)
 	if (PqSendPointer == PqSendStart)
 		return 0;
 
-	if (Gp_role == GP_ROLE_DISPATCH && IsUnderPostmaster)
-	{
-		if (!pq_send_mutex_lock())
-		{
-			return EOF;
-		}
-	}
-
 	/* No-op if reentrant call */
 	if (PqCommBusy)
-	{
-		if (Gp_role == GP_ROLE_DISPATCH && IsUnderPostmaster)
-			pthread_mutex_unlock(&send_mutex);
 		return 0;
-	}
 
 	/* Temporarily put the socket into non-blocking mode */
-	pq_set_nonblocking(true);
+	socket_set_nonblocking(true);
 
 	PqCommBusy = true;
 	res = internal_flush();
 	PqCommBusy = false;
-	if (Gp_role == GP_ROLE_DISPATCH && IsUnderPostmaster)
-		pthread_mutex_unlock(&send_mutex);
 	return res;
 }
 
 /* --------------------------------
- *		pq_is_send_pending	- is there any pending data in the output buffer?
+ *	socket_is_send_pending	- is there any pending data in the output buffer?
  * --------------------------------
  */
-bool
-pq_is_send_pending(void)
+static bool
+socket_is_send_pending(void)
 {
 	return (PqSendStart < PqSendPointer);
 }
@@ -1573,7 +1613,7 @@ pq_is_send_pending(void)
 
 
 /* --------------------------------
- *		pq_putmessage	- send a normal message (suppressed in COPY OUT mode)
+ *		socket_putmessage - send a normal message (suppressed in COPY OUT mode)
  *
  *		If msgtype is not '\0', it is a message type code to place before
  *		the message body.  If msgtype is '\0', then the message has no type
@@ -1595,21 +1635,14 @@ pq_is_send_pending(void)
  *		returns 0 if OK, EOF if trouble
  * --------------------------------
  */
-int
-pq_putmessage(char msgtype, const char *s, size_t len)
+static int
+socket_putmessage(char msgtype, const char *s, size_t len)
 {
-	if (DoingCopyOut)
+	if (DoingCopyOut || PqCommBusy)
 	{
 		return EOF;
 	}
-
-	if (Gp_role == GP_ROLE_DISPATCH && IsUnderPostmaster)
-	{
-		if (!pq_send_mutex_lock())
-		{
-			return EOF;
-		}
-	}
+	PqCommBusy = true;
 
 	if (msgtype)
 	{
@@ -1628,16 +1661,11 @@ pq_putmessage(char msgtype, const char *s, size_t len)
 
 	if (internal_putbytes(s, len))
 		goto fail;
-
-	if (Gp_role == GP_ROLE_DISPATCH && IsUnderPostmaster)
-		pthread_mutex_unlock(&send_mutex);
-
+	PqCommBusy = false;
 	return 0;
 
 fail:
-	if (Gp_role == GP_ROLE_DISPATCH && IsUnderPostmaster)
-		pthread_mutex_unlock(&send_mutex);
-
+	PqCommBusy = false;
 	return EOF;
 }
 
@@ -1647,8 +1675,8 @@ fail:
  *		If the output buffer is too small to hold the message, the buffer
  *		is enlarged.
  */
-void
-pq_putmessage_noblock(char msgtype, const char *s, size_t len)
+static void
+socket_putmessage_noblock(char msgtype, const char *s, size_t len)
 {
 	int res		PG_USED_FOR_ASSERTS_ONLY;
 	int			required;
@@ -1670,24 +1698,18 @@ pq_putmessage_noblock(char msgtype, const char *s, size_t len)
 
 
 /* --------------------------------
- *		pq_startcopyout - inform libpq that an old-style COPY OUT transfer
+ *		socket_startcopyout - inform libpq that an old-style COPY OUT transfer
  *			is beginning
  * --------------------------------
  */
-void
-pq_startcopyout(void)
+static void
+socket_startcopyout(void)
 {
-	if (!pq_send_mutex_lock())
-	{
-		/* no need to return a status, since socket has been closed in failed cases */
-		return;
-	}
 	DoingCopyOut = true;
-	pthread_mutex_unlock(&send_mutex);
 }
 
 /* --------------------------------
- *		pq_endcopyout	- end an old-style COPY OUT transfer
+ *		socket_endcopyout	- end an old-style COPY OUT transfer
  *
  *		If errorAbort is indicated, we are aborting a COPY OUT due to an error,
  *		and must send a terminator line.  Since a partial data line might have
@@ -1696,22 +1718,16 @@ pq_startcopyout(void)
  *		not allow binary transfers, so a textual terminator is always correct.
  * --------------------------------
  */
-void
-pq_endcopyout(bool errorAbort)
+static void
+socket_endcopyout(bool errorAbort)
 {
 	if (!DoingCopyOut)
 		return;
 	if (errorAbort)
 		pq_putbytes("\n\n\\.\n", 5);
 	/* in non-error case, copy.c will have emitted the terminator line */
-	if (!pq_send_mutex_lock())
-	{
-		return;
-	}
 	DoingCopyOut = false;
-	pthread_mutex_unlock(&send_mutex);
 }
-
 
 /*
  * Support for TCP Keepalive parameters
@@ -1720,7 +1736,7 @@ pq_endcopyout(bool errorAbort)
 /*
  * On Windows, we need to set both idle and interval at the same time.
  * We also cannot reset them to the default (setting to zero will
- * actually set them to zero, not default), therefor we fallback to
+ * actually set them to zero, not default), therefore we fallback to
  * the out-of-the-box default instead.
  */
 #if defined(WIN32) && defined(SIO_KEEPALIVE_VALS)
@@ -1765,7 +1781,7 @@ pq_setkeepaliveswin32(Port *port, int idle, int interval)
 int
 pq_getkeepalivesidle(Port *port)
 {
-#if defined(TCP_KEEPIDLE) || defined(TCP_KEEPALIVE) || defined(WIN32)
+#if defined(PG_TCP_KEEPALIVE_IDLE) || defined(SIO_KEEPALIVE_VALS)
 	if (port == NULL || IS_AF_UNIX(port->laddr.addr.ss_family))
 		return 0;
 
@@ -1777,23 +1793,13 @@ pq_getkeepalivesidle(Port *port)
 #ifndef WIN32
 		ACCEPT_TYPE_ARG3 size = sizeof(port->default_keepalives_idle);
 
-#ifdef TCP_KEEPIDLE
-		if (getsockopt(port->sock, IPPROTO_TCP, TCP_KEEPIDLE,
+		if (getsockopt(port->sock, IPPROTO_TCP, PG_TCP_KEEPALIVE_IDLE,
 					   (char *) &port->default_keepalives_idle,
 					   &size) < 0)
 		{
-			elog(LOG, "getsockopt(TCP_KEEPIDLE) failed: %m");
+			elog(LOG, "getsockopt(%s) failed: %m", PG_TCP_KEEPALIVE_IDLE_STR);
 			port->default_keepalives_idle = -1; /* don't know */
 		}
-#else
-		if (getsockopt(port->sock, IPPROTO_TCP, TCP_KEEPALIVE,
-					   (char *) &port->default_keepalives_idle,
-					   &size) < 0)
-		{
-			elog(LOG, "getsockopt(TCP_KEEPALIVE) failed: %m");
-			port->default_keepalives_idle = -1; /* don't know */
-		}
-#endif   /* TCP_KEEPIDLE */
 #else							/* WIN32 */
 		/* We can't get the defaults on Windows, so return "don't know" */
 		port->default_keepalives_idle = -1;
@@ -1812,7 +1818,8 @@ pq_setkeepalivesidle(int idle, Port *port)
 	if (port == NULL || IS_AF_UNIX(port->laddr.addr.ss_family))
 		return STATUS_OK;
 
-#if defined(TCP_KEEPIDLE) || defined(TCP_KEEPALIVE) || defined(SIO_KEEPALIVE_VALS)
+/* check SIO_KEEPALIVE_VALS here, not just WIN32, as some toolchains lack it */
+#if defined(PG_TCP_KEEPALIVE_IDLE) || defined(SIO_KEEPALIVE_VALS)
 	if (idle == port->keepalives_idle)
 		return STATUS_OK;
 
@@ -1831,33 +1838,25 @@ pq_setkeepalivesidle(int idle, Port *port)
 	if (idle == 0)
 		idle = port->default_keepalives_idle;
 
-#ifdef TCP_KEEPIDLE
-	if (setsockopt(port->sock, IPPROTO_TCP, TCP_KEEPIDLE,
+	if (setsockopt(port->sock, IPPROTO_TCP, PG_TCP_KEEPALIVE_IDLE,
 				   (char *) &idle, sizeof(idle)) < 0)
 	{
-		elog(LOG, "setsockopt(TCP_KEEPIDLE) failed: %m");
+		elog(LOG, "setsockopt(%s) failed: %m", PG_TCP_KEEPALIVE_IDLE_STR);
 		return STATUS_ERROR;
 	}
-#else
-	if (setsockopt(port->sock, IPPROTO_TCP, TCP_KEEPALIVE,
-				   (char *) &idle, sizeof(idle)) < 0)
-	{
-		elog(LOG, "setsockopt(TCP_KEEPALIVE) failed: %m");
-		return STATUS_ERROR;
-	}
-#endif
 
 	port->keepalives_idle = idle;
 #else							/* WIN32 */
 	return pq_setkeepaliveswin32(port, idle, port->keepalives_interval);
 #endif
-#else							/* TCP_KEEPIDLE || SIO_KEEPALIVE_VALS */
+#else
 	if (idle != 0)
 	{
 		elog(LOG, "setting the keepalive idle time is not supported");
 		return STATUS_ERROR;
 	}
 #endif
+
 	return STATUS_OK;
 }
 
@@ -1880,7 +1879,7 @@ pq_getkeepalivesinterval(Port *port)
 					   (char *) &port->default_keepalives_interval,
 					   &size) < 0)
 		{
-			elog(LOG, "getsockopt(TCP_KEEPINTVL) failed: %m");
+			elog(LOG, "getsockopt(%s) failed: %m", "TCP_KEEPINTVL");
 			port->default_keepalives_interval = -1;		/* don't know */
 		}
 #else
@@ -1901,7 +1900,7 @@ pq_setkeepalivesinterval(int interval, Port *port)
 	if (port == NULL || IS_AF_UNIX(port->laddr.addr.ss_family))
 		return STATUS_OK;
 
-#if defined(TCP_KEEPINTVL) || defined (SIO_KEEPALIVE_VALS)
+#if defined(TCP_KEEPINTVL) || defined(SIO_KEEPALIVE_VALS)
 	if (interval == port->keepalives_interval)
 		return STATUS_OK;
 
@@ -1923,7 +1922,7 @@ pq_setkeepalivesinterval(int interval, Port *port)
 	if (setsockopt(port->sock, IPPROTO_TCP, TCP_KEEPINTVL,
 				   (char *) &interval, sizeof(interval)) < 0)
 	{
-		elog(LOG, "setsockopt(TCP_KEEPINTVL) failed: %m");
+		elog(LOG, "setsockopt(%s) failed: %m", "TCP_KEEPINTVL");
 		return STATUS_ERROR;
 	}
 
@@ -1934,7 +1933,7 @@ pq_setkeepalivesinterval(int interval, Port *port)
 #else
 	if (interval != 0)
 	{
-		elog(LOG, "setsockopt(TCP_KEEPINTVL) not supported");
+		elog(LOG, "setsockopt(%s) not supported", "TCP_KEEPINTVL");
 		return STATUS_ERROR;
 	}
 #endif
@@ -1960,7 +1959,7 @@ pq_getkeepalivescount(Port *port)
 					   (char *) &port->default_keepalives_count,
 					   &size) < 0)
 		{
-			elog(LOG, "getsockopt(TCP_KEEPCNT) failed: %m");
+			elog(LOG, "getsockopt(%s) failed: %m", "TCP_KEEPCNT");
 			port->default_keepalives_count = -1;		/* don't know */
 		}
 	}
@@ -1998,7 +1997,7 @@ pq_setkeepalivescount(int count, Port *port)
 	if (setsockopt(port->sock, IPPROTO_TCP, TCP_KEEPCNT,
 				   (char *) &count, sizeof(count)) < 0)
 	{
-		elog(LOG, "setsockopt(TCP_KEEPCNT) failed: %m");
+		elog(LOG, "setsockopt(%s) failed: %m", "TCP_KEEPCNT");
 		return STATUS_ERROR;
 	}
 
@@ -2006,7 +2005,7 @@ pq_setkeepalivescount(int count, Port *port)
 #else
 	if (count != 0)
 	{
-		elog(LOG, "setsockopt(TCP_KEEPCNT) not supported");
+		elog(LOG, "setsockopt(%s) not supported", "TCP_KEEPCNT");
 		return STATUS_ERROR;
 	}
 #endif

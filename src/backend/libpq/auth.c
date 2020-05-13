@@ -3,7 +3,7 @@
  * auth.c
  *	  Routines to handle network authentication
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -20,11 +20,10 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <unistd.h>
+#ifdef HAVE_SYS_SELECT_H
+#include <sys/select.h>
+#endif
 
-#include "catalog/indexing.h"
-#include "catalog/pg_authid.h"
-#include "catalog/pg_auth_time_constraint.h"
-#include "cdb/cdbvars.h"
 #include "libpq/auth.h"
 #include "libpq/crypt.h"
 #include "libpq/ip.h"
@@ -32,6 +31,15 @@
 #include "libpq/pqformat.h"
 #include "libpq/md5.h"
 #include "miscadmin.h"
+#include "replication/walsender.h"
+#include "storage/ipc.h"
+
+#include "access/genam.h"
+#include "access/heapam.h"
+#include "catalog/indexing.h"
+#include "catalog/pg_authid.h"
+#include "catalog/pg_auth_time_constraint.h"
+#include "cdb/cdbvars.h"
 #include "pgtime.h"
 #include "postmaster/postmaster.h"
 #include "utils/builtins.h"
@@ -42,8 +50,6 @@
 #include "utils/syscache.h"
 #include "utils/timestamp.h"
 #include "utils/tqual.h"
-#include "replication/walsender.h"
-#include "storage/ipc.h"
 
 extern bool gp_reject_internal_tcp_conn;
 
@@ -94,7 +100,7 @@ static int	auth_peer(hbaPort *port);
 
 static int	CheckPAMAuth(Port *port, char *user, char *password);
 static int pam_passwd_conv_proc(int num_msg, const struct pam_message ** msg,
-                     struct pam_response ** resp, void *appdata_ptr);
+					 struct pam_response ** resp, void *appdata_ptr);
 
 static struct pam_conv pam_passw_conv = {
 	&pam_passwd_conv_proc,
@@ -105,6 +111,17 @@ static char *pam_passwd = NULL; /* Workaround for Solaris 2.6 brokenness */
 static Port *pam_port_cludge;	/* Workaround for passing "Port *port" into
 								 * pam_passwd_conv_proc */
 #endif   /* USE_PAM */
+
+
+/*----------------------------------------------------------------
+ * BSD authentication
+ *----------------------------------------------------------------
+ */
+#ifdef USE_BSD_AUTH
+#include <bsd_auth.h>
+
+static int	CheckBSDAuth(Port *port, char *user);
+#endif   /* USE_BSD_AUTH */
 
 
 /*----------------------------------------------------------------
@@ -175,13 +192,18 @@ typedef SECURITY_STATUS
 			(WINAPI * QUERY_SECURITY_CONTEXT_TOKEN_FN) (
 													   PCtxtHandle, void **);
 static int	pg_SSPI_recvauth(Port *port);
+static int pg_SSPI_make_upn(char *accountname,
+				 size_t accountnamesize,
+				 char *domainname,
+				 size_t domainnamesize,
+				 bool update_accountname);
 #endif
 
 /*----------------------------------------------------------------
  * RADIUS Authentication
  *----------------------------------------------------------------
  */
-#ifdef USE_SSL
+#ifdef USE_OPENSSL
 #include <openssl/rand.h>
 #endif
 static int	CheckRADIUSAuth(Port *port);
@@ -285,6 +307,9 @@ auth_failed(Port *port, int status, char *logdetail)
 			break;
 		case uaPAM:
 			errstr = gettext_noop("PAM authentication failed for user \"%s\"");
+			break;
+		case uaBSD:
+			errstr = gettext_noop("BSD authentication failed for user \"%s\"");
 			break;
 		case uaLDAP:
 			errstr = gettext_noop("LDAP authentication failed for user \"%s\"");
@@ -410,7 +435,8 @@ is_internal_gpdb_conn(Port *port)
 	 * This is an internal connection if major version is three and we've set
 	 * the upper bits to 7.
 	 */
-	if (PG_PROTOCOL_MAJOR(port->proto) == 3 && port->proto >> 28 == 7)
+	if (PG_PROTOCOL_MAJOR(port->proto) == 3 &&
+			IS_GPDB_INTERNAL_PROTOCOL(port->proto))
 		return true;
 	else
 		return false;
@@ -447,13 +473,6 @@ ClientAuthentication(Port *port)
 	 */
 	hba_getauthmethod(port);
 
-	/*
-	 * Enable immediate response to SIGTERM/SIGINT/timeout interrupts. (We
-	 * don't want this during hba_getauthmethod() because it might have to do
-	 * database access, eg for role membership checks.)
-	 */
-	ImmediateInterruptOK = true;
-	/* And don't forget to detect one that already arrived */
 	CHECK_FOR_INTERRUPTS();
 
 	/*
@@ -471,7 +490,7 @@ ClientAuthentication(Port *port)
 		 * already if it didn't verify ok.
 		 */
 #ifdef USE_SSL
-		if (!port->peer)
+		if (!port->peer_cert_valid)
 		{
 			ereport(FATAL,
 					(errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),
@@ -519,7 +538,7 @@ ClientAuthentication(Port *port)
 					   (errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),
 						errmsg("pg_hba.conf rejects replication connection for host \"%s\", user \"%s\", %s",
 							   hostinfo, port->user_name,
-							   port->ssl ? _("SSL on") : _("SSL off"))));
+							port->ssl_in_use ? _("SSL on") : _("SSL off"))));
 #else
 					ereport(FATAL,
 					   (errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),
@@ -535,15 +554,13 @@ ClientAuthentication(Port *port)
 						errmsg("pg_hba.conf rejects connection for host \"%s\", user \"%s\", database \"%s\", %s",
 							   hostinfo, port->user_name,
 							   port->database_name,
-							   port->ssl ? _("SSL on") : _("SSL off")),
-						errSendAlert(false)));
+							port->ssl_in_use ? _("SSL on") : _("SSL off"))));
 #else
 					ereport(FATAL,
 					   (errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),
 						errmsg("pg_hba.conf rejects connection for host \"%s\", user \"%s\", database \"%s\"",
 							   hostinfo, port->user_name,
-							   port->database_name),
-						errSendAlert(false)));
+							   port->database_name)));
 #endif
 				}
 				break;
@@ -595,7 +612,7 @@ ClientAuthentication(Port *port)
 					   (errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),
 						errmsg("no pg_hba.conf entry for replication connection from host \"%s\", user \"%s\", %s",
 							   hostinfo, port->user_name,
-							   port->ssl ? _("SSL on") : _("SSL off")),
+							   port->ssl_in_use ? _("SSL on") : _("SSL off")),
 						HOSTNAME_LOOKUP_DETAIL(port)));
 #else
 					ereport(FATAL,
@@ -613,7 +630,7 @@ ClientAuthentication(Port *port)
 						errmsg("no pg_hba.conf entry for host \"%s\", user \"%s\", database \"%s\", %s",
 							   hostinfo, port->user_name,
 							   port->database_name,
-							   port->ssl ? _("SSL on") : _("SSL off")),
+							   port->ssl_in_use ? _("SSL on") : _("SSL off")),
 						HOSTNAME_LOOKUP_DETAIL(port)));
 #else
 					ereport(FATAL,
@@ -687,6 +704,14 @@ ClientAuthentication(Port *port)
 #endif   /* USE_PAM */
 			break;
 
+		case uaBSD:
+#ifdef USE_BSD_AUTH
+			status = CheckBSDAuth(port, port->user_name);
+#else
+			Assert(false);
+#endif   /* USE_BSD_AUTH */
+			break;
+
 		case uaLDAP:
 #ifdef USE_LDAP
 			status = CheckLDAPAuth(port);
@@ -726,9 +751,6 @@ ClientAuthentication(Port *port)
 		sendAuthRequest(port, AUTH_REQ_OK);
 	else
 		auth_failed(port, status, logdetail);
-
-	/* Done with authentication, so we should turn off immediate interrupts */
-	ImmediateInterruptOK = false;
 }
 
 void
@@ -744,6 +766,8 @@ static void
 sendAuthRequest(Port *port, AuthRequest areq)
 {
 	StringInfoData buf;
+
+	CHECK_FOR_INTERRUPTS();
 
 	pq_beginmessage(&buf, 'R');
 	pq_sendint(&buf, (int32) areq, sizeof(int32));
@@ -778,6 +802,8 @@ sendAuthRequest(Port *port, AuthRequest areq)
 	 */
 	if (areq != AUTH_REQ_OK)
 		pq_flush();
+
+	CHECK_FOR_INTERRUPTS();
 }
 
 /*
@@ -790,6 +816,7 @@ recv_password_packet(Port *port)
 {
 	StringInfoData buf;
 
+	pq_startmsgread();
 	if (PG_PROTOCOL_MAJOR(port->proto) >= 3)
 	{
 		/* Expect 'p' message type */
@@ -837,9 +864,22 @@ recv_password_packet(Port *port)
 				(errcode(ERRCODE_PROTOCOL_VIOLATION),
 				 errmsg("invalid password packet size")));
 
+	/*
+	 * Don't allow an empty password. Libpq treats an empty password the same
+	 * as no password at all, and won't even try to authenticate. But other
+	 * clients might, so allowing it would be confusing.
+	 *
+	 * Note that this only catches an empty password sent by the client in
+	 * plaintext. There's another check in md5_crypt_verify to prevent an
+	 * empty password from being used with MD5 authentication.
+	 */
+	if (buf.data[0] == '\0')
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PASSWORD),
+				 errmsg("empty password returned by client")));
+
 	/* Do not echo password to logs, for security. */
-	ereport(DEBUG5,
-			(errmsg("received password packet")));
+	elog(DEBUG5, "received password packet");
 
 	/*
 	 * Return the received string.  Note we do not attempt to do any
@@ -851,7 +891,7 @@ recv_password_packet(Port *port)
 
 
 /*----------------------------------------------------------------
- * hashed password (MD5, SHA-256) authentication
+ * MD5 authentication
  *----------------------------------------------------------------
  */
 
@@ -871,7 +911,7 @@ recv_and_check_password_packet(Port *port, char **logdetail)
 	if (passwd == NULL)
 		return STATUS_EOF;		/* client wouldn't send password */
 
-	result = hashed_passwd_verify(port, port->user_name, passwd, logdetail);
+	result = md5_crypt_verify(port, port->user_name, passwd, logdetail);
 
 	pfree(passwd);
 
@@ -898,6 +938,10 @@ static GSS_DLLIMP gss_OID GSS_C_NT_USER_NAME = &GSS_C_NT_USER_NAME_desc;
 #endif
 
 
+/*
+ * Generate an error for GSSAPI authentication.  The caller should apply
+ * _() to errmsg to make it translatable.
+ */
 static void
 pg_GSS_error(int severity, char *errmsg, OM_uint32 maj_stat, OM_uint32 min_stat)
 {
@@ -959,13 +1003,6 @@ check_valid_until_for_gssapi(Port *port)
 	Datum		datum;
 	bool		isnull;
 
-	/*
-	 * Disable immediate interrupts while doing database access.  (Note
-	 * we don't bother to turn this back on if we hit one of the failure
-	 * conditions, since we can expect we'll just exit right away anyway.)
-	 */
-	ImmediateInterruptOK = false;
-
 	/* Get role info from pg_authid */
 	roleTup = SearchSysCache1(AUTHNAME, PointerGetDatum(port->user_name));
 	if (!HeapTupleIsValid(roleTup))
@@ -978,9 +1015,6 @@ check_valid_until_for_gssapi(Port *port)
 
 	ReleaseSysCache(roleTup);
 
-	/* Re-enable immediate response to SIGTERM/SIGINT/timeout interrupts */
-	ImmediateInterruptOK = true;
-	/* And don't forget to detect one that already arrived */
 	CHECK_FOR_INTERRUPTS();
 
 	/*
@@ -1034,15 +1068,16 @@ pg_GSS_recvauth(Port *port)
 			size_t		kt_len = strlen(pg_krb_server_keyfile) + 14;
 			char	   *kt_path = malloc(kt_len);
 
-			if (!kt_path)
+			if (!kt_path ||
+				snprintf(kt_path, kt_len, "KRB5_KTNAME=%s",
+						 pg_krb_server_keyfile) != kt_len - 2 ||
+				putenv(kt_path) != 0)
 			{
 				ereport(LOG,
 						(errcode(ERRCODE_OUT_OF_MEMORY),
 						 errmsg("out of memory")));
 				return STATUS_ERROR;
 			}
-			snprintf(kt_path, kt_len, "KRB5_KTNAME=%s", pg_krb_server_keyfile);
-			putenv(kt_path);
 		}
 	}
 
@@ -1061,12 +1096,16 @@ pg_GSS_recvauth(Port *port)
 
 	/*
 	 * Loop through GSSAPI message exchange. This exchange can consist of
-	 * multiple messags sent in both directions. First message is always from
+	 * multiple messages sent in both directions. First message is always from
 	 * the client. All messages from client to server are password packets
 	 * (type 'p').
 	 */
 	do
 	{
+		pq_startmsgread();
+
+		CHECK_FOR_INTERRUPTS();
+
 		mtype = pq_getbyte();
 		if (mtype != 'p')
 		{
@@ -1116,6 +1155,8 @@ pg_GSS_recvauth(Port *port)
 			 maj_stat, min_stat,
 			 (unsigned int) port->gss->outbuf.length, gflags);
 
+		CHECK_FOR_INTERRUPTS();
+
 		if (port->gss->outbuf.length != 0)
 		{
 			/*
@@ -1133,7 +1174,7 @@ pg_GSS_recvauth(Port *port)
 		{
 			gss_delete_sec_context(&lmin_s, &port->gss->ctx, GSS_C_NO_BUFFER);
 			pg_GSS_error(ERROR,
-					   gettext_noop("accepting GSS security context failed"),
+						 _("accepting GSS security context failed"),
 						 maj_stat, min_stat);
 		}
 
@@ -1159,7 +1200,7 @@ pg_GSS_recvauth(Port *port)
 	maj_stat = gss_display_name(&min_stat, port->gss->name, &gbuf, NULL);
 	if (maj_stat != GSS_S_COMPLETE)
 		pg_GSS_error(ERROR,
-					 gettext_noop("retrieving GSS user name failed"),
+					 _("retrieving GSS user name failed"),
 					 maj_stat, min_stat);
 
 	/*
@@ -1223,12 +1264,19 @@ pg_GSS_recvauth(Port *port)
  *----------------------------------------------------------------
  */
 #ifdef ENABLE_SSPI
+
+/*
+ * Generate an error for SSPI authentication.  The caller should apply
+ * _() to errmsg to make it translatable.
+ */
 static void
 pg_SSPI_error(int severity, const char *errmsg, SECURITY_STATUS r)
 {
 	char		sysmsg[256];
 
-	if (FormatMessage(FORMAT_MESSAGE_FROM_SYSTEM, NULL, r, 0,
+	if (FormatMessage(FORMAT_MESSAGE_IGNORE_INSERTS |
+					  FORMAT_MESSAGE_FROM_SYSTEM,
+					  NULL, r, 0,
 					  sysmsg, sizeof(sysmsg), NULL) == 0)
 		ereport(severity,
 				(errmsg_internal("%s", errmsg),
@@ -1295,12 +1343,13 @@ pg_SSPI_recvauth(Port *port)
 
 	/*
 	 * Loop through SSPI message exchange. This exchange can consist of
-	 * multiple messags sent in both directions. First message is always from
+	 * multiple messages sent in both directions. First message is always from
 	 * the client. All messages from client to server are password packets
 	 * (type 'p').
 	 */
 	do
 	{
+		pq_startmsgread();
 		mtype = pq_getbyte();
 		if (mtype != 'p')
 		{
@@ -1456,8 +1505,8 @@ pg_SSPI_recvauth(Port *port)
 
 	if (!GetTokenInformation(token, TokenUser, NULL, 0, &retlen) && GetLastError() != 122)
 		ereport(ERROR,
-			(errmsg_internal("could not get token user size: error code %lu",
-							 GetLastError())));
+				(errmsg_internal("could not get token information buffer size: error code %lu",
+								 GetLastError())));
 
 	tokenuser = malloc(retlen);
 	if (tokenuser == NULL)
@@ -1466,8 +1515,10 @@ pg_SSPI_recvauth(Port *port)
 
 	if (!GetTokenInformation(token, TokenUser, tokenuser, retlen, &retlen))
 		ereport(ERROR,
-				(errmsg_internal("could not get user token: error code %lu",
-								 GetLastError())));
+		  (errmsg_internal("could not get token information: error code %lu",
+						   GetLastError())));
+
+	CloseHandle(token);
 
 	if (!LookupAccountSid(NULL, tokenuser->User.Sid, accountname, &accountnamesize,
 						  domainname, &domainnamesize, &accountnameuse))
@@ -1476,6 +1527,17 @@ pg_SSPI_recvauth(Port *port)
 							 GetLastError())));
 
 	free(tokenuser);
+
+	if (!port->hba->compat_realm)
+	{
+		int			status = pg_SSPI_make_upn(accountname, sizeof(accountname),
+											  domainname, sizeof(domainname),
+											  port->hba->upn_username);
+
+		if (status != STATUS_OK)
+			/* Error already reported from pg_SSPI_make_upn */
+			return status;
+	}
 
 	/*
 	 * Compare realm/domain if requested. In SSPI, always compare case
@@ -1511,6 +1573,100 @@ pg_SSPI_recvauth(Port *port)
 	}
 	else
 		return check_usermap(port->hba->usermap, port->user_name, accountname, true);
+}
+
+/*
+ * Replaces the domainname with the Kerberos realm name,
+ * and optionally the accountname with the Kerberos user name.
+ */
+static int
+pg_SSPI_make_upn(char *accountname,
+				 size_t accountnamesize,
+				 char *domainname,
+				 size_t domainnamesize,
+				 bool update_accountname)
+{
+	char	   *samname;
+	char	   *upname = NULL;
+	char	   *p = NULL;
+	ULONG		upnamesize = 0;
+	size_t		upnamerealmsize;
+	BOOLEAN		res;
+
+	/*
+	 * Build SAM name (DOMAIN\user), then translate to UPN
+	 * (user@kerberos.realm). The realm name is returned in lower case, but
+	 * that is fine because in SSPI auth, string comparisons are always
+	 * case-insensitive.
+	 */
+
+	samname = psprintf("%s\\%s", domainname, accountname);
+	res = TranslateName(samname, NameSamCompatible, NameUserPrincipal,
+						NULL, &upnamesize);
+
+	if ((!res && GetLastError() != ERROR_INSUFFICIENT_BUFFER)
+		|| upnamesize == 0)
+	{
+		pfree(samname);
+		ereport(LOG,
+				(errcode(ERRCODE_INVALID_ROLE_SPECIFICATION),
+				 errmsg("could not translate name")));
+		return STATUS_ERROR;
+	}
+
+	/* upnamesize includes the terminating NUL. */
+	upname = palloc(upnamesize);
+
+	res = TranslateName(samname, NameSamCompatible, NameUserPrincipal,
+						upname, &upnamesize);
+
+	pfree(samname);
+	if (res)
+		p = strchr(upname, '@');
+
+	if (!res || p == NULL)
+	{
+		pfree(upname);
+		ereport(LOG,
+				(errcode(ERRCODE_INVALID_ROLE_SPECIFICATION),
+				 errmsg("could not translate name")));
+		return STATUS_ERROR;
+	}
+
+	/* Length of realm name after the '@', including the NUL. */
+	upnamerealmsize = upnamesize - (p - upname + 1);
+
+	/* Replace domainname with realm name. */
+	if (upnamerealmsize > domainnamesize)
+	{
+		pfree(upname);
+		ereport(LOG,
+				(errcode(ERRCODE_INVALID_ROLE_SPECIFICATION),
+				 errmsg("realm name too long")));
+		return STATUS_ERROR;
+	}
+
+	/* Length is now safe. */
+	strcpy(domainname, p + 1);
+
+	/* Replace account name as well (in case UPN != SAM)? */
+	if (update_accountname)
+	{
+		if ((p - upname + 1) > accountnamesize)
+		{
+			pfree(upname);
+			ereport(LOG,
+					(errcode(ERRCODE_INVALID_ROLE_SPECIFICATION),
+					 errmsg("translated account name too long")));
+			return STATUS_ERROR;
+		}
+
+		*p = 0;
+		strcpy(accountname, upname);
+	}
+
+	pfree(upname);
+	return STATUS_OK;
 }
 #endif   /* ENABLE_SSPI */
 
@@ -1611,6 +1767,9 @@ interpret_ident_response(const char *ident_response,
  *	IP addresses and port numbers are in network byte order.
  *
  *	But iff we're unable to get the information from ident, return false.
+ *
+ *	XXX: Using WaitLatchOrSocket() and doing a CHECK_FOR_INTERRUPTS() if the
+ *	latch was set would improve the responsiveness to timeouts/cancellations.
  */
 static int
 ident_inet(hbaPort *port)
@@ -1724,6 +1883,8 @@ ident_inet(hbaPort *port)
 	/* loop in case send is interrupted */
 	do
 	{
+		CHECK_FOR_INTERRUPTS();
+
 		rc = send(sock_fd, ident_query, strlen(ident_query), 0);
 	} while (rc < 0 && errno == EINTR);
 
@@ -1739,6 +1900,8 @@ ident_inet(hbaPort *port)
 
 	do
 	{
+		CHECK_FOR_INTERRUPTS();
+
 		rc = recv(sock_fd, ident_response, sizeof(ident_response) - 1, 0);
 	} while (rc < 0 && errno == EINTR);
 
@@ -1808,9 +1971,12 @@ auth_peer(hbaPort *port)
 	pw = getpwuid(uid);
 	if (!pw)
 	{
+		int			save_errno = errno;
+
 		ereport(LOG,
-				(errmsg("failed to look up local user id %ld: %s",
-		   (long) uid, errno ? strerror(errno) : _("user does not exist"))));
+				(errmsg("could not look up local user ID %ld: %s",
+						(long) uid,
+						save_errno ? strerror(save_errno) : _("user does not exist"))));
 		return STATUS_ERROR;
 	}
 
@@ -1901,12 +2067,6 @@ pam_passwd_conv_proc(int num_msg, const struct pam_message ** msg,
 						 */
 						goto fail;
 					}
-					if (strlen(passwd) == 0)
-					{
-						ereport(LOG,
-							  (errmsg("empty password returned by client")));
-						goto fail;
-					}
 				}
 				if ((reply[i].resp = strdup(passwd)) == NULL)
 					goto fail;
@@ -1955,6 +2115,18 @@ CheckPAMAuth(Port *port, char *user, char *password)
 {
 	int			retval;
 	pam_handle_t *pamh = NULL;
+	char		hostinfo[NI_MAXHOST];
+
+	retval = pg_getnameinfo_all(&port->raddr.addr, port->raddr.salen,
+								hostinfo, sizeof(hostinfo), NULL, 0,
+		  port->hba->pam_use_hostname ? 0 : NI_NUMERICHOST | NI_NUMERICSERV);
+	if (retval != 0)
+	{
+		ereport(WARNING,
+				(errmsg_internal("pg_getnameinfo_all() failed: %s",
+								 gai_strerror(retval))));
+		return STATUS_ERROR;
+	}
 
 	/*
 	 * We can't entirely rely on PAM to pass through appdata --- it appears
@@ -1997,6 +2169,17 @@ CheckPAMAuth(Port *port, char *user, char *password)
 				(errmsg("pam_set_item(PAM_USER) failed: %s",
 						pam_strerror(pamh, retval))));
 		pam_passwd = NULL;		/* Unset pam_passwd */
+		return STATUS_ERROR;
+	}
+
+	retval = pam_set_item(pamh, PAM_RHOST, hostinfo);
+
+	if (retval != PAM_SUCCESS)
+	{
+		ereport(LOG,
+				(errmsg("pam_set_item(PAM_RHOST) failed: %s",
+						pam_strerror(pamh, retval))));
+		pam_passwd = NULL;
 		return STATUS_ERROR;
 	}
 
@@ -2048,6 +2231,38 @@ CheckPAMAuth(Port *port, char *user, char *password)
 }
 #endif   /* USE_PAM */
 
+
+/*----------------------------------------------------------------
+ * BSD authentication system
+ *----------------------------------------------------------------
+ */
+#ifdef USE_BSD_AUTH
+static int
+CheckBSDAuth(Port *port, char *user)
+{
+	char	   *passwd;
+	int			retval;
+
+	/* Send regular password request to client, and get the response */
+	sendAuthRequest(port, AUTH_REQ_PASSWORD);
+
+	passwd = recv_password_packet(port);
+	if (passwd == NULL)
+		return STATUS_EOF;
+
+	/*
+	 * Ask the BSD auth system to verify password.  Note that auth_userokay
+	 * will overwrite the password string with zeroes, but it's just a
+	 * temporary string so we don't care.
+	 */
+	retval = auth_userokay(user, NULL, "auth-postgresql", passwd);
+
+	if (!retval)
+		return STATUS_ERROR;
+
+	return STATUS_OK;
+}
+#endif   /* USE_BSD_AUTH */
 
 
 /*----------------------------------------------------------------
@@ -2189,16 +2404,11 @@ CheckLDAPAuth(Port *port)
 	if (passwd == NULL)
 		return STATUS_EOF;		/* client wouldn't send password */
 
-	if (strlen(passwd) == 0)
-	{
-		ereport(LOG,
-				(errmsg("empty password returned by client")));
-		return STATUS_ERROR;
-	}
-
 	if (InitializeLDAPConnection(port, &ldap) == STATUS_ERROR)
+	{
 		/* Error message already sent */
 		return STATUS_ERROR;
+	}
 
 	if (port->hba->ldapbasedn)
 	{
@@ -2245,7 +2455,8 @@ CheckLDAPAuth(Port *port)
 		{
 			ereport(LOG,
 					(errmsg("could not perform initial LDAP bind for ldapbinddn \"%s\" on server \"%s\": %s",
-							port->hba->ldapbinddn, port->hba->ldapserver, ldap_err2string(r))));
+							port->hba->ldapbinddn ? port->hba->ldapbinddn : "",
+							port->hba->ldapserver, ldap_err2string(r))));
 			return STATUS_ERROR;
 		}
 
@@ -2398,18 +2609,21 @@ CheckCertAuth(Port *port)
  */
 
 /*
- * RADIUS authentication is described in RFC2865 (and several
- * others).
+ * RADIUS authentication is described in RFC2865 (and several others).
  */
 
 #define RADIUS_VECTOR_LENGTH 16
 #define RADIUS_HEADER_LENGTH 20
+#define RADIUS_MAX_PASSWORD_LENGTH 128
+
+/* Maximum size of a RADIUS packet we will create or accept */
+#define RADIUS_BUFFER_SIZE 1024
 
 typedef struct
 {
 	uint8		attribute;
 	uint8		length;
-	uint8		data[1];
+	uint8		data[FLEXIBLE_ARRAY_MEMBER];
 } radius_attribute;
 
 typedef struct
@@ -2418,6 +2632,8 @@ typedef struct
 	uint8		id;
 	uint16		length;
 	uint8		vector[RADIUS_VECTOR_LENGTH];
+	/* this is a bit longer than strictly necessary: */
+	char		pad[RADIUS_BUFFER_SIZE - RADIUS_VECTOR_LENGTH];
 } radius_packet;
 
 /* RADIUS packet types */
@@ -2433,9 +2649,6 @@ typedef struct
 
 /* RADIUS service types */
 #define RADIUS_AUTHENTICATE_ONLY	8
-
-/* Maximum size of a RADIUS packet we will create or accept */
-#define RADIUS_BUFFER_SIZE 1024
 
 /* Seconds to wait - XXX: should be in a config variable! */
 #define RADIUS_TIMEOUT 3
@@ -2457,7 +2670,6 @@ radius_add_attribute(radius_packet *packet, uint8 type, const unsigned char *dat
 			 "Adding attribute code %d with length %d to radius packet would create oversize packet, ignoring",
 			 type, len);
 		return;
-
 	}
 
 	attr = (radius_attribute *) ((unsigned char *) packet + packet->length);
@@ -2472,13 +2684,17 @@ CheckRADIUSAuth(Port *port)
 {
 	char	   *passwd;
 	char	   *identifier = "postgresql";
-	char		radius_buffer[RADIUS_BUFFER_SIZE];
-	char		receive_buffer[RADIUS_BUFFER_SIZE];
-	radius_packet *packet = (radius_packet *) radius_buffer;
-	radius_packet *receivepacket = (radius_packet *) receive_buffer;
+	radius_packet radius_send_pack;
+	radius_packet radius_recv_pack;
+	radius_packet *packet = &radius_send_pack;
+	radius_packet *receivepacket = &radius_recv_pack;
+	char	   *radius_buffer = (char *) &radius_send_pack;
+	char	   *receive_buffer = (char *) &radius_recv_pack;
 	int32		service = htonl(RADIUS_AUTHENTICATE_ONLY);
 	uint8	   *cryptvector;
-	uint8		encryptedpassword[RADIUS_VECTOR_LENGTH];
+	int			encryptedpasswordlen;
+	uint8		encryptedpassword[RADIUS_MAX_PASSWORD_LENGTH];
+	uint8	   *md5trailer;
 	int			packetlength;
 	pgsocket	sock;
 
@@ -2496,6 +2712,7 @@ CheckRADIUSAuth(Port *port)
 	fd_set		fdset;
 	struct timeval endtime;
 	int			i,
+				j,
 				r;
 
 	/* Make sure struct alignment is correct */
@@ -2553,17 +2770,18 @@ CheckRADIUSAuth(Port *port)
 		return STATUS_ERROR;
 	}
 
-	if (strlen(passwd) > RADIUS_VECTOR_LENGTH)
+	if (strlen(passwd) > RADIUS_MAX_PASSWORD_LENGTH)
 	{
 		ereport(LOG,
-				(errmsg("RADIUS authentication does not support passwords longer than 16 characters")));
+				(errmsg("RADIUS authentication does not support passwords longer than %d characters", RADIUS_MAX_PASSWORD_LENGTH)));
 		return STATUS_ERROR;
 	}
+
 
 	/* Construct RADIUS packet */
 	packet->code = RADIUS_ACCESS_REQUEST;
 	packet->length = RADIUS_HEADER_LENGTH;
-#ifdef USE_SSL
+#ifdef USE_OPENSSL
 	if (RAND_bytes(packet->vector, RADIUS_VECTOR_LENGTH) != 1)
 	{
 		ereport(LOG,
@@ -2582,27 +2800,45 @@ CheckRADIUSAuth(Port *port)
 
 	/*
 	 * RADIUS password attributes are calculated as: e[0] = p[0] XOR
-	 * MD5(secret + vector)
+	 * MD5(secret + Request Authenticator) for the first group of 16 octets,
+	 * and then: e[i] = p[i] XOR MD5(secret + e[i-1]) for the following ones
+	 * (if necessary)
 	 */
-	cryptvector = palloc(RADIUS_VECTOR_LENGTH + strlen(port->hba->radiussecret));
+	encryptedpasswordlen = ((strlen(passwd) + RADIUS_VECTOR_LENGTH - 1) / RADIUS_VECTOR_LENGTH) * RADIUS_VECTOR_LENGTH;
+	cryptvector = palloc(strlen(port->hba->radiussecret) + RADIUS_VECTOR_LENGTH);
 	memcpy(cryptvector, port->hba->radiussecret, strlen(port->hba->radiussecret));
-	memcpy(cryptvector + strlen(port->hba->radiussecret), packet->vector, RADIUS_VECTOR_LENGTH);
-	if (!pg_md5_binary(cryptvector, RADIUS_VECTOR_LENGTH + strlen(port->hba->radiussecret), encryptedpassword))
+
+	/* for the first iteration, we use the Request Authenticator vector */
+	md5trailer = packet->vector;
+	for (i = 0; i < encryptedpasswordlen; i += RADIUS_VECTOR_LENGTH)
 	{
-		ereport(LOG,
-				(errmsg("could not perform MD5 encryption of password")));
-		pfree(cryptvector);
-		return STATUS_ERROR;
+		memcpy(cryptvector + strlen(port->hba->radiussecret), md5trailer, RADIUS_VECTOR_LENGTH);
+
+		/*
+		 * .. and for subsequent iterations the result of the previous XOR
+		 * (calculated below)
+		 */
+		md5trailer = encryptedpassword + i;
+
+		if (!pg_md5_binary(cryptvector, strlen(port->hba->radiussecret) + RADIUS_VECTOR_LENGTH, encryptedpassword + i))
+		{
+			ereport(LOG,
+					(errmsg("could not perform MD5 encryption of password")));
+			pfree(cryptvector);
+			return STATUS_ERROR;
+		}
+
+		for (j = i; j < i + RADIUS_VECTOR_LENGTH; j++)
+		{
+			if (j < strlen(passwd))
+				encryptedpassword[j] = passwd[j] ^ encryptedpassword[j];
+			else
+				encryptedpassword[j] = '\0' ^ encryptedpassword[j];
+		}
 	}
 	pfree(cryptvector);
-	for (i = 0; i < RADIUS_VECTOR_LENGTH; i++)
-	{
-		if (i < strlen(passwd))
-			encryptedpassword[i] = passwd[i] ^ encryptedpassword[i];
-		else
-			encryptedpassword[i] = '\0' ^ encryptedpassword[i];
-	}
-	radius_add_attribute(packet, RADIUS_PASSWORD, encryptedpassword, RADIUS_VECTOR_LENGTH);
+
+	radius_add_attribute(packet, RADIUS_PASSWORD, encryptedpassword, encryptedpasswordlen);
 
 	/* Length need to be in network order on the wire */
 	packetlength = packet->length;
@@ -2657,6 +2893,10 @@ CheckRADIUSAuth(Port *port)
 	 * call to select() with a timeout, since somebody can be sending invalid
 	 * packets to our port thus causing us to retry in a loop and never time
 	 * out.
+	 *
+	 * XXX: Using WaitLatchOrSocket() and doing a CHECK_FOR_INTERRUPTS() if
+	 * the latch was set would improve the responsiveness to
+	 * timeouts/cancellations.
 	 */
 	gettimeofday(&endtime, NULL);
 	endtime.tv_sec += RADIUS_TIMEOUT;
@@ -2917,15 +3157,10 @@ check_auth_time_constraints_internal(char *rolname, TimestampTz timestamp)
 	HeapTuple		tuple;
 	authPoint 		now;
 	int				status;
+	bool			isRoleSuperuser;
+	bool			found = false;
 
 	timestamptz_to_point(timestamp, &now);
-
-	/*
-	 * Disable immediate interrupts while doing database access.  (Note
-	 * we don't bother to turn this back on if we hit one of the failure
-	 * conditions, since we can expect we'll just exit right away anyway.)
-	 */
-	ImmediateInterruptOK = false;
 
 	/* Look up this user in pg_authid. */
 	roleTup = SearchSysCache(AUTHNAME, CStringGetDatum(rolname), 0, 0, 0);
@@ -2938,10 +3173,7 @@ check_auth_time_constraints_internal(char *rolname, TimestampTz timestamp)
 		return STATUS_OK;
 	}
 
-	if (((Form_pg_authid) GETSTRUCT(roleTup))->rolsuper)
-		ereport(WARNING,
-				(errmsg("time constraints added on superuser role")));
-
+	isRoleSuperuser = ((Form_pg_authid) GETSTRUCT(roleTup))->rolsuper;
 	roleId = HeapTupleGetOid(roleTup);
 
 	ReleaseSysCache(roleTup);
@@ -2974,6 +3206,9 @@ check_auth_time_constraints_internal(char *rolname, TimestampTz timestamp)
 		bool			isnull;
 		authInterval	given;
 
+		/* Record that we found constraints regardless if they apply now */
+		found = true;
+
 		constraint_tuple = (Form_pg_auth_time_constraint) GETSTRUCT(tuple);
 		Assert(constraint_tuple->authid == roleId);
 
@@ -3004,9 +3239,11 @@ check_auth_time_constraints_internal(char *rolname, TimestampTz timestamp)
 	systable_endscan(scan);
 	heap_close(reltimeconstr, AccessShareLock);
 
-	/* Re-enable immediate response to SIGTERM/SIGINT/timeout interrupts */
-	ImmediateInterruptOK = true;
-	/* And don't forget to detect one that already arrived */
+	/* Time constraints shouldn't be added to superuser roles */
+	if (found && isRoleSuperuser)
+		ereport(WARNING,
+				(errmsg("time constraints added on superuser role")));
+
 	CHECK_FOR_INTERRUPTS();
 	
 	return status;

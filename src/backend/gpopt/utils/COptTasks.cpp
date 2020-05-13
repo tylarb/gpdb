@@ -93,35 +93,10 @@ using namespace gpdbcost;
 #define GPOPT_ERROR_BUFFER_SIZE 10 * 1024 * 1024
 
 // definition of default AutoMemoryPool
-#define AUTO_MEM_POOL(amp) CAutoMemoryPool amp(CAutoMemoryPool::ElcExc, CMemoryPoolManager::EatTracker, false /* fThreadSafe */)
+#define AUTO_MEM_POOL(amp) CAutoMemoryPool amp(CAutoMemoryPool::ElcExc)
 
 // default id for the source system
 const CSystemId default_sysid(IMDId::EmdidGPDB, GPOS_WSZ_STR_LENGTH("GPDB"));
-
-// array of optimizer minor exception types that trigger expected fallback to the planner
-const ULONG expected_opt_fallback[] =
-	{
-		gpopt::ExmiInvalidPlanAlternative,		// chosen plan id is outside range of possible plans
-		gpopt::ExmiUnsupportedOp,				// unsupported operator
-		gpopt::ExmiUnsupportedPred,				// unsupported predicate
-		gpopt::ExmiUnsupportedCompositePartKey	// composite partitioning keys
-	};
-
-// array of DXL minor exception types that trigger expected fallback to the planner
-const ULONG expected_dxl_fallback[] =
-	{
-		gpdxl::ExmiMDObjUnsupported,			// unsupported metadata object
-		gpdxl::ExmiQuery2DXLUnsupportedFeature,	// unsupported feature during algebrization
-		gpdxl::ExmiPlStmt2DXLConversion,		// unsupported feature during plan freezing
-		gpdxl::ExmiDXL2PlStmtConversion			// unsupported feature during planned statement translation
-	};
-
-// array of DXL minor exception types that error out and NOT fallback to the planner
-const ULONG expected_dxl_errors[] =
-	{
-		gpdxl::ExmiDXL2PlStmtExternalScanError,	// external table error
-		gpdxl::ExmiQuery2DXLNotNullViolation,	// not null violation
-	};
 
 
 //---------------------------------------------------------------------------
@@ -284,7 +259,7 @@ COptTasks::Execute
 
 	bool abort_flag = false;
 
-	CAutoMemoryPool amp(CAutoMemoryPool::ElcNone, CMemoryPoolManager::EatTracker, false /* fThreadSafe */);
+	CAutoMemoryPool amp(CAutoMemoryPool::ElcNone);
 
 	gpos_exec_params params;
 	params.func = func;
@@ -339,22 +314,25 @@ COptTasks::LogExceptionMessageAndDelete(CHAR* err_buf, ULONG severity_level)
 PlannedStmt *
 COptTasks::ConvertToPlanStmtFromDXL
 	(
-	IMemoryPool *mp,
+	CMemoryPool *mp,
 	CMDAccessor *md_accessor,
+	const Query *orig_query,
 	const CDXLNode *dxlnode,
-	bool can_set_tag
+	bool can_set_tag,
+	DistributionHashOpsKind distribution_hashops
 	)
 {
 
 	GPOS_ASSERT(NULL != md_accessor);
 	GPOS_ASSERT(NULL != dxlnode);
 
-	CIdGenerator plan_id_generator(1 /* ulStartId */);
+	/*
+	 * Since GPDB 7 (commit 0ae9004), plan node IDs start from 0 in GPDB.
+	 * GPDB 6 and lower had plan node IDs starting from 0.
+	 */
+	CIdGenerator plan_id_generator(0 /* ulStartId */);
 	CIdGenerator motion_id_generator(1 /* ulStartId */);
 	CIdGenerator param_id_generator(0 /* ulStartId */);
-
-	List *table_list = NULL;
-	List *subplans_list = NULL;
 
 	CContextDXLToPlStmt dxl_to_plan_stmt_ctxt
 							(
@@ -362,13 +340,12 @@ COptTasks::ConvertToPlanStmtFromDXL
 							&plan_id_generator,
 							&motion_id_generator,
 							&param_id_generator,
-							&table_list,
-							&subplans_list
+							distribution_hashops
 							);
 	
 	// translate DXL -> PlannedStmt
 	CTranslatorDXLToPlStmt dxl_to_plan_stmt_translator(mp, md_accessor, &dxl_to_plan_stmt_ctxt, gpdb::GetGPSegmentCount());
-	return dxl_to_plan_stmt_translator.GetPlannedStmtFromDXL(dxlnode, can_set_tag);
+	return dxl_to_plan_stmt_translator.GetPlannedStmtFromDXL(dxlnode, orig_query, can_set_tag);
 }
 
 
@@ -383,7 +360,7 @@ COptTasks::ConvertToPlanStmtFromDXL
 CSearchStageArray *
 COptTasks::LoadSearchStrategy
 	(
-	IMemoryPool *mp,
+	CMemoryPool *mp,
 	char *path
 	)
 {
@@ -430,7 +407,7 @@ COptTasks::LoadSearchStrategy
 COptimizerConfig *
 COptTasks::CreateOptimizerConfig
 	(
-	IMemoryPool *mp,
+	CMemoryPool *mp,
 	ICostModel *cost_model
 	)
 {
@@ -448,6 +425,7 @@ COptTasks::CreateOptimizerConfig
 	ULONG array_expansion_threshold = (ULONG) optimizer_array_expansion_threshold;
 	ULONG join_order_threshold = (ULONG) optimizer_join_order_threshold;
 	ULONG broadcast_threshold = (ULONG) optimizer_penalize_broadcast_threshold;
+	ULONG push_group_by_below_setop_threshold = (ULONG) optimizer_push_group_by_below_setop_threshold;
 
 	return GPOS_NEW(mp) COptimizerConfig
 						(
@@ -462,88 +440,12 @@ COptTasks::CreateOptimizerConfig
 								array_expansion_threshold,
 								join_order_threshold,
 								broadcast_threshold,
-								false /* don't create Assert nodes for constraints, we'll
+								false, /* don't create Assert nodes for constraints, we'll
 								      * enforce them ourselves in the executor */
+								push_group_by_below_setop_threshold
 								),
 						GPOS_NEW(mp) CWindowOids(OID(F_WINDOW_ROW_NUMBER), OID(F_WINDOW_RANK))
 						);
-}
-
-
-//---------------------------------------------------------------------------
-//	@function:
-//		COptTasks::FoundException
-//
-//	@doc:
-//		Lookup given exception type in the given array
-//
-//---------------------------------------------------------------------------
-BOOL
-COptTasks::FoundException
-	(
-	gpos::CException &exc,
-	const ULONG *exceptions,
-	ULONG size
-	)
-{
-	GPOS_ASSERT(NULL != exceptions);
-
-	ULONG minor = exc.Minor();
-	BOOL found = false;
-	for (ULONG ul = 0; !found && ul < size; ul++)
-	{
-		found = (exceptions[ul] == minor);
-	}
-
-	return found;
-}
-
-
-//---------------------------------------------------------------------------
-//	@function:
-//		COptTasks::IsUnexpectedFailure
-//
-//	@doc:
-//		Check if given exception is an unexpected reason for failing to
-//		produce a plan
-//
-//---------------------------------------------------------------------------
-BOOL
-COptTasks::IsUnexpectedFailure
-	(
-	gpos::CException &exc
-	)
-{
-	ULONG major = exc.Major();
-
-	BOOL is_opt_failure_expected =
-		gpopt::ExmaGPOPT == major &&
-		FoundException(exc, expected_opt_fallback, GPOS_ARRAY_SIZE(expected_opt_fallback));
-
-	BOOL is_dxl_failure_expected =
-		(gpdxl::ExmaDXL == major || gpdxl::ExmaMD == major) &&
-		FoundException(exc, expected_dxl_fallback, GPOS_ARRAY_SIZE(expected_dxl_fallback));
-
-	return (!is_opt_failure_expected && !is_dxl_failure_expected);
-}
-
-//---------------------------------------------------------------------------
-//	@function:
-//		COptTasks::ShouldErrorOut
-//
-//	@doc:
-//		Check if given exception should error out
-//
-//---------------------------------------------------------------------------
-BOOL
-COptTasks::ShouldErrorOut
-	(
-	gpos::CException &exc
-	)
-{
-	return
-		gpdxl::ExmaDXL == exc.Major() &&
-		FoundException(exc, expected_dxl_errors, GPOS_ARRAY_SIZE(expected_dxl_errors));
 }
 
 //---------------------------------------------------------------------------
@@ -566,7 +468,7 @@ COptTasks::SetCostModelParams
 	{
 		// change NLJ cost factor
 		ICostModelParams::SCostParam *cost_param = NULL;
-		if (OPTIMIZER_GPDB_CALIBRATED == optimizer_cost_model)
+		if (OPTIMIZER_GPDB_CALIBRATED >= optimizer_cost_model)
 		{
 			cost_param = cost_model->GetCostModelParams()->PcpLookup(CCostModelParamsGPDB::EcpNLJFactor);
 		}
@@ -582,7 +484,7 @@ COptTasks::SetCostModelParams
 	{
 		// change sort cost factor
 		ICostModelParams::SCostParam *cost_param = NULL;
-		if (OPTIMIZER_GPDB_CALIBRATED == optimizer_cost_model)
+		if (OPTIMIZER_GPDB_CALIBRATED >= optimizer_cost_model)
 		{
 			cost_param = cost_model->GetCostModelParams()->PcpLookup(CCostModelParamsGPDB::EcpSortTupWidthCostUnit);
 
@@ -604,12 +506,12 @@ COptTasks::SetCostModelParams
 ICostModel *
 COptTasks::GetCostModel
 	(
-	IMemoryPool *mp,
+	CMemoryPool *mp,
 	ULONG num_segments
 	)
 {
 	ICostModel *cost_model = NULL;
-	if (OPTIMIZER_GPDB_CALIBRATED == optimizer_cost_model)
+	if (OPTIMIZER_GPDB_CALIBRATED >= optimizer_cost_model)
 	{
 		cost_model = GPOS_NEW(mp) CCostModelGPDB(mp, num_segments);
 	}
@@ -645,7 +547,7 @@ COptTasks::OptimizeTask
 	GPOS_ASSERT(NULL == opt_ctxt->m_plan_stmt);
 
 	AUTO_MEM_POOL(amp);
-	IMemoryPool *mp = amp.Pmp();
+	CMemoryPool *mp = amp.Pmp();
 
 	// Does the metadatacache need to be reset?
 	//
@@ -696,13 +598,6 @@ COptTasks::OptimizeTask
 			// scope for MD accessor
 			CMDAccessor mda(mp, CMDCache::Pcache(), default_sysid, relcache_provider);
 
-			// ColId generator
-			CIdGenerator colid_generator(GPDXL_COL_ID_START);
-			CIdGenerator cteid_generator(GPDXL_CTE_ID_START);
-
-			// map that stores gpdb att to optimizer col mapping
-			CMappingVarColId *var_colid_mapping = GPOS_NEW(mp) CMappingVarColId(mp);
-
 			ULONG num_segments = gpdb::GetGPSegmentCount();
 			ULONG num_segments_for_costing = optimizer_segments;
 			if (0 == num_segments_for_costing)
@@ -715,11 +610,7 @@ COptTasks::OptimizeTask
 							(
 							mp,
 							&mda,
-							&colid_generator,
-							&cteid_generator,
-							var_colid_mapping,
-							(Query*) opt_ctxt->m_query,
-							0 /* query_level */
+							(Query*) opt_ctxt->m_query
 							);
 
 			ICostModel *cost_model = GetCostModel(mp, num_segments_for_costing);
@@ -735,7 +626,10 @@ COptTasks::OptimizeTask
 
 			BOOL is_master_only = !optimizer_enable_motions ||
 						(!optimizer_enable_motions_masteronly_queries && !query_to_dxl_translator->HasDistributedTables());
-			CAutoTraceFlag atf(EopttraceDisableMotions, is_master_only);
+			// See NoteDistributionPolicyOpclasses() in src/backend/gpopt/translate/CTranslatorQueryToDXL.cpp
+			BOOL use_legacy_opfamilies = (query_to_dxl_translator->GetDistributionHashOpsKind() == DistrUseLegacyHashOps);
+			CAutoTraceFlag atf1(EopttraceDisableMotions, is_master_only);
+			CAutoTraceFlag atf2(EopttraceUseLegacyOpfamilies, use_legacy_opfamilies);
 
 			plan_dxl = COptimizer::PdxlnOptimize
 									(
@@ -766,7 +660,7 @@ COptTasks::OptimizeTask
 			{
 				// always use opt_ctxt->m_query->can_set_tag as the query_to_dxl_translator->Pquery() is a mutated Query object
 				// that may not have the correct can_set_tag
-				opt_ctxt->m_plan_stmt = (PlannedStmt *) gpdb::CopyObject(ConvertToPlanStmtFromDXL(mp, &mda, plan_dxl, opt_ctxt->m_query->canSetTag));
+			  opt_ctxt->m_plan_stmt = (PlannedStmt *) gpdb::CopyObject(ConvertToPlanStmtFromDXL(mp, &mda, opt_ctxt->m_query, plan_dxl, opt_ctxt->m_query->canSetTag, query_to_dxl_translator->GetDistributionHashOpsKind()));
 			}
 
 			CStatisticsConfig *stats_conf = optimizer_config->GetStatsConf();
@@ -831,7 +725,7 @@ COptTasks::OptimizeTask
 void
 COptTasks::PrintMissingStatsWarning
 	(
-	IMemoryPool *mp,
+	CMemoryPool *mp,
 	CMDAccessor *md_accessor,
 	IMdIdArray *col_stats,
 	MdidHashSet *rel_stats

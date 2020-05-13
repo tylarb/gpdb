@@ -68,7 +68,7 @@ SessionState_Acquire(int sessionId)
 		LWLockRelease(SessionStateLock);
 		ereport(FATAL,
 				(errcode(ERRCODE_TOO_MANY_CONNECTIONS),
-						errmsg("Too many sessions."),
+						errmsg("too many sessions"),
 						errdetail("Could not acquire resources for additional sessions."),
 						errhint("Disconnect some sessions and try again.")));
 	}
@@ -99,6 +99,7 @@ SessionState_Acquire(int sessionId)
 		acquired->cleanupCountdown = CLEANUP_COUNTDOWN_BEFORE_RUNAWAY;
 		acquired->activeProcessCount = 0;
 		acquired->idle_start = 0;
+		acquired->latestCursorCommandId = 0;
 		acquired->resGroupSlot = NULL;
 
 #ifdef USE_ASSERT_CHECKING
@@ -172,6 +173,7 @@ SessionState_Release(SessionState *acquired)
 		acquired->cleanupCountdown = CLEANUP_COUNTDOWN_BEFORE_RUNAWAY;
 		acquired->activeProcessCount = 0;
 		acquired->idle_start = 0;
+		acquired->latestCursorCommandId = 0;
 		acquired->resGroupSlot = NULL;
 
 #ifdef USE_ASSERT_CHECKING

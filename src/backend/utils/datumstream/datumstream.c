@@ -178,6 +178,7 @@ datumstreamread_getlarge(DatumStreamRead * acc, Datum *datum, bool *null)
 			acc->largeObjectState = DatumStreamLargeObjectState_Consumed;
 
 			/* Fall below to ~_Consumed. */
+			/* fallthrough */
 
 		case DatumStreamLargeObjectState_Consumed:
 			{
@@ -493,7 +494,8 @@ create_datumstreamwrite(
 						int32 maxsz,
 						Form_pg_attribute attr,
 						char *relname,
-						char *title)
+						char *title,
+						bool needsWAL)
 {
 	DatumStreamWrite *acc = palloc0(sizeof(DatumStreamWrite));
 
@@ -561,7 +563,8 @@ create_datumstreamwrite(
 								acc->maxAoBlockSize,
 								relname,
 								title,
-								&acc->ao_attr);
+								&acc->ao_attr,
+								needsWAL);
 
 	acc->ao_write.compression_functions = compressionFunctions;
 	acc->ao_write.compressionState = compressionState;
@@ -803,7 +806,6 @@ datumstreamwrite_open_file(DatumStreamWrite *ds, char *fn, int64 eof, int64 eofU
 	if (segmentFileNum > 0 && eof == 0)
 	{
 		AppendOnlyStorageWrite_TransactionCreateFile(&ds->ao_write,
-													 fn,
 													 relFileNode,
 													 segmentFileNum);
 	}
@@ -1192,7 +1194,7 @@ datumstreamread_block_content(DatumStreamRead * acc)
 					pfree(acc->large_object_buffer);
 					acc->large_object_buffer = NULL;
 
-					SIMPLE_FAULT_INJECTOR(MallocFailure);
+					SIMPLE_FAULT_INJECTOR("malloc_failure");
 				}
 
 				acc->large_object_buffer_size = acc->getBlockInfo.contentLen;

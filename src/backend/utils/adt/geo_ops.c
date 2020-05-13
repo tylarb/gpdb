@@ -3,7 +3,7 @@
  * geo_ops.c
  *	  2D geometric operations
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -20,6 +20,7 @@
 #include <ctype.h>
 
 #include "libpq/pqformat.h"
+#include "miscadmin.h"
 #include "utils/builtins.h"
 #include "utils/geo_decls.h"
 
@@ -56,12 +57,16 @@ static void make_bound_box(POLYGON *poly);
 static bool plist_same(int npts, Point *p1, Point *p2);
 static Point *point_construct(double x, double y);
 static Point *point_copy(Point *pt);
-static int	single_decode(char *str, float8 *x, char **ss);
-static int	single_encode(float8 x, char *str);
-static int	pair_decode(char *str, float8 *x, float8 *y, char **s);
-static int	pair_encode(float8 x, float8 y, char *str);
+static double single_decode(char *num, char **endptr_p,
+			  const char *type_name, const char *orig_string);
+static void single_encode(float8 x, StringInfo str);
+static void pair_decode(char *str, double *x, double *y, char **endptr_p,
+			const char *type_name, const char *orig_string);
+static void pair_encode(float8 x, float8 y, StringInfo str);
 static int	pair_count(char *s, char delim);
-static int	path_decode(int opentype, int npts, char *str, int *isopen, char **ss, Point *p);
+static void path_decode(char *str, bool opentype, int npts, Point *p,
+			bool *isopen, char **endptr_p,
+			const char *type_name, const char *orig_string);
 static char *path_encode(enum path_delim path_delim, int npts, Point *pt);
 static void statlseg_construct(LSEG *lseg, Point *pt1, Point *pt2);
 static double box_ar(BOX *box);
@@ -73,6 +78,7 @@ static double dist_ps_internal(Point *pt, LSEG *lseg);
 static Point *line_interpt_internal(LINE *l1, LINE *l2);
 static bool lseg_inside_poly(Point *a, Point *b, POLYGON *poly, int start);
 static Point *lseg_interpt_internal(LSEG *l1, LSEG *l2);
+static double dist_ppoly_internal(Point *pt, POLYGON *poly);
 
 
 /*
@@ -88,10 +94,6 @@ static Point *lseg_interpt_internal(LSEG *l1, LSEG *l2);
 #define RDELIM_EP		']'
 #define LDELIM_C		'<'
 #define RDELIM_C		'>'
-
-/* Maximum number of characters printed by pair_encode() */
-/* ...+3+7 : 3 accounts for extra_float_digits max value */
-#define P_MAXLEN (2*(DBL_DIG+3+7)+1)
 
 
 /*
@@ -119,197 +121,166 @@ static Point *lseg_interpt_internal(LSEG *l1, LSEG *l2);
  *	and restore that order for text output - tgl 97/01/16
  */
 
-static int
-single_decode(char *str, float8 *x, char **s)
+static double
+single_decode(char *num, char **endptr_p,
+			  const char *type_name, const char *orig_string)
 {
-	char	   *cp;
-
-	if (!PointerIsValid(str))
-		return FALSE;
-
-	while (isspace((unsigned char) *str))
-		str++;
-	*x = strtod(str, &cp);
-#ifdef GEODEBUG
-	printf("single_decode- (%x) try decoding %s to %g\n", (cp - str), str, *x);
-#endif
-	if (cp <= str)
-		return FALSE;
-	while (isspace((unsigned char) *cp))
-		cp++;
-
-	if (s != NULL)
-		*s = cp;
-
-	return TRUE;
+	return float8in_internal(num, endptr_p, type_name, orig_string);
 }	/* single_decode() */
 
-static int
-single_encode(float8 x, char *str)
+static void
+single_encode(float8 x, StringInfo str)
 {
-	int			ndig = DBL_DIG + extra_float_digits;
+	char	   *xstr = float8out_internal(x);
 
-	if (ndig < 1)
-		ndig = 1;
-
-	sprintf(str, "%.*g", ndig, x);
-	return TRUE;
+	appendStringInfoString(str, xstr);
+	pfree(xstr);
 }	/* single_encode() */
 
-static int
-pair_decode(char *str, float8 *x, float8 *y, char **s)
+static void
+pair_decode(char *str, double *x, double *y, char **endptr_p,
+			const char *type_name, const char *orig_string)
 {
-	int			has_delim;
-	char	   *cp;
-
-	if (!PointerIsValid(str))
-		return FALSE;
+	bool		has_delim;
 
 	while (isspace((unsigned char) *str))
 		str++;
 	if ((has_delim = (*str == LDELIM)))
 		str++;
 
-	while (isspace((unsigned char) *str))
-		str++;
-	*x = strtod(str, &cp);
-	if (cp <= str)
-		return FALSE;
-	while (isspace((unsigned char) *cp))
-		cp++;
-	if (*cp++ != DELIM)
-		return FALSE;
-	while (isspace((unsigned char) *cp))
-		cp++;
-	*y = strtod(cp, &str);
-	if (str <= cp)
-		return FALSE;
-	while (isspace((unsigned char) *str))
-		str++;
+	*x = float8in_internal(str, &str, type_name, orig_string);
+
+	if (*str++ != DELIM)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+				 errmsg("invalid input syntax for type %s: \"%s\"",
+						type_name, orig_string)));
+
+	*y = float8in_internal(str, &str, type_name, orig_string);
+
 	if (has_delim)
 	{
-		if (*str != RDELIM)
-			return FALSE;
-		str++;
+		if (*str++ != RDELIM)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+					 errmsg("invalid input syntax for type %s: \"%s\"",
+							type_name, orig_string)));
 		while (isspace((unsigned char) *str))
 			str++;
 	}
-	if (s != NULL)
-		*s = str;
 
-	return TRUE;
+	/* report stopping point if wanted, else complain if not end of string */
+	if (endptr_p)
+		*endptr_p = str;
+	else if (*str != '\0')
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+				 errmsg("invalid input syntax for type %s: \"%s\"",
+						type_name, orig_string)));
 }
 
-static int
-pair_encode(float8 x, float8 y, char *str)
+static void
+pair_encode(float8 x, float8 y, StringInfo str)
 {
-	// dummy assignment to bypass gcc bug on SPARC
-	volatile int ndig = (int) (x + y);
-	ndig = DBL_DIG + extra_float_digits;
+	char	   *xstr = float8out_internal(x);
+	char	   *ystr = float8out_internal(y);
 
-	if (ndig < 1)
-		ndig = 1;
-
-	sprintf(str, "%.*g,%.*g", ndig, x, ndig, y);
-	return TRUE;
+	appendStringInfo(str, "%s,%s", xstr, ystr);
+	pfree(xstr);
+	pfree(ystr);
 }
 
-static int
-path_decode(int opentype, int npts, char *str, int *isopen, char **ss, Point *p)
+static void
+path_decode(char *str, bool opentype, int npts, Point *p,
+			bool *isopen, char **endptr_p,
+			const char *type_name, const char *orig_string)
 {
 	int			depth = 0;
-	char	   *s,
-			   *cp;
+	char	   *cp;
 	int			i;
 
-	s = str;
-	while (isspace((unsigned char) *s))
-		s++;
-	if ((*isopen = (*s == LDELIM_EP)))
+	while (isspace((unsigned char) *str))
+		str++;
+	if ((*isopen = (*str == LDELIM_EP)))
 	{
 		/* no open delimiter allowed? */
 		if (!opentype)
-			return FALSE;
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+					 errmsg("invalid input syntax for type %s: \"%s\"",
+							type_name, orig_string)));
 		depth++;
-		s++;
-		while (isspace((unsigned char) *s))
-			s++;
-
+		str++;
 	}
-	else if (*s == LDELIM)
+	else if (*str == LDELIM)
 	{
-		cp = (s + 1);
+		cp = (str + 1);
 		while (isspace((unsigned char) *cp))
 			cp++;
 		if (*cp == LDELIM)
 		{
-#ifdef NOT_USED
-			/* nested delimiters with only one point? */
-			if (npts <= 1)
-				return FALSE;
-#endif
 			depth++;
-			s = cp;
+			str = cp;
 		}
-		else if (strrchr(s, LDELIM) == s)
+		else if (strrchr(str, LDELIM) == str)
 		{
 			depth++;
-			s = cp;
+			str = cp;
 		}
 	}
 
 	for (i = 0; i < npts; i++)
 	{
-		if (!pair_decode(s, &(p->x), &(p->y), &s))
-			return FALSE;
-
-		if (*s == DELIM)
-			s++;
+		pair_decode(str, &(p->x), &(p->y), &str, type_name, orig_string);
+		if (*str == DELIM)
+			str++;
 		p++;
 	}
 
+	while (isspace((unsigned char) *str))
+		str++;
 	while (depth > 0)
 	{
-		if ((*s == RDELIM)
-			|| ((*s == RDELIM_EP) && (*isopen) && (depth == 1)))
+		if ((*str == RDELIM)
+			|| ((*str == RDELIM_EP) && (*isopen) && (depth == 1)))
 		{
 			depth--;
-			s++;
-			while (isspace((unsigned char) *s))
-				s++;
+			str++;
+			while (isspace((unsigned char) *str))
+				str++;
 		}
 		else
-			return FALSE;
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+					 errmsg("invalid input syntax for type %s: \"%s\"",
+							type_name, orig_string)));
 	}
-	*ss = s;
 
-	return TRUE;
+	/* report stopping point if wanted, else complain if not end of string */
+	if (endptr_p)
+		*endptr_p = str;
+	else if (*str != '\0')
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+				 errmsg("invalid input syntax for type %s: \"%s\"",
+						type_name, orig_string)));
 }	/* path_decode() */
 
 static char *
 path_encode(enum path_delim path_delim, int npts, Point *pt)
 {
-	int			size = npts * (P_MAXLEN + 3) + 2;
-	char	   *result;
-	char	   *cp;
+	StringInfoData str;
 	int			i;
 
-	/* Check for integer overflow */
-	if ((size - 2) / npts != (P_MAXLEN + 3))
-		ereport(ERROR,
-				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-				 errmsg("too many points requested")));
+	initStringInfo(&str);
 
-	result = palloc(size);
-
-	cp = result;
 	switch (path_delim)
 	{
 		case PATH_CLOSED:
-			*cp++ = LDELIM;
+			appendStringInfoChar(&str, LDELIM);
 			break;
 		case PATH_OPEN:
-			*cp++ = LDELIM_EP;
+			appendStringInfoChar(&str, LDELIM_EP);
 			break;
 		case PATH_NONE:
 			break;
@@ -317,32 +288,27 @@ path_encode(enum path_delim path_delim, int npts, Point *pt)
 
 	for (i = 0; i < npts; i++)
 	{
-		*cp++ = LDELIM;
-		if (!pair_encode(pt->x, pt->y, cp))
-			ereport(ERROR,
-					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-					 errmsg("could not format \"path\" value")));
-
-		cp += strlen(cp);
-		*cp++ = RDELIM;
-		*cp++ = DELIM;
+		if (i > 0)
+			appendStringInfoChar(&str, DELIM);
+		appendStringInfoChar(&str, LDELIM);
+		pair_encode(pt->x, pt->y, &str);
+		appendStringInfoChar(&str, RDELIM);
 		pt++;
 	}
-	cp--;
+
 	switch (path_delim)
 	{
 		case PATH_CLOSED:
-			*cp++ = RDELIM;
+			appendStringInfoChar(&str, RDELIM);
 			break;
 		case PATH_OPEN:
-			*cp++ = RDELIM_EP;
+			appendStringInfoChar(&str, RDELIM_EP);
 			break;
 		case PATH_NONE:
 			break;
 	}
-	*cp = '\0';
 
-	return result;
+	return str.data;
 }	/* path_encode() */
 
 /*-------------------------------------------------------------
@@ -387,16 +353,11 @@ box_in(PG_FUNCTION_ARGS)
 {
 	char	   *str = PG_GETARG_CSTRING(0);
 	BOX		   *box = (BOX *) palloc(sizeof(BOX));
-	int			isopen;
-	char	   *s;
+	bool		isopen;
 	double		x,
 				y;
 
-	if ((!path_decode(FALSE, 2, str, &isopen, &s, &(box->high)))
-		|| (*s != '\0'))
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
-				 errmsg("invalid input syntax for type box: \"%s\"", str)));
+	path_decode(str, false, 2, &(box->high), &isopen, NULL, "box", str);
 
 	/* reorder corners if necessary... */
 	if (box->high.x < box->low.x)
@@ -935,43 +896,22 @@ box_diagonal(PG_FUNCTION_ARGS)
  ***********************************************************************/
 
 static bool
-line_decode(const char *str, LINE *line)
+line_decode(char *s, const char *str, LINE *line)
 {
-	char	   *tail;
-
-	while (isspace((unsigned char) *str))
-		str++;
-	if (*str++ != '{')
+	/* s was already advanced over leading '{' */
+	line->A = single_decode(s, &s, "line", str);
+	if (*s++ != DELIM)
 		return false;
-	line->A = strtod(str, &tail);
-	if (tail <= str)
+	line->B = single_decode(s, &s, "line", str);
+	if (*s++ != DELIM)
 		return false;
-	str = tail;
-	while (isspace((unsigned char) *str))
-		str++;
-	if (*str++ != DELIM)
+	line->C = single_decode(s, &s, "line", str);
+	if (*s++ != '}')
 		return false;
-	line->B = strtod(str, &tail);
-	if (tail <= str)
+	while (isspace((unsigned char) *s))
+		s++;
+	if (*s != '\0')
 		return false;
-	str = tail;
-	while (isspace((unsigned char) *str))
-		str++;
-	if (*str++ != DELIM)
-		return false;
-	line->C = strtod(str, &tail);
-	if (tail <= str)
-		return false;
-	str = tail;
-	while (isspace((unsigned char) *str))
-		str++;
-	if (*str++ != '}')
-		return false;
-	while (isspace((unsigned char) *str))
-		str++;
-	if (*str)
-		return false;
-
 	return true;
 }
 
@@ -979,33 +919,35 @@ Datum
 line_in(PG_FUNCTION_ARGS)
 {
 	char	   *str = PG_GETARG_CSTRING(0);
-	LINE	   *line;
+	LINE	   *line = (LINE *) palloc(sizeof(LINE));
 	LSEG		lseg;
-	int			isopen;
+	bool		isopen;
 	char	   *s;
 
-	line = (LINE *) palloc(sizeof(LINE));
-
-	if (path_decode(TRUE, 2, str, &isopen, &s, &(lseg.p[0])) && *s == '\0')
+	s = str;
+	while (isspace((unsigned char) *s))
+		s++;
+	if (*s == '{')
 	{
-		if (FPeq(lseg.p[0].x, lseg.p[1].x) && FPeq(lseg.p[0].y, lseg.p[1].y))
+		if (!line_decode(s + 1, str, line))
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
-					 errmsg("invalid line specification: must be two distinct points")));
-
-		line_construct_pts(line, &lseg.p[0], &lseg.p[1]);
-	}
-	else if (line_decode(str, line))
-	{
+					 errmsg("invalid input syntax for type %s: \"%s\"",
+							"line", str)));
 		if (FPzero(line->A) && FPzero(line->B))
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
 					 errmsg("invalid line specification: A and B cannot both be zero")));
 	}
 	else
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
-				 errmsg("invalid input syntax for type line: \"%s\"", str)));
+	{
+		path_decode(s, true, 2, &(lseg.p[0]), &isopen, NULL, "line", str);
+		if (FPeq(lseg.p[0].x, lseg.p[1].x) && FPeq(lseg.p[0].y, lseg.p[1].y))
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+					 errmsg("invalid line specification: must be two distinct points")));
+		line_construct_pts(line, &lseg.p[0], &lseg.p[1]);
+	}
 
 	PG_RETURN_LINE_P(line);
 }
@@ -1015,12 +957,11 @@ Datum
 line_out(PG_FUNCTION_ARGS)
 {
 	LINE	   *line = PG_GETARG_LINE_P(0);
-	int			ndig = DBL_DIG + extra_float_digits;
+	char	   *astr = float8out_internal(line->A);
+	char	   *bstr = float8out_internal(line->B);
+	char	   *cstr = float8out_internal(line->C);
 
-	if (ndig < 1)
-		ndig = 1;
-
-	PG_RETURN_CSTRING(psprintf("{%.*g,%.*g,%.*g}", ndig, line->A, ndig, line->B, ndig, line->C));
+	PG_RETURN_CSTRING(psprintf("{%s,%s,%s}", astr, bstr, cstr));
 }
 
 /*
@@ -1367,7 +1308,7 @@ path_in(PG_FUNCTION_ARGS)
 {
 	char	   *str = PG_GETARG_CSTRING(0);
 	PATH	   *path;
-	int			isopen;
+	bool		isopen;
 	char	   *s;
 	int			npts;
 	int			size;
@@ -1377,7 +1318,8 @@ path_in(PG_FUNCTION_ARGS)
 	if ((npts = pair_count(str, ',')) <= 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
-				 errmsg("invalid input syntax for type path: \"%s\"", str)));
+				 errmsg("invalid input syntax for type %s: \"%s\"",
+						"path", str)));
 
 	s = str;
 	while (isspace((unsigned char) *s))
@@ -1391,7 +1333,7 @@ path_in(PG_FUNCTION_ARGS)
 	}
 
 	base_size = sizeof(path->p[0]) * npts;
-	size = offsetof(PATH, p[0]) + base_size;
+	size = offsetof(PATH, p) +base_size;
 
 	/* Check for integer overflow */
 	if (base_size / npts != sizeof(path->p[0]) || size <= base_size)
@@ -1404,11 +1346,23 @@ path_in(PG_FUNCTION_ARGS)
 	SET_VARSIZE(path, size);
 	path->npts = npts;
 
-	if ((!path_decode(TRUE, npts, s, &isopen, &s, &(path->p[0])))
-	&& (!((depth == 0) && (*s == '\0'))) && !((depth >= 1) && (*s == RDELIM)))
+	path_decode(s, true, npts, &(path->p[0]), &isopen, &s, "path", str);
+
+	if (depth >= 1)
+	{
+		if (*s++ != RDELIM)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+					 errmsg("invalid input syntax for type %s: \"%s\"",
+							"path", str)));
+		while (isspace((unsigned char) *s))
+			s++;
+	}
+	if (*s != '\0')
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
-				 errmsg("invalid input syntax for type path: \"%s\"", str)));
+				 errmsg("invalid input syntax for type %s: \"%s\"",
+						"path", str)));
 
 	path->closed = (!isopen);
 	/* prevent instability in unused pad bytes */
@@ -1444,12 +1398,12 @@ path_recv(PG_FUNCTION_ARGS)
 
 	closed = pq_getmsgbyte(buf);
 	npts = pq_getmsgint(buf, sizeof(int32));
-	if (npts <= 0 || npts >= (int32) ((INT_MAX - offsetof(PATH, p[0])) / sizeof(Point)))
+	if (npts <= 0 || npts >= (int32) ((INT_MAX - offsetof(PATH, p)) / sizeof(Point)))
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_BINARY_REPRESENTATION),
 			 errmsg("invalid number of points in external \"path\" value")));
 
-	size = offsetof(PATH, p[0]) +sizeof(path->p[0]) * npts;
+	size = offsetof(PATH, p) +sizeof(path->p[0]) * npts;
 	path = (PATH *) palloc(size);
 
 	SET_VARSIZE(path, size);
@@ -1782,21 +1736,9 @@ Datum
 point_in(PG_FUNCTION_ARGS)
 {
 	char	   *str = PG_GETARG_CSTRING(0);
-	Point	   *point;
-	double		x = 0,
-				y = 0;
-	char	   *s;
+	Point	   *point = (Point *) palloc(sizeof(Point));
 
-	if (!pair_decode(str, &x, &y, &s) || (*s != '\0'))
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
-				 errmsg("invalid input syntax for type point: \"%s\"", str)));
-
-	point = (Point *) palloc(sizeof(Point));
-
-	point->x = x;
-	point->y = y;
-
+	pair_decode(str, &point->x, &point->y, NULL, "point", str);
 	PG_RETURN_POINT_P(point);
 }
 
@@ -2008,22 +1950,10 @@ Datum
 lseg_in(PG_FUNCTION_ARGS)
 {
 	char	   *str = PG_GETARG_CSTRING(0);
-	LSEG	   *lseg;
-	int			isopen;
-	char	   *s;
+	LSEG	   *lseg = (LSEG *) palloc(sizeof(LSEG));
+	bool		isopen;
 
-	lseg = (LSEG *) palloc(sizeof(LSEG));
-
-	if ((!path_decode(TRUE, 2, str, &isopen, &s, &(lseg->p[0])))
-		|| (*s != '\0'))
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
-				 errmsg("invalid input syntax for type lseg: \"%s\"", str)));
-
-#ifdef NOT_USED
-	lseg->m = point_sl(&lseg->p[0], &lseg->p[1]);
-#endif
-
+	path_decode(str, true, 2, &(lseg->p[0]), &isopen, NULL, "lseg", str);
 	PG_RETURN_LSEG_P(lseg);
 }
 
@@ -2051,10 +1981,6 @@ lseg_recv(PG_FUNCTION_ARGS)
 	lseg->p[0].y = pq_getmsgfloat8(buf);
 	lseg->p[1].x = pq_getmsgfloat8(buf);
 	lseg->p[1].y = pq_getmsgfloat8(buf);
-
-#ifdef NOT_USED
-	lseg->m = point_sl(&lseg->p[0], &lseg->p[1]);
-#endif
 
 	PG_RETURN_LSEG_P(lseg);
 }
@@ -2092,10 +2018,6 @@ lseg_construct(PG_FUNCTION_ARGS)
 	result->p[1].x = pt2->x;
 	result->p[1].y = pt2->y;
 
-#ifdef NOT_USED
-	result->m = point_sl(pt1, pt2);
-#endif
-
 	PG_RETURN_LSEG_P(result);
 }
 
@@ -2107,10 +2029,6 @@ statlseg_construct(LSEG *lseg, Point *pt1, Point *pt2)
 	lseg->p[0].y = pt1->y;
 	lseg->p[1].x = pt2->x;
 	lseg->p[1].y = pt2->y;
-
-#ifdef NOT_USED
-	lseg->m = point_sl(pt1, pt2);
-#endif
 }
 
 Datum
@@ -2161,9 +2079,6 @@ lseg_parallel(PG_FUNCTION_ARGS)
 	LSEG	   *l1 = PG_GETARG_LSEG_P(0);
 	LSEG	   *l2 = PG_GETARG_LSEG_P(1);
 
-#ifdef NOT_USED
-	PG_RETURN_BOOL(FPeq(l1->m, l2->m));
-#endif
 	PG_RETURN_BOOL(FPeq(point_sl(&l1->p[0], &l1->p[1]),
 						point_sl(&l2->p[0], &l2->p[1])));
 }
@@ -2417,6 +2332,9 @@ lseg_interpt(PG_FUNCTION_ARGS)
  *				Minimum distance from one object to another.
  *-------------------------------------------------------------------*/
 
+/*
+ * Distance from a point to a line
+ */
 Datum
 dist_pl(PG_FUNCTION_ARGS)
 {
@@ -2433,6 +2351,9 @@ dist_pl_internal(Point *pt, LINE *line)
 				HYPOT(line->A, line->B));
 }
 
+/*
+ * Distance from a point to a lseg
+ */
 Datum
 dist_ps(PG_FUNCTION_ARGS)
 {
@@ -2496,7 +2417,7 @@ dist_ps_internal(Point *pt, LSEG *lseg)
 }
 
 /*
- ** Distance from a point to a path
+ * Distance from a point to a path
  */
 Datum
 dist_ppath(PG_FUNCTION_ARGS)
@@ -2552,6 +2473,9 @@ dist_ppath(PG_FUNCTION_ARGS)
 	PG_RETURN_FLOAT8(result);
 }
 
+/*
+ * Distance from a point to a box
+ */
 Datum
 dist_pb(PG_FUNCTION_ARGS)
 {
@@ -2568,7 +2492,9 @@ dist_pb(PG_FUNCTION_ARGS)
 	PG_RETURN_FLOAT8(result);
 }
 
-
+/*
+ * Distance from a lseg to a line
+ */
 Datum
 dist_sl(PG_FUNCTION_ARGS)
 {
@@ -2591,7 +2517,9 @@ dist_sl(PG_FUNCTION_ARGS)
 	PG_RETURN_FLOAT8(result);
 }
 
-
+/*
+ * Distance from a lseg to a box
+ */
 Datum
 dist_sb(PG_FUNCTION_ARGS)
 {
@@ -2610,7 +2538,9 @@ dist_sb(PG_FUNCTION_ARGS)
 	PG_RETURN_DATUM(result);
 }
 
-
+/*
+ * Distance from a line to a box
+ */
 Datum
 dist_lb(PG_FUNCTION_ARGS)
 {
@@ -2627,23 +2557,67 @@ dist_lb(PG_FUNCTION_ARGS)
 	PG_RETURN_NULL();
 }
 
-
+/*
+ * Distance from a circle to a polygon
+ */
 Datum
 dist_cpoly(PG_FUNCTION_ARGS)
 {
 	CIRCLE	   *circle = PG_GETARG_CIRCLE_P(0);
 	POLYGON    *poly = PG_GETARG_POLYGON_P(1);
 	float8		result;
+
+	/* calculate distance to center, and subtract radius */
+	result = dist_ppoly_internal(&circle->center, poly);
+
+	result -= circle->radius;
+	if (result < 0)
+		result = 0;
+
+	PG_RETURN_FLOAT8(result);
+}
+
+/*
+ * Distance from a point to a polygon
+ */
+Datum
+dist_ppoly(PG_FUNCTION_ARGS)
+{
+	Point	   *point = PG_GETARG_POINT_P(0);
+	POLYGON    *poly = PG_GETARG_POLYGON_P(1);
+	float8		result;
+
+	result = dist_ppoly_internal(point, poly);
+
+	PG_RETURN_FLOAT8(result);
+}
+
+Datum
+dist_polyp(PG_FUNCTION_ARGS)
+{
+	POLYGON    *poly = PG_GETARG_POLYGON_P(0);
+	Point	   *point = PG_GETARG_POINT_P(1);
+	float8		result;
+
+	result = dist_ppoly_internal(point, poly);
+
+	PG_RETURN_FLOAT8(result);
+}
+
+static double
+dist_ppoly_internal(Point *pt, POLYGON *poly)
+{
+	float8		result;
 	float8		d;
 	int			i;
 	LSEG		seg;
 
-	if (point_inside(&(circle->center), poly->npts, poly->p) != 0)
+	if (point_inside(pt, poly->npts, poly->p) != 0)
 	{
 #ifdef GEODEBUG
-		printf("dist_cpoly- center inside of polygon\n");
+		printf("dist_ppoly_internal- point inside of polygon\n");
 #endif
-		PG_RETURN_FLOAT8(0.0);
+		return 0.0;
 	}
 
 	/* initialize distance with segment between first and last points */
@@ -2651,9 +2625,9 @@ dist_cpoly(PG_FUNCTION_ARGS)
 	seg.p[0].y = poly->p[0].y;
 	seg.p[1].x = poly->p[poly->npts - 1].x;
 	seg.p[1].y = poly->p[poly->npts - 1].y;
-	result = dist_ps_internal(&circle->center, &seg);
+	result = dist_ps_internal(pt, &seg);
 #ifdef GEODEBUG
-	printf("dist_cpoly- segment 0/n distance is %f\n", result);
+	printf("dist_ppoly_internal- segment 0/n distance is %f\n", result);
 #endif
 
 	/* check distances for other segments */
@@ -2663,19 +2637,15 @@ dist_cpoly(PG_FUNCTION_ARGS)
 		seg.p[0].y = poly->p[i].y;
 		seg.p[1].x = poly->p[i + 1].x;
 		seg.p[1].y = poly->p[i + 1].y;
-		d = dist_ps_internal(&circle->center, &seg);
+		d = dist_ps_internal(pt, &seg);
 #ifdef GEODEBUG
-		printf("dist_cpoly- segment %d distance is %f\n", (i + 1), d);
+		printf("dist_ppoly_internal- segment %d distance is %f\n", (i + 1), d);
 #endif
 		if (d < result)
 			result = d;
 	}
 
-	result -= circle->radius;
-	if (result < 0)
-		result = 0;
-
-	PG_RETURN_FLOAT8(result);
+	return result;
 }
 
 
@@ -2859,8 +2829,8 @@ close_ps(PG_FUNCTION_ARGS)
 		result = point_copy(&lseg->p[!yh]);		/* below the lseg, take lower
 												 * end pt */
 #ifdef GEODEBUG
-		printf("close_ps below: tmp A %f  B %f   C %f    m %f\n",
-			   tmp->A, tmp->B, tmp->C, tmp->m);
+		printf("close_ps below: tmp A %f  B %f   C %f\n",
+			   tmp->A, tmp->B, tmp->C);
 #endif
 		PG_RETURN_POINT_P(result);
 	}
@@ -2871,23 +2841,31 @@ close_ps(PG_FUNCTION_ARGS)
 		result = point_copy(&lseg->p[yh]);		/* above the lseg, take higher
 												 * end pt */
 #ifdef GEODEBUG
-		printf("close_ps above: tmp A %f  B %f   C %f    m %f\n",
-			   tmp->A, tmp->B, tmp->C, tmp->m);
+		printf("close_ps above: tmp A %f  B %f   C %f\n",
+			   tmp->A, tmp->B, tmp->C);
 #endif
 		PG_RETURN_POINT_P(result);
 	}
 
 	/*
-	 * at this point the "normal" from point will hit lseg. The closet point
+	 * at this point the "normal" from point will hit lseg. The closest point
 	 * will be somewhere on the lseg
 	 */
 	tmp = line_construct_pm(pt, invm);
 #ifdef GEODEBUG
-	printf("close_ps- tmp A %f  B %f   C %f    m %f\n",
-		   tmp->A, tmp->B, tmp->C, tmp->m);
+	printf("close_ps- tmp A %f  B %f   C %f\n",
+		   tmp->A, tmp->B, tmp->C);
 #endif
 	result = interpt_sl(lseg, tmp);
-	Assert(result != NULL);
+
+	/*
+	 * ordinarily we should always find an intersection point, but that could
+	 * fail in the presence of NaN coordinates, and perhaps even from simple
+	 * roundoff issues.  Return a SQL NULL if so.
+	 */
+	if (result == NULL)
+		PG_RETURN_NULL();
+
 #ifdef GEODEBUG
 	printf("close_ps- result.x %f  result.y %f\n", result->x, result->y);
 #endif
@@ -3444,16 +3422,16 @@ poly_in(PG_FUNCTION_ARGS)
 	int			npts;
 	int			size;
 	int			base_size;
-	int			isopen;
-	char	   *s;
+	bool		isopen;
 
 	if ((npts = pair_count(str, ',')) <= 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
-			  errmsg("invalid input syntax for type polygon: \"%s\"", str)));
+				 errmsg("invalid input syntax for type %s: \"%s\"",
+						"polygon", str)));
 
 	base_size = sizeof(poly->p[0]) * npts;
-	size = offsetof(POLYGON, p[0]) + base_size;
+	size = offsetof(POLYGON, p) +base_size;
 
 	/* Check for integer overflow */
 	if (base_size / npts != sizeof(poly->p[0]) || size <= base_size)
@@ -3466,11 +3444,7 @@ poly_in(PG_FUNCTION_ARGS)
 	SET_VARSIZE(poly, size);
 	poly->npts = npts;
 
-	if ((!path_decode(FALSE, npts, str, &isopen, &s, &(poly->p[0])))
-		|| (*s != '\0'))
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
-			  errmsg("invalid input syntax for type polygon: \"%s\"", str)));
+	path_decode(str, false, npts, &(poly->p[0]), &isopen, NULL, "polygon", str);
 
 	make_bound_box(poly);
 
@@ -3507,12 +3481,12 @@ poly_recv(PG_FUNCTION_ARGS)
 	int			size;
 
 	npts = pq_getmsgint(buf, sizeof(int32));
-	if (npts <= 0 || npts >= (int32) ((INT_MAX - offsetof(POLYGON, p[0])) / sizeof(Point)))
+	if (npts <= 0 || npts >= (int32) ((INT_MAX - offsetof(POLYGON, p)) / sizeof(Point)))
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_BINARY_REPRESENTATION),
 		  errmsg("invalid number of points in external \"polygon\" value")));
 
-	size = offsetof(POLYGON, p[0]) +sizeof(poly->p[0]) * npts;
+	size = offsetof(POLYGON, p) +sizeof(poly->p[0]) * npts;
 	poly = (POLYGON *) palloc0(size);	/* zero any holes */
 
 	SET_VARSIZE(poly, size);
@@ -3896,6 +3870,8 @@ lseg_inside_poly(Point *a, Point *b, POLYGON *poly, int start)
 	{
 		Point	   *interpt;
 
+		CHECK_FOR_INTERRUPTS();
+
 		s.p[1] = poly->p[i];
 
 		if (on_ps_internal(t.p, &s))
@@ -4204,6 +4180,45 @@ box_div(PG_FUNCTION_ARGS)
 	PG_RETURN_BOX_P(result);
 }
 
+/*
+ * Convert point to empty box
+ */
+Datum
+point_box(PG_FUNCTION_ARGS)
+{
+	Point	   *pt = PG_GETARG_POINT_P(0);
+	BOX		   *box;
+
+	box = (BOX *) palloc(sizeof(BOX));
+
+	box->high.x = pt->x;
+	box->low.x = pt->x;
+	box->high.y = pt->y;
+	box->low.y = pt->y;
+
+	PG_RETURN_BOX_P(box);
+}
+
+/*
+ * Smallest bounding box that includes both of the given boxes
+ */
+Datum
+boxes_bound_box(PG_FUNCTION_ARGS)
+{
+	BOX		   *box1 = PG_GETARG_BOX_P(0),
+			   *box2 = PG_GETARG_BOX_P(1),
+			   *container;
+
+	container = (BOX *) palloc(sizeof(BOX));
+
+	container->high.x = Max(box1->high.x, box2->high.x);
+	container->low.x = Min(box1->low.x, box2->low.x);
+	container->high.y = Max(box1->high.y, box2->high.y);
+	container->low.y = Min(box1->low.y, box2->low.y);
+
+	PG_RETURN_BOX_P(container);
+}
+
 
 /***********************************************************************
  **
@@ -4228,7 +4243,7 @@ path_add(PG_FUNCTION_ARGS)
 		PG_RETURN_NULL();
 
 	base_size = sizeof(p1->p[0]) * (p1->npts + p2->npts);
-	size = offsetof(PATH, p[0]) +base_size;
+	size = offsetof(PATH, p) +base_size;
 
 	/* Check for integer overflow */
 	if (base_size / sizeof(p1->p[0]) != (p1->npts + p2->npts) ||
@@ -4370,7 +4385,7 @@ path_poly(PG_FUNCTION_ARGS)
 	 * Never overflows: the old size fit in MaxAllocSize, and the new size is
 	 * just a small constant larger.
 	 */
-	size = offsetof(POLYGON, p[0]) +sizeof(poly->p[0]) * path->npts;
+	size = offsetof(POLYGON, p) +sizeof(poly->p[0]) * path->npts;
 	poly = (POLYGON *) palloc(size);
 
 	SET_VARSIZE(poly, size);
@@ -4445,7 +4460,7 @@ box_poly(PG_FUNCTION_ARGS)
 	int			size;
 
 	/* map four corners of the box to a polygon */
-	size = offsetof(POLYGON, p[0]) +sizeof(poly->p[0]) * 4;
+	size = offsetof(POLYGON, p) +sizeof(poly->p[0]) * 4;
 	poly = (POLYGON *) palloc(size);
 
 	SET_VARSIZE(poly, size);
@@ -4479,7 +4494,7 @@ poly_path(PG_FUNCTION_ARGS)
 	 * Never overflows: the old size fit in MaxAllocSize, and the new size is
 	 * smaller by a small constant.
 	 */
-	size = offsetof(PATH, p[0]) +sizeof(path->p[0]) * poly->npts;
+	size = offsetof(PATH, p) +sizeof(path->p[0]) * poly->npts;
 	path = (PATH *) palloc(size);
 
 	SET_VARSIZE(path, size);
@@ -4518,12 +4533,10 @@ Datum
 circle_in(PG_FUNCTION_ARGS)
 {
 	char	   *str = PG_GETARG_CSTRING(0);
-	CIRCLE	   *circle;
+	CIRCLE	   *circle = (CIRCLE *) palloc(sizeof(CIRCLE));
 	char	   *s,
 			   *cp;
 	int			depth = 0;
-
-	circle = (CIRCLE *) palloc(sizeof(CIRCLE));
 
 	s = str;
 	while (isspace((unsigned char) *s))
@@ -4538,20 +4551,17 @@ circle_in(PG_FUNCTION_ARGS)
 			s = cp;
 	}
 
-	if (!pair_decode(s, &circle->center.x, &circle->center.y, &s))
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
-			   errmsg("invalid input syntax for type circle: \"%s\"", str)));
+	pair_decode(s, &circle->center.x, &circle->center.y, &s, "circle", str);
 
 	if (*s == DELIM)
 		s++;
-	while (isspace((unsigned char) *s))
-		s++;
 
-	if ((!single_decode(s, &circle->radius, &s)) || (circle->radius < 0))
+	circle->radius = single_decode(s, &s, "circle", str);
+	if (circle->radius < 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
-			   errmsg("invalid input syntax for type circle: \"%s\"", str)));
+				 errmsg("invalid input syntax for type %s: \"%s\"",
+						"circle", str)));
 
 	while (depth > 0)
 	{
@@ -4566,13 +4576,15 @@ circle_in(PG_FUNCTION_ARGS)
 		else
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
-			   errmsg("invalid input syntax for type circle: \"%s\"", str)));
+					 errmsg("invalid input syntax for type %s: \"%s\"",
+							"circle", str)));
 	}
 
 	if (*s != '\0')
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
-			   errmsg("invalid input syntax for type circle: \"%s\"", str)));
+				 errmsg("invalid input syntax for type %s: \"%s\"",
+						"circle", str)));
 
 	PG_RETURN_CIRCLE_P(circle);
 }
@@ -4583,32 +4595,19 @@ Datum
 circle_out(PG_FUNCTION_ARGS)
 {
 	CIRCLE	   *circle = PG_GETARG_CIRCLE_P(0);
-	char	   *result;
-	char	   *cp;
+	StringInfoData str;
 
-	result = palloc(2 * P_MAXLEN + 6);
+	initStringInfo(&str);
 
-	cp = result;
-	*cp++ = LDELIM_C;
-	*cp++ = LDELIM;
-	if (!pair_encode(circle->center.x, circle->center.y, cp))
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("could not format \"circle\" value")));
+	appendStringInfoChar(&str, LDELIM_C);
+	appendStringInfoChar(&str, LDELIM);
+	pair_encode(circle->center.x, circle->center.y, &str);
+	appendStringInfoChar(&str, RDELIM);
+	appendStringInfoChar(&str, DELIM);
+	single_encode(circle->radius, &str);
+	appendStringInfoChar(&str, RDELIM_C);
 
-	cp += strlen(cp);
-	*cp++ = RDELIM;
-	*cp++ = DELIM;
-	if (!single_encode(circle->radius, cp))
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("could not format \"circle\" value")));
-
-	cp += strlen(cp);
-	*cp++ = RDELIM_C;
-	*cp = '\0';
-
-	PG_RETURN_CSTRING(result);
+	PG_RETURN_CSTRING(str.data);
 }
 
 /*
@@ -5050,6 +5049,21 @@ dist_pc(PG_FUNCTION_ARGS)
 	PG_RETURN_FLOAT8(result);
 }
 
+/*
+ * Distance from a circle to a point
+ */
+Datum
+dist_cpoint(PG_FUNCTION_ARGS)
+{
+	CIRCLE	   *circle = PG_GETARG_CIRCLE_P(0);
+	Point	   *point = PG_GETARG_POINT_P(1);
+	float8		result;
+
+	result = point_dt(point, &circle->center) - circle->radius;
+	if (result < 0)
+		result = 0;
+	PG_RETURN_FLOAT8(result);
+}
 
 /*		circle_center	-		returns the center point of the circle.
  */
@@ -5158,7 +5172,7 @@ circle_poly(PG_FUNCTION_ARGS)
 				 errmsg("must request at least 2 points")));
 
 	base_size = sizeof(poly->p[0]) * npts;
-	size = offsetof(POLYGON, p[0]) +base_size;
+	size = offsetof(POLYGON, p) +base_size;
 
 	/* Check for integer overflow */
 	if (base_size / npts != sizeof(poly->p[0]) || size <= base_size)

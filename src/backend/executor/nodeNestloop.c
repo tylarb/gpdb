@@ -5,7 +5,7 @@
  *
  * Portions Copyright (c) 2005-2008, Greenplum inc
  * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -23,9 +23,14 @@
 
 #include "postgres.h"
 
+#include "cdb/cdbvars.h"
 #include "executor/execdebug.h"
 #include "executor/nodeNestloop.h"
+#include "optimizer/clauses.h"
+#include "utils/lsyscache.h"
 #include "utils/memutils.h"
+
+extern bool Test_print_prefetch_joinqual;
 
 static void splitJoinQualExpr(NestLoopState *nlstate);
 static void extractFuncExprArgs(FuncExprState *fstate, List **lclauses, List **rclauses);
@@ -60,8 +65,8 @@ static void extractFuncExprArgs(FuncExprState *fstate, List **lclauses, List **r
  *			   are prepared to return the first tuple.
  * ----------------------------------------------------------------
  */
-TupleTableSlot *
-ExecNestLoop(NestLoopState *node)
+static TupleTableSlot *
+ExecNestLoop_guts(NestLoopState *node)
 {
 	NestLoop   *nl;
 	PlanState  *innerPlan;
@@ -106,6 +111,26 @@ ExecNestLoop(NestLoopState *node)
 	 */
 	if (node->prefetch_inner)
 	{
+		/*
+		 * Prefetch inner is Greenplum specific behavior.
+		 * However, inner plan may depend on outer plan as
+		 * outerParams. If so, we have to fake those params
+		 * to avoid null pointer reference issue. And because
+		 * of the nestParams, those inner results prefetched
+		 * will be discarded (following code will rescan inner,
+		 * even if inner's top is material node because of chgParam
+		 * it will be re-executed too) that it is safe to fake
+		 * nestParams here. The target is to materialize motion scan.
+		 */
+		if (nl->nestParams)
+		{
+			EState	   *estate = node->js.ps.state;
+
+			econtext->ecxt_outertuple = ExecInitNullTupleSlot(estate,
+															  ExecGetResultType(outerPlan));
+			fake_outer_params(&(node->js));
+		}
+
 		innerTupleSlot = ExecProcNode(innerPlan);
 		node->reset_inner = true;
 		econtext->ecxt_innertuple = innerTupleSlot;
@@ -125,24 +150,30 @@ ExecNestLoop(NestLoopState *node)
 				(node->nl_InnerJoinKeys && isJoinExprNull(node->nl_InnerJoinKeys, econtext)))
 		{
 			/*
-			 * If LASJ_NOTIN and a null was found on the inner side, then clean out.
+			 * If LASJ_NOTIN and a null was found on the inner side, all tuples
 			 * We'll read no more from either inner or outer subtree. To keep our
-			 * sibling QEs from being starved, tell source QEs not to
-			 * clog up the pipeline with our never-to-be-consumed
-			 * data.
+			 * in outer sider will be treated as "not in" tuples in inner side.
 			 */
 			ENL1_printf("Found NULL tuple on the inner side, clean out");
-			ExecSquelchNode(outerPlan);
-			ExecSquelchNode(innerPlan);
 			return NULL;
 		}
 
 		ExecReScan(innerPlan);
 		ResetExprContext(econtext);
 
-		node->nl_innerSquelchNeeded = false; /* no need to squelch inner since it was completely prefetched */
 		node->prefetch_inner = false;
 		node->reset_inner = false;
+	}
+
+	/*
+	 * Prefetch JoinQual to prevent motion hazard.
+	 *
+	 * See ExecPrefetchJoinQual() for details.
+	 */
+	if (node->prefetch_joinqual)
+	{
+		ExecPrefetchJoinQual(&node->js);
+		node->prefetch_joinqual = false;
 	}
 
 	/*
@@ -168,29 +199,6 @@ ExecNestLoop(NestLoopState *node)
 			if (TupIsNull(outerTupleSlot))
 			{
 				ENL1_printf("no outer tuple, ending join");
-
-				/*
-				 * CDB: If outer tuple stream was empty, notify inner
-				 * subplan that we won't fetch its results, so QEs in
-				 * lower gangs won't keep trying to send to us.  Else
-				 * we have reached inner end-of-data at least once and
-				 * squelch is not needed.
-				 */
-				if (node->nl_innerSquelchNeeded)
-				{
-					ExecSquelchNode(innerPlan);
-				}
-
-				/*
-				 * The memory used by child nodes might not be freed because
-				 * they are not eager free safe. However, when the nestloop is done,
-				 * we can free the memory used by the child nodes.
-				 */
-				if (!node->js.ps.delayEagerFree)
-				{
-					ExecEagerFreeChildNodes((PlanState *)node, false);
-				}
-
 				return NULL;
 			}
 
@@ -297,15 +305,11 @@ ExecNestLoop(NestLoopState *node)
 				(node->nl_InnerJoinKeys && isJoinExprNull(node->nl_InnerJoinKeys, econtext)))
 		{
 			/*
-			 * If LASJ_NOTIN and a null was found on the inner side, then clean out.
+			 * If LASJ_NOTIN and a null was found on the inner side, all tuples
 			 * We'll read no more from either inner or outer subtree. To keep our
-			 * sibling QEs from being starved, tell source QEs not to
-			 * clog up the pipeline with our never-to-be-consumed
-			 * data.
+			 * in outer sider will be treated as "not in" tuples in inner side.
 			 */
 			ENL1_printf("Found NULL tuple on the inner side, clean out");
-			ExecSquelchNode(outerPlan);
-			ExecSquelchNode(innerPlan);
 			return NULL;
 		}
 
@@ -366,6 +370,27 @@ ExecNestLoop(NestLoopState *node)
 	}
 }
 
+TupleTableSlot *
+ExecNestLoop(NestLoopState *node)
+{
+	TupleTableSlot *result;
+
+	result = ExecNestLoop_guts(node);
+
+	if (TupIsNull(result))
+	{
+		/*
+		 * CDB: We'll read no more from inner subtree. To keep our
+		 * sibling QEs from being starved, tell source QEs not to
+		 * clog up the pipeline with our never-to-be-consumed
+		 * data.
+		 */
+		ExecSquelchNode((PlanState *) node);
+	}
+
+	return result;
+}
+
 /* ----------------------------------------------------------------
  *		ExecInitNestLoop
  * ----------------------------------------------------------------
@@ -391,7 +416,13 @@ ExecInitNestLoop(NestLoop *node, EState *estate, int eflags)
 	nlstate->shared_outer = node->shared_outer;
 
 	nlstate->prefetch_inner = node->join.prefetch_inner;
-	
+	nlstate->prefetch_joinqual = node->join.prefetch_joinqual;
+
+	if (Test_print_prefetch_joinqual && nlstate->prefetch_joinqual)
+		elog(NOTICE,
+			 "prefetch join qual in slice %d of plannode %d",
+			 currentSliceId, ((Plan *) node)->plan_node_id);
+
 	/*CDB-OLAP*/
 	nlstate->reset_inner = false;
 	nlstate->require_inner_reset = !node->singleton_outer;
@@ -402,13 +433,6 @@ ExecInitNestLoop(NestLoop *node, EState *estate, int eflags)
 	 * create expression context for node
 	 */
 	ExecAssignExprContext(estate, &nlstate->js.ps);
-
-	/*
-	 * If eflag contains EXEC_FLAG_REWIND or EXEC_FLAG_BACKWARD or EXEC_FLAG_MARK,
-	 * then this node is not eager free safe.
-	 */
-	nlstate->js.ps.delayEagerFree =
-		((eflags & (EXEC_FLAG_REWIND | EXEC_FLAG_BACKWARD | EXEC_FLAG_MARK)) != 0);
 
 	/*
 	 * initialize child expressions
@@ -497,8 +521,6 @@ ExecInitNestLoop(NestLoop *node, EState *estate, int eflags)
 	 */
 	nlstate->nl_NeedNewOuter = true;
 	nlstate->nl_MatchedOuter = false;
-	nlstate->nl_innerSquelchNeeded = true;		/*CDB*/
-
 
     if (node->join.jointype == JOIN_LASJ_NOTIN)
     {
@@ -552,8 +574,6 @@ ExecEndNestLoop(NestLoopState *node)
 
 	NL1_printf("ExecEndNestLoop: %s\n",
 			   "node processing ended");
-
-	EndPlanStateGpmonPkt(&node->js.ps);
 }
 
 /* ----------------------------------------------------------------
@@ -581,7 +601,6 @@ ExecReScanNestLoop(NestLoopState *node)
 	node->nl_NeedNewOuter = true;
 	node->nl_MatchedOuter = false;
 	node->nl_innerSideScanned = false;
-	/* CDB: We intentionally leave node->nl_innerSquelchNeeded unchanged on ReScan */
 }
 
 /* ----------------------------------------------------------------
@@ -635,11 +654,11 @@ splitJoinQualExpr(NestLoopState *nlstate)
 				continue;
 			}
 
-			insist_log(false, "unexpected expression type in NestLoopJoin qual");
+			elog(ERROR, "unexpected expression type in NestLoopJoin qual");
 
 			break; /* Unreachable */
 		default:
-			insist_log(false, "unexpected expression type in NestLoopJoin qual");
+			elog(ERROR, "unexpected expression type in NestLoopJoin qual");
 		}
 	}
 	Assert(NIL == nlstate->nl_InnerJoinKeys && NIL == nlstate->nl_OuterJoinKeys);
@@ -655,11 +674,31 @@ splitJoinQualExpr(NestLoopState *nlstate)
  * given lists:
  *   - lclauses for the left side of the expression,
  *   - rclauses for the right side
+ *
+ * This function is only used for LASJ. Once we find a NULL from inner side, we
+ * can skip the join and just return an empty set as result. This is only true
+ * if the equality operator is strict, that is, if a tuple from inner side is
+ * NULL then the equality operator returns NULL.
+ *
+ * If the number of arguments is not two, we just return leaving lclauses and
+ * rclauses remaining NULL. In this case, the LASJ join would be actually
+ * performed.
  * ----------------------------------------------------------------
  */
 static void
 extractFuncExprArgs(FuncExprState *fstate, List **lclauses, List **rclauses)
 {
-	*lclauses = lappend(*lclauses, linitial(fstate->args));
-	*rclauses = lappend(*rclauses, lsecond(fstate->args));
+	Node *clause;
+
+	if (list_length(fstate->args) != 2)
+		return;
+
+	/* Check for strictness of the equality operator */
+	clause = (Node *)fstate->xprstate.expr;
+	if ((is_opclause(clause) && op_strict(((OpExpr *) clause)->opno)) ||
+			(is_funcclause(clause) && func_strict(((FuncExpr *) clause)->funcid)))
+	{
+		*lclauses = lappend(*lclauses, linitial(fstate->args));
+		*rclauses = lappend(*rclauses, lsecond(fstate->args));
+	}
 }

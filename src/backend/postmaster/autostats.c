@@ -68,10 +68,11 @@ autostats_issue_analyze(Oid relationOid)
 	analyzeStmt = makeNode(VacuumStmt);
 	/* Set up command parameters */
 	analyzeStmt->options = VACOPT_ANALYZE;
-	analyzeStmt->freeze_min_age = -1;
 	analyzeStmt->relation = relation;	/* not used since we pass relids list */
 	analyzeStmt->va_cols = NIL;
-	vacuum(analyzeStmt, InvalidOid, false, NULL, false, false);
+
+	ExecVacuum(analyzeStmt, false);
+
 	pfree(analyzeStmt);
 }
 
@@ -147,7 +148,27 @@ autostats_on_no_stats_check(AutoStatsCmdType cmdType, Oid relationOid)
 			 classForm->relpages,
 			 classForm->reltuples);
 
-		result = (classForm->relpages == 0 && classForm->reltuples < 1);
+		if (classForm->relkind == RELKIND_FOREIGN_TABLE &&
+			rel_is_external_table(relationOid))
+		{
+			/*
+			 * To keep the behaviour the same as in GPDB 6, don't try to
+			 * auto-analyze external tables. In GPDB 6, we used to populate
+			 * pg_class.relpages with a constant at CREATE EXTERNAL TABLE.
+			 * We don't do that anymore, for consistency with foreign tables,
+			 * but without this special case here, we would then try to
+			 * auto-analyze external tables. External tables don't have
+			 * an ANALYZE callback, so it wouldn't do anything, but it would
+			 * print an annoying "cannot analyze this foreign table" warning
+			 * every time you inserted to an external table.
+			 *
+			 * All foreign tables without an analyze callback have the same
+			 * problem, really, but we're not concerned about that right now.
+			 */
+			result = false;
+		}
+		else
+			result = (classForm->relpages == 0 && classForm->reltuples < 1);
 		ReleaseSysCache(tuple);
 		return result;
 	}
@@ -203,6 +224,10 @@ autostats_get_cmdtype(QueryDesc *queryDesc, AutoStatsCmdType * pcmdType, Oid *pr
 				/* CTAS */
 				relationOid = GetIntoRelOid(queryDesc);
 				cmdType = AUTOSTATS_CMDTYPE_CTAS;
+			}
+			else if (stmt->copyIntoClause != NULL)
+			{
+				cmdType = AUTOSTATS_CMDTYPE_COPY;
 			}
 			break;
 

@@ -20,6 +20,7 @@
 #include "catalog/index.h"
 #include "catalog/indexing.h"
 #include "catalog/namespace.h"
+#include "catalog/pg_am.h"
 #include "catalog/pg_appendonly_fn.h"
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_opclass.h"
@@ -136,7 +137,6 @@ CreateAOAuxiliaryTable(
 											     rel->rd_rel->relowner,
 											     tupledesc,
 												 NIL,
-											     /* relam */ InvalidOid,
 											     relkind,
 												 rel->rd_rel->relpersistence,
 											     RELSTORAGE_HEAP,
@@ -150,6 +150,7 @@ CreateAOAuxiliaryTable(
 												 /* use_user_acl */ false,
 											     true,
 												 true,
+												 NULL, /* typeaddress */
 												 /* valid_opts */ false,
 												 /* is_part_child */ false,
 												 is_part_parent);
@@ -172,13 +173,15 @@ CreateAOAuxiliaryTable(
 										 aoauxiliary_idxname,
 										 InvalidOid,
 										 InvalidOid,
+										 InvalidOid,
+										 InvalidOid,
 										 indexInfo,
 										 indexColNames,
 										 BTREE_AM_OID,
 										 rel->rd_rel->reltablespace,
 										 collationObjectId, classObjectId, coloptions, (Datum) 0,
 										 true, false, false, false,
-										 true, false, false, true, NULL);
+										 true, false, false, true, false, NULL);
 
 		/* Unlock target table -- no one can see it */
 		heap_close(aoauxiliary_rel, ShareLock);
@@ -235,4 +238,11 @@ CreateAOAuxiliaryTable(
 	CommandCounterIncrement();
 
 	return true;
+}
+
+bool
+IsAppendonlyMetadataRelkind(const char relkind) {
+	return (relkind == RELKIND_AOSEGMENTS ||
+			relkind == RELKIND_AOBLOCKDIR ||
+			relkind == RELKIND_AOVISIMAP);
 }

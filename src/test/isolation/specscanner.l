@@ -4,7 +4,7 @@
  * specscanner.l
  *	  a lexical scanner for an isolation test specification
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *-------------------------------------------------------------------------
@@ -46,11 +46,11 @@ comment			("#"{non_newline}*)
 	litbufsize = LITBUF_INIT;
 %}
 
-permutation		{ return PERMUTATION; }
-session			{ return SESSION; }
-setup			{ return SETUP; }
-step			{ return STEP; }
-teardown		{ return TEARDOWN; }
+permutation		{ return(PERMUTATION); }
+session			{ return(SESSION); }
+setup			{ return(SETUP); }
+step			{ return(STEP); }
+teardown		{ return(TEARDOWN); }
 
 [\n]			{ yyline++; }
 {comment}		{ /* ignore */ }

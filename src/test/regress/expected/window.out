@@ -30,24 +30,24 @@ SELECT depname, empno, salary, sum(salary) OVER (PARTITION BY depname) FROM emps
  develop   |     8 |   6000 | 25100
  personnel |     5 |   3500 |  7400
  personnel |     2 |   3900 |  7400
- sales     |     4 |   4800 | 14600
  sales     |     3 |   4800 | 14600
+ sales     |     4 |   4800 | 14600
  sales     |     1 |   5000 | 14600
 (10 rows)
 
 SELECT depname, empno, salary, rank() OVER (PARTITION BY depname ORDER BY salary) FROM empsalary;
   depname  | empno | salary | rank 
 -----------+-------+--------+------
+ develop   |     7 |   4200 |    1
+ develop   |     9 |   4500 |    2
+ develop   |    11 |   5200 |    3
+ develop   |    10 |   5200 |    3
+ develop   |     8 |   6000 |    5
  personnel |     5 |   3500 |    1
  personnel |     2 |   3900 |    2
  sales     |     3 |   4800 |    1
  sales     |     4 |   4800 |    1
  sales     |     1 |   5000 |    3
- develop   |     7 |   4200 |    1
- develop   |     9 |   4500 |    2
- develop   |    10 |   5200 |    3
- develop   |    11 |   5200 |    3
- develop   |     8 |   6000 |    5
 (10 rows)
 
 -- with GROUP BY
@@ -629,16 +629,16 @@ select first_value(max(x)) over (), y
                                QUERY PLAN                               
 ------------------------------------------------------------------------
  WindowAgg
-   ->  Gather Motion 3:1  (slice2; segments: 3)
+   ->  Gather Motion 3:1  (slice1; segments: 3)
          ->  Subquery Scan on "Window"
-               ->  HashAggregate
+               ->  Finalize HashAggregate
                      Group Key: ((tenk1.ten + tenk1.four))
-                     ->  Redistribute Motion 3:3  (slice1; segments: 3)
+                     ->  Redistribute Motion 3:3  (slice2; segments: 3)
                            Hash Key: ((tenk1.ten + tenk1.four))
-                           ->  HashAggregate
+                           ->  Partial HashAggregate
                                  Group Key: (tenk1.ten + tenk1.four)
                                  ->  Seq Scan on tenk1
- Optimizer: legacy query optimizer
+ Optimizer: Postgres query optimizer
 (11 rows)
 
 -- test non-default frame specifications
@@ -928,16 +928,16 @@ FROM tenk1 WHERE unique1 < 10
 WINDOW w AS (order by four range between current row and unbounded following);
  first_value | nth_2 | last_value | unique1 | four 
 -------------+-------+------------+---------+------
-           0 |     8 |          3 |       0 |    0
-           0 |     8 |          3 |       8 |    0
-           0 |     8 |          3 |       4 |    0
-           5 |     9 |          3 |       5 |    1
-           5 |     9 |          3 |       9 |    1
-           5 |     9 |          3 |       1 |    1
-           2 |     6 |          3 |       2 |    2
-           2 |     6 |          3 |       6 |    2
-           7 |     3 |          3 |       7 |    3
-           7 |     3 |          3 |       3 |    3
+           4 |     0 |          7 |       4 |    0
+           4 |     0 |          7 |       0 |    0
+           4 |     0 |          7 |       8 |    0
+           1 |     5 |          7 |       1 |    1
+           1 |     5 |          7 |       5 |    1
+           1 |     5 |          7 |       9 |    1
+           6 |     2 |          7 |       6 |    2
+           6 |     2 |          7 |       2 |    2
+           3 |     7 |          7 |       3 |    3
+           3 |     7 |          7 |       7 |    3
 (10 rows)
 
 SELECT sum(unique1) over
@@ -1080,8 +1080,9 @@ SELECT * FROM
 WHERE depname = 'sales';
                                  QUERY PLAN                                 
 ----------------------------------------------------------------------------
- Gather Motion 1:1  (slice1; segments: 1)
-   ->  Subquery Scan on emp
+ Subquery Scan on emp
+   ->  Gather Motion 1:1  (slice1; segments: 1)
+         Merge Key: empsalary.empno, empsalary.enroll_date
          ->  WindowAgg
                Order By: empsalary.empno
                ->  WindowAgg
@@ -1091,8 +1092,8 @@ WHERE depname = 'sales';
                            Sort Key: empsalary.empno, empsalary.enroll_date
                            ->  Seq Scan on empsalary
                                  Filter: ((depname)::text = 'sales'::text)
- Optimizer: legacy query optimizer
-(12 rows)
+ Optimizer: Postgres query optimizer
+(13 rows)
 
 -- Test Sort node reordering
 EXPLAIN (COSTS OFF)
@@ -1112,8 +1113,86 @@ FROM empsalary;
                ->  Sort
                      Sort Key: depname, salary, enroll_date, empno
                      ->  Seq Scan on empsalary
- Optimizer: legacy query optimizer
+ Optimizer: Postgres query optimizer
 (11 rows)
+
+-- Test pushdown of quals into a subquery containing window functions
+-- pushdown is safe because all PARTITION BY clauses include depname:
+EXPLAIN (COSTS OFF)
+SELECT * FROM
+  (SELECT depname,
+          sum(salary) OVER (PARTITION BY depname) depsalary,
+          min(salary) OVER (PARTITION BY depname || 'A', depname) depminsalary
+   FROM empsalary) emp
+WHERE depname = 'sales';
+                                   QUERY PLAN                                   
+--------------------------------------------------------------------------------
+ Subquery Scan on emp
+   ->  Gather Motion 1:1  (slice1; segments: 1)
+         Merge Key: (((empsalary.depname)::text || 'A'::text))
+         ->  WindowAgg
+               ->  WindowAgg
+                     Partition By: (((empsalary.depname)::text || 'A'::text))
+                     ->  Sort
+                           Sort Key: (((empsalary.depname)::text || 'A'::text))
+                           ->  Seq Scan on empsalary
+                                 Filter: ((depname)::text = 'sales'::text)
+ Optimizer: Postgres query optimizer
+(11 rows)
+
+-- pushdown is unsafe because there's a PARTITION BY clause without depname:
+EXPLAIN (COSTS OFF)
+SELECT * FROM
+  (SELECT depname,
+          sum(salary) OVER (PARTITION BY enroll_date) enroll_salary,
+          min(salary) OVER (PARTITION BY depname) depminsalary
+   FROM empsalary) emp
+WHERE depname = 'sales';
+                               QUERY PLAN                               
+------------------------------------------------------------------------
+ Subquery Scan on emp
+   Filter: ((emp.depname)::text = 'sales'::text)
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         Merge Key: empsalary.enroll_date
+         ->  WindowAgg
+               Partition By: empsalary.enroll_date
+               ->  Sort
+                     Sort Key: empsalary.enroll_date
+                     ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                           Hash Key: empsalary.enroll_date
+                           ->  WindowAgg
+                                 Partition By: empsalary.depname
+                                 ->  Sort
+                                       Sort Key: empsalary.depname
+                                       ->  Seq Scan on empsalary
+ Optimizer: Postgres query optimizer
+(16 rows)
+
+-- pushdown is unsafe because the subquery contains window functions and the qual is volatile:
+EXPLAIN (COSTS OFF)
+SELECT * FROM
+  (SELECT depname,
+          sum(salary) OVER (PARTITION BY depname) depsalary,
+          min(salary) OVER (PARTITION BY depname || 'A', depname) depminsalary
+   FROM empsalary) emp
+WHERE depname = 'sales' OR RANDOM() > 0.5;
+                                               QUERY PLAN                                                
+---------------------------------------------------------------------------------------------------------
+ Subquery Scan on emp
+   Filter: (((emp.depname)::text = 'sales'::text) OR (random() > '0.5'::double precision))
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         Merge Key: empsalary.depname
+         ->  WindowAgg
+               Partition By: empsalary.depname
+               ->  Sort
+                     Sort Key: empsalary.depname
+                     ->  WindowAgg
+                           Partition By: (((empsalary.depname)::text || 'A'::text)), empsalary.depname
+                           ->  Sort
+                                 Sort Key: (((empsalary.depname)::text || 'A'::text)), empsalary.depname
+                                 ->  Seq Scan on empsalary
+ Optimizer: Postgres query optimizer
+(14 rows)
 
 -- cleanup
 DROP TABLE empsalary;

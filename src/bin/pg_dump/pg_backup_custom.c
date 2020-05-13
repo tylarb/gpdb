@@ -23,6 +23,7 @@
  *
  *-------------------------------------------------------------------------
  */
+#include "postgres_fe.h"
 
 #include "compress_io.h"
 #include "parallel.h"
@@ -43,7 +44,7 @@ static void _WriteBuf(ArchiveHandle *AH, const void *buf, size_t len);
 static void _ReadBuf(ArchiveHandle *AH, void *buf, size_t len);
 static void _CloseArchive(ArchiveHandle *AH);
 static void _ReopenArchive(ArchiveHandle *AH);
-static void _PrintTocData(ArchiveHandle *AH, TocEntry *te, RestoreOptions *ropt);
+static void _PrintTocData(ArchiveHandle *AH, TocEntry *te);
 static void _WriteExtraToc(ArchiveHandle *AH, TocEntry *te);
 static void _ReadExtraToc(ArchiveHandle *AH, TocEntry *te);
 static void _PrintExtraToc(ArchiveHandle *AH, TocEntry *te);
@@ -202,7 +203,7 @@ InitArchiveFmt_Custom(ArchiveHandle *AH)
  *
  * Optional.
  *
- * Set up extrac format-related TOC data.
+ * Set up extract format-related TOC data.
 */
 static void
 _ArchiveEntry(ArchiveHandle *AH, TocEntry *te)
@@ -418,7 +419,7 @@ _EndBlobs(ArchiveHandle *AH, TocEntry *te)
  * Print data for a given TOC entry
  */
 static void
-_PrintTocData(ArchiveHandle *AH, TocEntry *te, RestoreOptions *ropt)
+_PrintTocData(ArchiveHandle *AH, TocEntry *te)
 {
 	lclContext *ctx = (lclContext *) AH->formatData;
 	lclTocEntry *tctx = (lclTocEntry *) te->formatData;
@@ -499,7 +500,7 @@ _PrintTocData(ArchiveHandle *AH, TocEntry *te, RestoreOptions *ropt)
 			break;
 
 		case BLK_BLOBS:
-			_LoadBlobs(AH, ropt->dropSchema);
+			_LoadBlobs(AH, AH->public.ropt->dropSchema);
 			break;
 
 		default:				/* Always have a default */
@@ -687,7 +688,7 @@ _ReadBuf(ArchiveHandle *AH, void *buf, size_t len)
  * the process of saving it to files. No data should be written prior
  * to this point, since the user could sort the TOC after creating it.
  *
- * If an archive is to be written, this toutine must call:
+ * If an archive is to be written, this routine must call:
  *		WriteHead			to save the archive header
  *		WriteToc			to save the TOC entries
  *		WriteDataChunks		to save all DATA & BLOBs.
@@ -870,7 +871,7 @@ _MasterEndParallelItem(ArchiveHandle *AH, TocEntry *te, const char *str, T_Actio
 	/* no parallel dump in the custom archive */
 	Assert(act == ACT_RESTORE);
 
-	sscanf(str, "%u %u %u%n", &dumpId, &status, &n_errors, &nBytes);
+	sscanf(str, "%d %d %d%n", &dumpId, &status, &n_errors, &nBytes);
 
 	Assert(nBytes == strlen(str));
 	Assert(dumpId == te->dumpId);

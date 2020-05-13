@@ -38,9 +38,20 @@ PATH=$bindir:$PATH
 export PATH
 
 # Adjust these paths for your environment
-TESTROOT=$PWD/tmp_check
-TEST_MASTER=$TESTROOT/data_master
-TEST_STANDBY=$TESTROOT/data_standby
+TESTROOT=$PWD/tmp_check_$TEST_SUITE
+TEST_MASTER=$TESTROOT/$TESTNAME/data_master
+TEST_STANDBY=$TESTROOT/$TESTNAME/data_standby
+
+# Remove data dirs from previous passing tests. Only retain the ones that
+# failed. We parse regression.out to determine which previous tests directories
+# can be deleted. Unfortunately this has the effect of leaving the last test
+# untouched. We could check the last test inside the Makefile if we wish to.
+if [ -f regression.out ]; then
+	PASSED_TEST=`tail -2 regression.out | grep -w "ok" | cut -d " " -f2`
+	if [ ! -z $PASSED_TEST ]; then
+		rm -rf $TESTROOT/$PASSED_TEST
+	fi
+fi
 
 # Create the root folder for test data
 mkdir -p $TESTROOT
@@ -69,30 +80,51 @@ PG_VERSION_NUM=90401
 PORT_MASTER=`expr $PG_VERSION_NUM % 16384 + 49152`
 PORT_STANDBY=`expr $PORT_MASTER + 1`
 
+MASTER_DBID=2
+STANDBY_DBID=5
+
 PGOPTIONS_UTILITY='-c gp_session_role=utility'
 MASTER_PSQL="psql -a --no-psqlrc -p $PORT_MASTER"
 STANDBY_PSQL="psql -a --no-psqlrc -p $PORT_STANDBY"
-PG_CTL_COMMON_OPTIONS="--gp_dbid=2 --gp_contentid=0"
-MASTER_PG_CTL_OPTIONS="-p ${PORT_MASTER} $PG_CTL_COMMON_OPTIONS"
-STANDBY_PG_CTL_OPTIONS="-p ${PORT_STANDBY} $PG_CTL_COMMON_OPTIONS"
+STANDBY_PSQL_TUPLES_ONLY="psql -t --no-psqlrc -p $PORT_STANDBY"
+# -m option is used for pg_rewind tests to convey starting in single
+# postgres instance mode the QE segment. So, ignore the distributed
+# log checking and hence enable vacuuming the tables in pg_rewind
+# tests. If pg_rewind tests use full GPDB cluster, -m option will not
+# be needed.
+PG_CTL_COMMON_OPTIONS="--gp_contentid=0 -m"
+MASTER_PG_CTL_OPTIONS="--gp_dbid=${MASTER_DBID} -p ${PORT_MASTER} $PG_CTL_COMMON_OPTIONS"
+STANDBY_PG_CTL_OPTIONS="--gp_dbid=${STANDBY_DBID} -p ${PORT_STANDBY} $PG_CTL_COMMON_OPTIONS"
 MASTER_PG_CTL_STOP_MODE="fast"
 
-function wait_until_standby_is_promoted {
-   retry=50
+function wait_for_promotion {
+   retry=150
    until [ $retry -le 0 ]
    do
-      PGOPTIONS=${PGOPTIONS_UTILITY} $STANDBY_PSQL -c "select 1;" && break
+      PGOPTIONS=${PGOPTIONS_UTILITY} ${1} -c "select 'promotion is done';" && return 0
       retry=$[$retry-1]
-      sleep 0.2
+      sleep 0.5
    done
+   echo "error: timeout, promotion is not done."
+   exit 1
+}
+
+function wait_until_standby_is_promoted {
+    wait_for_promotion "${STANDBY_PSQL}"
+}
+
+function wait_until_master_is_promoted {
+    wait_for_promotion "${MASTER_PSQL}"
 }
 
 function wait_until_standby_streaming_state {
    retry=150
    until [ $retry -le 0 ]
    do
-      PGOPTIONS=${PGOPTIONS_UTILITY} $STANDBY_PSQL -c "SELECT state FROM pg_stat_replication;" | grep 'streaming' > /dev/null && break
+      PGOPTIONS=${PGOPTIONS_UTILITY} $STANDBY_PSQL -c "SELECT state FROM pg_stat_replication;" | grep 'streaming' > /dev/null && return 0
       retry=$[$retry-1]
-      sleep 0.2
+      sleep 0.5
    done
+   echo "error: timeout, standby streaming is not done."
+   exit 1
 }

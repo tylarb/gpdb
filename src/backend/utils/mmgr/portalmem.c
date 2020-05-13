@@ -10,7 +10,7 @@
  *
  * Portions Copyright (c) 2006-2009, Greenplum inc
  * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -26,10 +26,12 @@
 #include "miscadmin.h"
 #include "utils/builtins.h"
 #include "utils/memutils.h"
-#include "utils/resscheduler.h"
+#include "utils/snapmgr.h"
+#include "utils/timestamp.h"
 
 #include "cdb/ml_ipc.h"
-#include "utils/timestamp.h"
+#include "utils/resource_manager.h"
+#include "utils/resscheduler.h"
 
 /*
  * Estimate of the maximum number of open portals a user would have,
@@ -237,6 +239,7 @@ CreatePortal(const char *name, bool allowDup, bool dupSilent)
 	portal->status = PORTAL_NEW;
 	portal->cleanup = PortalCleanup;
 	portal->createSubid = GetCurrentSubTransactionId();
+	portal->activeSubid = portal->createSubid;
 	portal->strategy = PORTAL_MULTI_QUERY;
 	portal->cursorOptions = CURSOR_OPT_NO_SCROLL;
 	portal->atStart = true;
@@ -254,11 +257,6 @@ CreatePortal(const char *name, bool allowDup, bool dupSilent)
 
 	/* put portal in table (sets portal->name) */
 	PortalHashTableInsert(portal, name);
-
-	/* Setup gpmon. Siva - should this be moved elsewhere? */
-	gpmon_init();
-
-	/* End Gpmon */
 
 	return portal;
 }
@@ -370,6 +368,7 @@ PortalCreateHoldStore(Portal portal)
 
 	Assert(portal->holdContext == NULL);
 	Assert(portal->holdStore == NULL);
+	Assert(portal->holdSnapshot == NULL);
 
 	/*
 	 * Create the memory context that is used for storage of the tuple set.
@@ -423,6 +422,25 @@ UnpinPortal(Portal portal)
 }
 
 /*
+ * MarkPortalActive
+ *		Transition a portal from READY to ACTIVE state.
+ *
+ * NOTE: never set portal->status = PORTAL_ACTIVE directly; call this instead.
+ */
+void
+MarkPortalActive(Portal portal)
+{
+	/* For safety, this is a runtime test not just an Assert */
+	if (portal->status != PORTAL_READY)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("portal \"%s\" cannot be run", portal->name)));
+	/* Perform the state transition */
+	portal->status = PORTAL_ACTIVE;
+	portal->activeSubid = GetCurrentSubTransactionId();
+}
+
+/*
  * MarkPortalDone
  *		Transition a portal from ACTIVE to DONE state.
  *
@@ -440,8 +458,8 @@ MarkPortalDone(Portal portal)
 	 * well do that now, since the portal can't be executed any more.
 	 *
 	 * In some cases involving execution of a ROLLBACK command in an already
-	 * aborted transaction, this prevents an assertion failure caused by
-	 * reaching AtCleanup_Portals with the cleanup hook still unexecuted.
+	 * aborted transaction, this is necessary, or we'd reach AtCleanup_Portals
+	 * with the cleanup hook still unexecuted.
 	 */
 	if (PointerIsValid(portal->cleanup))
 	{
@@ -468,8 +486,8 @@ MarkPortalFailed(Portal portal)
 	 * well do that now, since the portal can't be executed any more.
 	 *
 	 * In some cases involving cleanup of an already aborted transaction, this
-	 * prevents an assertion failure caused by reaching AtCleanup_Portals with
-	 * the cleanup hook still unexecuted.
+	 * is necessary, or we'd reach AtCleanup_Portals with the cleanup hook
+	 * still unexecuted.
 	 */
 	if (PointerIsValid(portal->cleanup))
 	{
@@ -530,6 +548,20 @@ PortalDrop(Portal portal, bool isTopCommit)
 
 	/* drop cached plan reference, if any */
 	PortalReleaseCachedPlan(portal);
+
+	/*
+	 * If portal has a snapshot protecting its data, release that.  This needs
+	 * a little care since the registration will be attached to the portal's
+	 * resowner; if the portal failed, we will already have released the
+	 * resowner (and the snapshot) during transaction abort.
+	 */
+	if (portal->holdSnapshot)
+	{
+		if (portal->resowner)
+			UnregisterSnapshotFromOwner(portal->holdSnapshot,
+										portal->resowner);
+		portal->holdSnapshot = NULL;
+	}
 
 	/*
 	 * Release any resources still attached to the portal.  There are several
@@ -715,6 +747,7 @@ PreCommit_Portals(bool isPrepare)
 			 * not belonging to this transaction.
 			 */
 			portal->createSubid = InvalidSubTransactionId;
+			portal->activeSubid = InvalidSubTransactionId;
 
 			/* Report we changed state */
 			result = true;
@@ -769,7 +802,14 @@ AtAbort_Portals(void)
 	{
 		Portal		portal = hentry->portal;
 
-		/* Any portal that was actually running has to be considered broken */
+		/*
+		 * See similar code in AtSubAbort_Portals().  This would fire if code
+		 * orchestrating multiple top-level transactions within a portal, such
+		 * as VACUUM, caught errors and continued under the same portal with a
+		 * fresh transaction.  No part of core PostgreSQL functions that way.
+		 * XXX Such code would wish the portal to remain ACTIVE, as in
+		 * PreCommit_Portals().
+		 */
 		if (portal->status == PORTAL_ACTIVE)
 			MarkPortalFailed(portal);
 
@@ -867,8 +907,15 @@ AtCleanup_Portals(void)
 		if (portal->portalPinned)
 			portal->portalPinned = false;
 
-		/* We had better not be calling any user-defined code here */
-		Assert(portal->cleanup == NULL);
+		/*
+		 * We had better not call any user-defined code during cleanup, so if
+		 * the cleanup hook hasn't been run yet, too bad; we'll just skip it.
+		 */
+		if (PointerIsValid(portal->cleanup))
+		{
+			elog(WARNING, "skipping cleanup for portal \"%s\"", portal->name);
+			portal->cleanup = NULL;
+		}
 
 		/* Zap it. */
 		PortalDrop(portal, false);
@@ -878,8 +925,8 @@ AtCleanup_Portals(void)
 /*
  * Pre-subcommit processing for portals.
  *
- * Reassign the portals created in the current subtransaction to the parent
- * subtransaction.
+ * Reassign portals created or used in the current subtransaction to the
+ * parent subtransaction.
  */
 void
 AtSubCommit_Portals(SubTransactionId mySubid,
@@ -901,14 +948,16 @@ AtSubCommit_Portals(SubTransactionId mySubid,
 			if (portal->resowner)
 				ResourceOwnerNewParent(portal->resowner, parentXactOwner);
 		}
+		if (portal->activeSubid == mySubid)
+			portal->activeSubid = parentSubid;
 	}
 }
 
 /*
  * Subtransaction abort handling for portals.
  *
- * Deactivate portals created during the failed subtransaction.
- * Note that per AtSubCommit_Portals, this will catch portals created
+ * Deactivate portals created or used during the failed subtransaction.
+ * Note that per AtSubCommit_Portals, this will catch portals created/used
  * in descendants of the subtransaction too.
  *
  * We don't destroy any portals here; that's done in AtSubCleanup_Portals.
@@ -916,6 +965,7 @@ AtSubCommit_Portals(SubTransactionId mySubid,
 void
 AtSubAbort_Portals(SubTransactionId mySubid,
 				   SubTransactionId parentSubid,
+				   ResourceOwner myXactOwner,
 				   ResourceOwner parentXactOwner)
 {
 	HASH_SEQ_STATUS status;
@@ -927,16 +977,70 @@ AtSubAbort_Portals(SubTransactionId mySubid,
 	{
 		Portal		portal = hentry->portal;
 
+		/* Was it created in this subtransaction? */
 		if (portal->createSubid != mySubid)
+		{
+			/* No, but maybe it was used in this subtransaction? */
+			if (portal->activeSubid == mySubid)
+			{
+				/* Maintain activeSubid until the portal is removed */
+				portal->activeSubid = parentSubid;
+
+				/*
+				 * GPDB_96_MERGE_FIXME: We had this different comment here in GPDB.
+				 * Does this scenario happen in GPDB for some reason?
+				 *
+				 * Upper-level portals that failed while running in this
+				 * subtransaction must be forced into FAILED state, for the
+				 * same reasons discussed below.
+				 *
+				 * A MarkPortalActive() caller ran an upper-level portal in
+				 * this subtransaction and left the portal ACTIVE.  This can't
+				 * happen, but force the portal into FAILED state for the same
+				 * reasons discussed below.
+				 *
+				 * We assume we can get away without forcing upper-level READY
+				 * portals to fail, even if they were run and then suspended.
+				 * In theory a suspended upper-level portal could have
+				 * acquired some references to objects that are about to be
+				 * destroyed, but there should be sufficient defenses against
+				 * such cases: the portal's original query cannot contain such
+				 * references, and any references within, say, cached plans of
+				 * PL/pgSQL functions are not from active queries and should
+				 * be protected by revalidation logic.
+				 */
+				if (portal->status == PORTAL_ACTIVE)
+					MarkPortalFailed(portal);
+
+				/*
+				 * Also, if we failed it during the current subtransaction
+				 * (either just above, or earlier), reattach its resource
+				 * owner to the current subtransaction's resource owner, so
+				 * that any resources it still holds will be released while
+				 * cleaning up this subtransaction.  This prevents some corner
+				 * cases wherein we might get Asserts or worse while cleaning
+				 * up objects created during the current subtransaction
+				 * (because they're still referenced within this portal).
+				 */
+				if (portal->status == PORTAL_FAILED && portal->resowner)
+				{
+					ResourceOwnerNewParent(portal->resowner, myXactOwner);
+					portal->resowner = NULL;
+				}
+			}
+			/* Done if it wasn't created in this subtransaction */
 			continue;
+		}
 
 		/*
 		 * Force any live portals of my own subtransaction into FAILED state.
 		 * We have to do this because they might refer to objects created or
-		 * changed in the failed subtransaction, leading to crashes if
-		 * execution is resumed, or even if we just try to run ExecutorEnd.
-		 * (Note we do NOT do this to upper-level portals, since they cannot
-		 * have such references and hence may be able to continue.)
+		 * changed in the failed subtransaction, leading to crashes within
+		 * ExecutorEnd when portalcmds.c tries to close down the portal.
+		 * Currently, every MarkPortalActive() caller ensures it updates the
+		 * portal status again before relinquishing control, so ACTIVE can't
+		 * happen here.  If it does happen, dispose the portal like existing
+		 * MarkPortalActive() callers would.
 		 */
 		// GPDB_90_MERGE_FIXME: Not in READY portals. See comment in AtAbort_Portals.
 		if (//portal->status == PORTAL_READY ||
@@ -1002,8 +1106,15 @@ AtSubCleanup_Portals(SubTransactionId mySubid)
 		if (portal->portalPinned)
 			portal->portalPinned = false;
 
-		/* We had better not be calling any user-defined code here */
-		Assert(portal->cleanup == NULL);
+		/*
+		 * We had better not call any user-defined code during cleanup, so if
+		 * the cleanup hook hasn't been run yet, too bad; we'll just skip it.
+		 */
+		if (PointerIsValid(portal->cleanup))
+		{
+			elog(WARNING, "skipping cleanup for portal \"%s\"", portal->name);
+			portal->cleanup = NULL;
+		}
 
 		/* Zap it. */
 		PortalDrop(portal, false);

@@ -3,7 +3,7 @@
  * pg_recvlogical.c - receive data from a logical decoding slot in a streaming
  *					  fashion and write it to a local file.
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *		  src/bin/pg_basebackup/pg_recvlogical.c
@@ -15,6 +15,9 @@
 #include <dirent.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#ifdef HAVE_SYS_SELECT_H
+#include <sys/select.h>
+#endif
 
 /* local includes */
 #include "streamutil.h"
@@ -38,6 +41,7 @@ static int	standby_message_timeout = 10 * 1000;		/* 10 sec = default */
 static int	fsync_interval = 10 * 1000; /* 10 sec = default */
 static XLogRecPtr startpos = InvalidXLogRecPtr;
 static bool do_create_slot = false;
+static bool slot_exists_ok = false;
 static bool do_start_slot = false;
 static bool do_drop_slot = false;
 
@@ -50,27 +54,41 @@ static const char *plugin = "test_decoding";
 static int	outfd = -1;
 static volatile sig_atomic_t time_to_abort = false;
 static volatile sig_atomic_t output_reopen = false;
+static bool output_isfile;
 static int64 output_last_fsync = -1;
 static bool output_needs_fsync = false;
 static XLogRecPtr output_written_lsn = InvalidXLogRecPtr;
 static XLogRecPtr output_fsync_lsn = InvalidXLogRecPtr;
 
 static void usage(void);
-static void StreamLog();
+static void StreamLogicalLog(void);
 static void disconnect_and_exit(int code);
 
 static void
 usage(void)
 {
-	printf(_("%s receives PostgreSQL logical change stream.\n\n"),
+	printf(_("%s controls PostgreSQL logical decoding streams.\n\n"),
 		   progname);
 	printf(_("Usage:\n"));
 	printf(_("  %s [OPTION]...\n"), progname);
+	printf(_("\nAction to be performed:\n"));
+	printf(_("      --create-slot      create a new replication slot (for the slot's name see --slot)\n"));
+	printf(_("      --drop-slot        drop the replication slot (for the slot's name see --slot)\n"));
+	printf(_("      --start            start streaming in a replication slot (for the slot's name see --slot)\n"));
 	printf(_("\nOptions:\n"));
-	printf(_("  -f, --file=FILE        receive log into this file. - for stdout\n"));
+	printf(_("  -f, --file=FILE        receive log into this file, - for stdout\n"));
 	printf(_("  -F  --fsync-interval=SECS\n"
-			 "                         frequency of syncs to the output file (default: %d)\n"), (fsync_interval / 1000));
+			 "                         time between fsyncs to the output file (default: %d)\n"), (fsync_interval / 1000));
+	printf(_("      --if-not-exists    do not error if slot already exists when creating a slot\n"));
+	printf(_("  -I, --startpos=LSN     where in an existing slot should the streaming start\n"));
 	printf(_("  -n, --no-loop          do not loop on connection lost\n"));
+	printf(_("  -o, --option=NAME[=VALUE]\n"
+			 "                         pass option NAME with optional value VALUE to the\n"
+			 "                         output plugin\n"));
+	printf(_("  -P, --plugin=PLUGIN    use output plugin PLUGIN (default: %s)\n"), plugin);
+	printf(_("  -s, --status-interval=SECS\n"
+			 "                         time between status packets sent to server (default: %d)\n"), (standby_message_timeout / 1000));
+	printf(_("  -S, --slot=SLOTNAME    name of the logical replication slot\n"));
 	printf(_("  -v, --verbose          output verbose messages\n"));
 	printf(_("  -V, --version          output version information, then exit\n"));
 	printf(_("  -?, --help             show this help, then exit\n"));
@@ -81,19 +99,6 @@ usage(void)
 	printf(_("  -U, --username=NAME    connect as specified database user\n"));
 	printf(_("  -w, --no-password      never prompt for password\n"));
 	printf(_("  -W, --password         force password prompt (should happen automatically)\n"));
-	printf(_("\nReplication options:\n"));
-	printf(_("  -I, --startpos=PTR     where in an existing slot should the streaming start\n"));
-	printf(_("  -o, --option=NAME[=VALUE]\n"
-			 "                         specify option NAME with optional value VALUE, to be passed\n"
-			 "                         to the output plugin\n"));
-	printf(_("  -P, --plugin=PLUGIN    use output plugin PLUGIN (default: %s)\n"), plugin);
-	printf(_("  -s, --status-interval=SECS\n"
-			 "                         time between status packets sent to server (default: %d)\n"), (standby_message_timeout / 1000));
-	printf(_("  -S, --slot=SLOT        name of the logical replication slot\n"));
-	printf(_("\nAction to be performed:\n"));
-	printf(_("      --create           create a new replication slot (for the slot's name see --slot)\n"));
-	printf(_("      --start            start streaming in a replication slot (for the slot's name see --slot)\n"));
-	printf(_("      --drop             drop the replication slot (for the slot's name see --slot)\n"));
 	printf(_("\nReport bugs to <pgsql-bugs@postgresql.org>.\n"));
 }
 
@@ -178,8 +183,11 @@ OutputFsync(int64 now)
 
 	output_needs_fsync = false;
 
-	/* Accept EINVAL, in case output is writing to a pipe or similar. */
-	if (fsync(outfd) != 0 && errno != EINVAL)
+	/* can only fsync if it's a regular file */
+	if (!output_isfile)
+		return true;
+
+	if (fsync(outfd) != 0)
 	{
 		fprintf(stderr,
 				_("%s: could not fsync log file \"%s\": %s\n"),
@@ -194,7 +202,7 @@ OutputFsync(int64 now)
  * Start the log streaming
  */
 static void
-StreamLog(void)
+StreamLogicalLog(void)
 {
 	PGresult   *res;
 	char	   *copybuf = NULL;
@@ -318,6 +326,8 @@ StreamLog(void)
 		/* open the output file, if not open yet */
 		if (outfd == -1)
 		{
+			struct stat statbuf;
+
 			if (strcmp(outfile, "-") == 0)
 				outfd = fileno(stdout);
 			else
@@ -330,6 +340,13 @@ StreamLog(void)
 						progname, outfile, strerror(errno));
 				goto error;
 			}
+
+			if (fstat(outfd, &statbuf) != 0)
+				fprintf(stderr,
+						_("%s: could not stat file \"%s\": %s\n"),
+						progname, outfile, strerror(errno));
+
+			output_isfile = S_ISREG(statbuf.st_mode) && !isatty(outfd);
 		}
 
 		r = PQgetCopyData(conn, &copybuf, 1);
@@ -345,6 +362,14 @@ StreamLog(void)
 			int64		fsync_target = 0;
 			struct timeval timeout;
 			struct timeval *timeoutptr = NULL;
+
+			if (PQsocket(conn) < 0)
+			{
+				fprintf(stderr,
+						_("%s: invalid socket: %s"),
+						progname, PQerrorMessage(conn));
+				goto error;
+			}
 
 			FD_ZERO(&input_mask);
 			FD_SET(PQsocket(conn), &input_mask);
@@ -596,7 +621,6 @@ sighup_handler(int signum)
 int
 main(int argc, char **argv)
 {
-	PGresult   *res;
 	static struct option long_options[] = {
 /* general options */
 		{"file", required_argument, NULL, 'f'},
@@ -605,7 +629,7 @@ main(int argc, char **argv)
 		{"verbose", no_argument, NULL, 'v'},
 		{"version", no_argument, NULL, 'V'},
 		{"help", no_argument, NULL, '?'},
-/* connnection options */
+/* connection options */
 		{"dbname", required_argument, NULL, 'd'},
 		{"host", required_argument, NULL, 'h'},
 		{"port", required_argument, NULL, 'p'},
@@ -619,18 +643,20 @@ main(int argc, char **argv)
 		{"status-interval", required_argument, NULL, 's'},
 		{"slot", required_argument, NULL, 'S'},
 /* action */
-		{"create", no_argument, NULL, 1},
+		{"create-slot", no_argument, NULL, 1},
 		{"start", no_argument, NULL, 2},
-		{"drop", no_argument, NULL, 3},
+		{"drop-slot", no_argument, NULL, 3},
+		{"if-not-exists", no_argument, NULL, 4},
 		{NULL, 0, NULL, 0}
 	};
 	int			c;
 	int			option_index;
 	uint32		hi,
 				lo;
+	char	   *db_name;
 
 	progname = get_progname(argv[0]);
-	set_pglocale_pgservice(argv[0], PG_TEXTDOMAIN("pg_recvlogical"));
+	set_pglocale_pgservice(argv[0], PG_TEXTDOMAIN("pg_basebackup"));
 
 	if (argc > 1)
 	{
@@ -671,7 +697,7 @@ main(int argc, char **argv)
 			case 'v':
 				verbose++;
 				break;
-/* connnection options */
+/* connection options */
 			case 'd':
 				dbname = pg_strdup(optarg);
 				break;
@@ -752,6 +778,9 @@ main(int argc, char **argv)
 			case 3:
 				do_drop_slot = true;
 				break;
+			case 4:
+				slot_exists_ok = true;
+				break;
 
 			default:
 
@@ -814,15 +843,15 @@ main(int argc, char **argv)
 
 	if (do_drop_slot && (do_create_slot || do_start_slot))
 	{
-		fprintf(stderr, _("%s: cannot use --init or --start together with --stop\n"), progname);
+		fprintf(stderr, _("%s: cannot use --create-slot or --start together with --drop-slot\n"), progname);
 		fprintf(stderr, _("Try \"%s --help\" for more information.\n"),
 				progname);
 		exit(1);
 	}
 
-	if (startpos && (do_create_slot || do_drop_slot))
+	if (startpos != InvalidXLogRecPtr && (do_create_slot || do_drop_slot))
 	{
-		fprintf(stderr, _("%s: cannot use --init or --stop together with --startpos\n"), progname);
+		fprintf(stderr, _("%s: cannot use --create-slot or --drop-slot together with --startpos\n"), progname);
 		fprintf(stderr, _("Try \"%s --help\" for more information.\n"),
 				progname);
 		exit(1);
@@ -834,124 +863,63 @@ main(int argc, char **argv)
 #endif
 
 	/*
-	 * don't really need this but it actually helps to get more precise error
-	 * messages about authentication, required GUCs and such without starting
-	 * to loop around connection attempts lateron.
+	 * Obtain a connection to server. This is not really necessary but it
+	 * helps to get more precise error messages about authentication, required
+	 * GUC parameters and such.
 	 */
-	{
-		conn = GetConnection();
-		if (!conn)
-			/* Error message already written in GetConnection() */
-			exit(1);
-
-		/*
-		 * Run IDENTIFY_SYSTEM so we can get the timeline and current xlog
-		 * position.
-		 */
-		res = PQexec(conn, "IDENTIFY_SYSTEM");
-		if (PQresultStatus(res) != PGRES_TUPLES_OK)
-		{
-			fprintf(stderr, _("%s: could not send replication command \"%s\": %s"),
-					progname, "IDENTIFY_SYSTEM", PQerrorMessage(conn));
-			disconnect_and_exit(1);
-		}
-
-		if (PQntuples(res) != 1 || PQnfields(res) < 4)
-		{
-			fprintf(stderr,
-					_("%s: could not identify system: got %d rows and %d fields, expected %d rows and %d or more fields\n"),
-					progname, PQntuples(res), PQnfields(res), 1, 4);
-			disconnect_and_exit(1);
-		}
-		PQclear(res);
-	}
-
+	conn = GetConnection();
+	if (!conn)
+		/* Error message already written in GetConnection() */
+		exit(1);
 
 	/*
-	 * stop a replication slot
+	 * Run IDENTIFY_SYSTEM to make sure we connected using a database specific
+	 * replication connection.
 	 */
+	if (!RunIdentifySystem(conn, NULL, NULL, NULL, &db_name))
+		disconnect_and_exit(1);
+
+	if (db_name == NULL)
+	{
+		fprintf(stderr,
+				_("%s: could not establish database-specific replication connection\n"),
+				progname);
+		disconnect_and_exit(1);
+	}
+
+	/* Drop a replication slot. */
 	if (do_drop_slot)
 	{
-		char		query[256];
-
 		if (verbose)
 			fprintf(stderr,
-					_("%s: freeing replication slot \"%s\"\n"),
+					_("%s: dropping replication slot \"%s\"\n"),
 					progname, replication_slot);
 
-		snprintf(query, sizeof(query), "DROP_REPLICATION_SLOT \"%s\"",
-				 replication_slot);
-		res = PQexec(conn, query);
-		if (PQresultStatus(res) != PGRES_COMMAND_OK)
-		{
-			fprintf(stderr, _("%s: could not send replication command \"%s\": %s"),
-					progname, query, PQerrorMessage(conn));
+		if (!DropReplicationSlot(conn, replication_slot))
 			disconnect_and_exit(1);
-		}
-
-		if (PQntuples(res) != 0 || PQnfields(res) != 0)
-		{
-			fprintf(stderr,
-					_("%s: could not stop logical replication: got %d rows and %d fields, expected %d rows and %d fields\n"),
-					progname, PQntuples(res), PQnfields(res), 0, 0);
-			disconnect_and_exit(1);
-		}
-
-		PQclear(res);
-		disconnect_and_exit(0);
 	}
 
-	/*
-	 * init a replication slot
-	 */
+	/* Create a replication slot. */
 	if (do_create_slot)
 	{
-		char		query[256];
-
 		if (verbose)
 			fprintf(stderr,
-					_("%s: initializing replication slot \"%s\"\n"),
+					_("%s: creating replication slot \"%s\"\n"),
 					progname, replication_slot);
 
-		snprintf(query, sizeof(query), "CREATE_REPLICATION_SLOT \"%s\" LOGICAL \"%s\"",
-				 replication_slot, plugin);
-
-		res = PQexec(conn, query);
-		if (PQresultStatus(res) != PGRES_TUPLES_OK)
-		{
-			fprintf(stderr, _("%s: could not send replication command \"%s\": %s"),
-					progname, query, PQerrorMessage(conn));
+		if (!CreateReplicationSlot(conn, replication_slot, plugin,
+								   false, slot_exists_ok))
 			disconnect_and_exit(1);
-		}
-
-		if (PQntuples(res) != 1 || PQnfields(res) != 4)
-		{
-			fprintf(stderr,
-					_("%s: could not init logical replication: got %d rows and %d fields, expected %d rows and %d fields\n"),
-					progname, PQntuples(res), PQnfields(res), 1, 4);
-			disconnect_and_exit(1);
-		}
-
-		if (sscanf(PQgetvalue(res, 0, 1), "%X/%X", &hi, &lo) != 2)
-		{
-			fprintf(stderr,
-					_("%s: could not parse transaction log location \"%s\"\n"),
-					progname, PQgetvalue(res, 0, 1));
-			disconnect_and_exit(1);
-		}
-		startpos = ((uint64) hi) << 32 | lo;
-
-		replication_slot = strdup(PQgetvalue(res, 0, 0));
-		PQclear(res);
+		startpos = InvalidXLogRecPtr;
 	}
-
 
 	if (!do_start_slot)
 		disconnect_and_exit(0);
 
+	/* Stream loop */
 	while (true)
 	{
-		StreamLog();
+		StreamLogicalLog();
 		if (time_to_abort)
 		{
 			/*

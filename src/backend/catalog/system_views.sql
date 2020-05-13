@@ -3,9 +3,17 @@
  *
  * Portions Copyright (c) 2006-2010, Greenplum inc.
  * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
- * Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Copyright (c) 1996-2016, PostgreSQL Global Development Group
  *
  * src/backend/catalog/system_views.sql
+ *
+ * Note: this file is read in single-user -j mode, which means that the
+ * command terminator is semicolon-newline-newline; whenever the backend
+ * sees that, it stops and executes what it's got.  If you write a lot of
+ * statements without empty lines between, they'll all get quoted to you
+ * in any error message about one of them, so don't do that.  Also, you
+ * cannot write a semicolon immediately followed by an empty line in a
+ * string literal (including a function body!) or a multiline comment.
  */
 
 CREATE VIEW pg_roles AS
@@ -15,20 +23,18 @@ CREATE VIEW pg_roles AS
         rolinherit,
         rolcreaterole,
         rolcreatedb,
-        rolcatupdate,
         rolcanlogin,
         rolreplication,
         rolconnlimit,
         '********'::text as rolpassword,
         rolvaliduntil,
+        rolbypassrls,
         setconfig as rolconfig,
 		rolresqueue,
         pg_authid.oid,
         rolcreaterextgpfd,
         rolcreaterexthttp,
         rolcreatewextgpfd,
-        rolcreaterexthdfs,
-        rolcreatewexthdfs,
         rolresgroup
     FROM pg_authid LEFT JOIN pg_db_role_setting s
     ON (pg_authid.oid = setrole AND setdatabase = 0);
@@ -39,8 +45,8 @@ CREATE VIEW pg_shadow AS
         pg_authid.oid AS usesysid,
         rolcreatedb AS usecreatedb,
         rolsuper AS usesuper,
-        rolcatupdate AS usecatupd,
         rolreplication AS userepl,
+        rolbypassrls AS usebypassrls,
         rolpassword AS passwd,
         rolvaliduntil::abstime AS valuntil,
         setconfig AS useconfig
@@ -64,12 +70,41 @@ CREATE VIEW pg_user AS
         usesysid,
         usecreatedb,
         usesuper,
-        usecatupd,
         userepl,
+        usebypassrls,
         '********'::text as passwd,
         valuntil,
         useconfig
     FROM pg_shadow;
+
+CREATE VIEW pg_policies AS
+    SELECT
+        N.nspname AS schemaname,
+        C.relname AS tablename,
+        pol.polname AS policyname,
+        CASE
+            WHEN pol.polroles = '{0}' THEN
+                string_to_array('public', '')
+            ELSE
+                ARRAY
+                (
+                    SELECT rolname
+                    FROM pg_catalog.pg_authid
+                    WHERE oid = ANY (pol.polroles) ORDER BY 1
+                )
+        END AS roles,
+        CASE pol.polcmd
+            WHEN 'r' THEN 'SELECT'
+            WHEN 'a' THEN 'INSERT'
+            WHEN 'w' THEN 'UPDATE'
+            WHEN 'd' THEN 'DELETE'
+            WHEN '*' THEN 'ALL'
+        END AS cmd,
+        pg_catalog.pg_get_expr(pol.polqual, pol.polrelid) AS qual,
+        pg_catalog.pg_get_expr(pol.polwithcheck, pol.polrelid) AS with_check
+    FROM pg_catalog.pg_policy pol
+    JOIN pg_catalog.pg_class C ON (C.oid = pol.polrelid)
+    LEFT JOIN pg_catalog.pg_namespace N ON (N.oid = C.relnamespace);
 
 CREATE VIEW pg_rules AS
     SELECT
@@ -98,7 +133,8 @@ CREATE VIEW pg_tables AS
         T.spcname AS tablespace,
         C.relhasindex AS hasindexes,
         C.relhasrules AS hasrules,
-        C.relhastriggers AS hastriggers
+        C.relhastriggers AS hastriggers,
+        C.relrowsecurity AS rowsecurity
     FROM pg_class C LEFT JOIN pg_namespace N ON (N.oid = C.relnamespace)
          LEFT JOIN pg_tablespace T ON (T.oid = C.reltablespace)
     WHERE C.relkind = 'r';
@@ -129,7 +165,7 @@ CREATE VIEW pg_indexes AS
          LEFT JOIN pg_tablespace T ON (T.oid = I.reltablespace)
     WHERE C.relkind IN ('r', 'm') AND I.relkind = 'i';
 
-CREATE VIEW pg_stats AS
+CREATE VIEW pg_stats WITH (security_barrier) AS
     SELECT
         nspname AS schemaname,
         relname AS tablename,
@@ -190,7 +226,9 @@ CREATE VIEW pg_stats AS
     FROM pg_statistic s JOIN pg_class c ON (c.oid = s.starelid)
          JOIN pg_attribute a ON (c.oid = attrelid AND attnum = s.staattnum)
          LEFT JOIN pg_namespace n ON (n.oid = c.relnamespace)
-    WHERE NOT attisdropped AND has_column_privilege(c.oid, a.attnum, 'select');
+    WHERE NOT attisdropped
+    AND has_column_privilege(c.oid, a.attnum, 'select')
+    AND (c.relrowsecurity = false OR NOT row_security_active(c.oid));
 
 REVOKE ALL on pg_statistic FROM public;
 
@@ -390,15 +428,27 @@ CREATE RULE pg_settings_n AS
 
 GRANT SELECT, UPDATE ON pg_settings TO PUBLIC;
 
+CREATE VIEW pg_file_settings AS
+   SELECT * FROM pg_show_all_file_settings() AS A;
+
+REVOKE ALL on pg_file_settings FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION pg_show_all_file_settings() FROM PUBLIC;
+
 CREATE VIEW pg_timezone_abbrevs AS
     SELECT * FROM pg_timezone_abbrevs();
 
 CREATE VIEW pg_timezone_names AS
     SELECT * FROM pg_timezone_names();
 
+CREATE VIEW pg_config AS
+    SELECT * FROM pg_config();
+
+REVOKE ALL on pg_config FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION pg_config() FROM PUBLIC;
+
 -- Statistics views
 
-CREATE VIEW pg_stat_all_tables AS
+CREATE VIEW pg_stat_all_tables_internal AS
     SELECT
             C.oid AS relid,
             N.nspname AS schemaname,
@@ -428,6 +478,72 @@ CREATE VIEW pg_stat_all_tables AS
          LEFT JOIN pg_namespace N ON (N.oid = C.relnamespace)
     WHERE C.relkind IN ('r', 't', 'm')
     GROUP BY C.oid, N.nspname, C.relname;
+
+-- Gather data from segments on user tables, and use data on master on system tables.
+
+CREATE VIEW pg_stat_all_tables AS
+SELECT
+    s.relid,
+    s.schemaname,
+    s.relname,
+    m.seq_scan,
+    m.seq_tup_read,
+    m.idx_scan,
+    m.idx_tup_fetch,
+    m.n_tup_ins,
+    m.n_tup_upd,
+    m.n_tup_del,
+    m.n_tup_hot_upd,
+    m.n_live_tup,
+    m.n_dead_tup,
+    m.n_mod_since_analyze,
+    s.last_vacuum,
+    s.last_autovacuum,
+    s.last_analyze,
+    s.last_autoanalyze,
+    s.vacuum_count,
+    s.autovacuum_count,
+    s.analyze_count,
+    s.autoanalyze_count
+FROM
+    (SELECT
+         relid,
+         schemaname,
+         relname,
+         sum(seq_scan) as seq_scan,
+         sum(seq_tup_read) as seq_tup_read,
+         sum(idx_scan) as idx_scan,
+         sum(idx_tup_fetch) as idx_tup_fetch,
+         sum(n_tup_ins) as n_tup_ins,
+         sum(n_tup_upd) as n_tup_upd,
+         sum(n_tup_del) as n_tup_del,
+         sum(n_tup_hot_upd) as n_tup_hot_upd,
+         sum(n_live_tup) as n_live_tup,
+         sum(n_dead_tup) as n_dead_tup,
+         max(n_mod_since_analyze) as n_mod_since_analyze,
+         max(last_vacuum) as last_vacuum,
+         max(last_autovacuum) as last_autovacuum,
+         max(last_analyze) as last_analyze,
+         max(last_autoanalyze) as last_autoanalyze,
+         max(vacuum_count) as vacuum_count,
+         max(autovacuum_count) as autovacuum_count,
+         max(analyze_count) as analyze_count,
+         max(autoanalyze_count) as autoanalyze_count
+     FROM
+         gp_dist_random('pg_stat_all_tables_internal')
+     WHERE
+             relid >= 16384
+     GROUP BY relid, schemaname, relname
+
+     UNION ALL
+
+     SELECT
+         *
+     FROM
+         pg_stat_all_tables_internal
+     WHERE
+             relid < 16384) m, pg_stat_all_tables_internal s
+WHERE m.relid = s.relid;
 
 CREATE VIEW pg_stat_xact_all_tables AS
     SELECT
@@ -504,7 +620,7 @@ CREATE VIEW pg_statio_user_tables AS
     WHERE schemaname NOT IN ('pg_catalog', 'information_schema') AND
           schemaname !~ '^pg_toast';
 
-CREATE VIEW pg_stat_all_indexes AS
+CREATE VIEW pg_stat_all_indexes_internal AS
     SELECT
             C.oid AS relid,
             I.oid AS indexrelid,
@@ -519,6 +635,44 @@ CREATE VIEW pg_stat_all_indexes AS
             pg_class I ON I.oid = X.indexrelid
             LEFT JOIN pg_namespace N ON (N.oid = C.relnamespace)
     WHERE C.relkind IN ('r', 't', 'm');
+
+-- Gather data from segments on user tables, and use data on master on system tables.
+
+CREATE VIEW pg_stat_all_indexes AS
+SELECT
+    s.relid,
+    s.indexrelid,
+    s.schemaname,
+    s.relname,
+    s.indexrelname,
+    m.idx_scan,
+    m.idx_tup_read,
+    m.idx_tup_fetch
+FROM
+    (SELECT
+         relid,
+         indexrelid,
+         schemaname,
+         relname,
+         indexrelname,
+         sum(idx_scan) as idx_scan,
+         sum(idx_tup_read) as idx_tup_read,
+         sum(idx_tup_fetch) as idx_tup_fetch
+     FROM
+         gp_dist_random('pg_stat_all_indexes_internal')
+     WHERE
+             relid >= 16384
+     GROUP BY relid, indexrelid, schemaname, relname, indexrelname
+
+     UNION ALL
+
+     SELECT
+         *
+     FROM
+         pg_stat_all_indexes_internal
+     WHERE
+             relid < 16384) m, pg_stat_all_indexes_internal s
+WHERE m.relid = s.relid;
 
 CREATE VIEW pg_stat_sys_indexes AS
     SELECT * FROM pg_stat_all_indexes
@@ -594,16 +748,15 @@ CREATE VIEW pg_stat_activity AS
             S.xact_start,
             S.query_start,
             S.state_change,
-            S.waiting,
+            S.wait_event_type,
+            S.wait_event,
             S.state,
             S.backend_xid,
             s.backend_xmin,
             S.query,
 
-            S.waiting_reason,
             S.rsgid,
-            S.rsgname,
-            S.rsgqueueduration
+            S.rsgname
     FROM pg_database D, pg_stat_get_activity(NULL) AS S, pg_authid U
     WHERE S.datid = D.oid AND
             S.usesysid = U.oid;
@@ -684,6 +837,34 @@ CREATE VIEW gp_stat_replication AS
          ON G.gp_segment_id = R.gp_segment_id
     );
 
+CREATE VIEW pg_stat_wal_receiver AS
+    SELECT
+            s.pid,
+            s.status,
+            s.receive_start_lsn,
+            s.receive_start_tli,
+            s.received_lsn,
+            s.received_tli,
+            s.last_msg_send_time,
+            s.last_msg_receipt_time,
+            s.latest_end_lsn,
+            s.latest_end_time,
+            s.slot_name,
+            s.conninfo
+    FROM pg_stat_get_wal_receiver() s
+    WHERE s.pid IS NOT NULL;
+
+CREATE VIEW pg_stat_ssl AS
+    SELECT
+            S.pid,
+            S.ssl,
+            S.sslversion AS version,
+            S.sslcipher AS cipher,
+            S.sslbits AS bits,
+            S.sslcompression AS compression,
+            S.sslclientdn AS clientdn
+    FROM pg_stat_get_activity(NULL) AS S;
+
 CREATE VIEW pg_replication_slots AS
     SELECT
             L.slot_name,
@@ -692,9 +873,11 @@ CREATE VIEW pg_replication_slots AS
             L.datoid,
             D.datname AS database,
             L.active,
+            L.active_pid,
             L.xmin,
             L.catalog_xmin,
-            L.restart_lsn
+            L.restart_lsn,
+            L.confirmed_flush_lsn
     FROM pg_get_replication_slots() AS L
             LEFT JOIN pg_database D ON (L.datoid = D.oid);
 
@@ -825,12 +1008,12 @@ create view pg_partitions as
                       partition by pp.oid, cl.relname, pp.parlevel, cl3.relname
                       order by pr1.parisdefault, pr1.parruleord) 
                   end as partitionrank, 
-              pg_get_expr(pr1.parlistvalues, pr1.parchildrelid) as partitionlistvalues, 
-              pg_get_expr(pr1.parrangestart, pr1.parchildrelid) as partitionrangestart, 
+              pg_get_expr(pr1.parlistvalues, pr1.parchildrelid, false, true) as partitionlistvalues, 
+              pg_get_expr(pr1.parrangestart, pr1.parchildrelid, false, true) as partitionrangestart, 
               pr1.parrangestartincl as partitionstartinclusive, 
-              pg_get_expr(pr1.parrangeend, pr1.parchildrelid) as partitionrangeend, 
+              pg_get_expr(pr1.parrangeend, pr1.parchildrelid, false, true) as partitionrangeend, 
               pr1.parrangeendincl as partitionendinclusive, 
-              pg_get_expr(pr1.parrangeevery, pr1.parchildrelid) as partitioneveryclause, 
+              pg_get_expr(pr1.parrangeevery, pr1.parchildrelid, false, true) as partitioneveryclause, 
               min(pr1.parruleord) over(
                   partition by pp.oid, cl.relname, pp.parlevel, cl3.relname
                   order by pr1.parruleord) as partitionnodefault, 
@@ -925,12 +1108,12 @@ p.parlevel as partitionlevel,
 pr1.parruleord as partitionposition,
 rank() over (partition by p.oid, cl.relname, p.parlevel 
 			 order by pr1.parruleord) as partitionrank,
-pg_get_expr(pr1.parlistvalues, p.parrelid) as partitionlistvalues,
-pg_get_expr(pr1.parrangestart, p.parrelid) as partitionrangestart,
+pg_get_expr(pr1.parlistvalues, p.parrelid, false, true) as partitionlistvalues,
+pg_get_expr(pr1.parrangestart, p.parrelid, false, true) as partitionrangestart,
 pr1.parrangestartincl as partitionstartinclusive,
-pg_get_expr(pr1.parrangeend, p.parrelid) as partitionrangeend,
+pg_get_expr(pr1.parrangeend, p.parrelid, false, true) as partitionrangeend,
 pr1.parrangeendincl as partitionendinclusive,
-pg_get_expr(pr1.parrangeevery, p.parrelid) as partitioneveryclause,
+pg_get_expr(pr1.parrangeevery, p.parrelid, false, true) as partitioneveryclause,
 
 min(pr1.parruleord) over (partition by p.oid, cl.relname, p.parlevel
 	order by pr1.parruleord) as partitionnodefault,
@@ -1210,6 +1393,24 @@ CREATE VIEW pg_stat_bgwriter AS
         pg_stat_get_buf_alloc() AS buffers_alloc,
         pg_stat_get_bgwriter_stat_reset_time() AS stats_reset;
 
+CREATE VIEW pg_stat_progress_vacuum AS
+	SELECT
+		S.pid AS pid, S.datid AS datid, D.datname AS datname,
+		S.relid AS relid,
+		CASE S.param1 WHEN 0 THEN 'initializing'
+					  WHEN 1 THEN 'scanning heap'
+					  WHEN 2 THEN 'vacuuming indexes'
+					  WHEN 3 THEN 'vacuuming heap'
+					  WHEN 4 THEN 'cleaning up indexes'
+					  WHEN 5 THEN 'truncating heap'
+					  WHEN 6 THEN 'performing final cleanup'
+					  END AS phase,
+		S.param2 AS heap_blks_total, S.param3 AS heap_blks_scanned,
+		S.param4 AS heap_blks_vacuumed, S.param5 AS index_vacuum_count,
+		S.param6 AS max_dead_tuples, S.param7 AS num_dead_tuples
+    FROM pg_stat_get_progress_info('VACUUM') AS S
+		 JOIN pg_database D ON S.datid = D.oid;
+
 CREATE VIEW pg_user_mappings AS
     SELECT
         U.oid       AS umid,
@@ -1221,16 +1422,25 @@ CREATE VIEW pg_user_mappings AS
         ELSE
             A.rolname
         END AS usename,
-        CASE WHEN pg_has_role(S.srvowner, 'USAGE') OR has_server_privilege(S.oid, 'USAGE') THEN
-            U.umoptions
-        ELSE
-            NULL
-        END AS umoptions
+        CASE WHEN (U.umuser <> 0 AND A.rolname = current_user
+                     AND (pg_has_role(S.srvowner, 'USAGE')
+                          OR has_server_privilege(S.oid, 'USAGE')))
+                    OR (U.umuser = 0 AND pg_has_role(S.srvowner, 'USAGE'))
+                    OR (SELECT rolsuper FROM pg_authid WHERE rolname = current_user)
+                    THEN U.umoptions
+                 ELSE NULL END AS umoptions
     FROM pg_user_mapping U
          LEFT JOIN pg_authid A ON (A.oid = U.umuser) JOIN
         pg_foreign_server S ON (U.umserver = S.oid);
 
 REVOKE ALL on pg_user_mapping FROM public;
+
+
+CREATE VIEW pg_replication_origin_status AS
+    SELECT *
+    FROM pg_show_replication_origin_status();
+
+REVOKE ALL ON pg_replication_origin_status FROM public;
 
 --
 -- We have a few function definitions in here, too.
@@ -1279,7 +1489,7 @@ FROM pg_catalog.ts_parse(
     ) AS tt
 WHERE tt.tokid = parse.tokid
 $$
-LANGUAGE SQL STRICT STABLE;
+LANGUAGE SQL STRICT STABLE PARALLEL SAFE;
 
 COMMENT ON FUNCTION ts_debug(regconfig,text) IS
     'debug function for text search configuration';
@@ -1295,7 +1505,7 @@ RETURNS SETOF record AS
 $$
     SELECT * FROM pg_catalog.ts_debug( pg_catalog.get_current_ts_config(), $1);
 $$
-LANGUAGE SQL STRICT STABLE;
+LANGUAGE SQL STRICT STABLE PARALLEL SAFE;
 
 COMMENT ON FUNCTION ts_debug(text) IS
     'debug function for current text search configuration';
@@ -1310,40 +1520,19 @@ COMMENT ON FUNCTION ts_debug(text) IS
 --
 
 CREATE OR REPLACE FUNCTION
-  pg_start_backup(label text, fast boolean DEFAULT false)
-  RETURNS pg_lsn STRICT VOLATILE LANGUAGE internal AS 'pg_start_backup';
+  pg_start_backup(label text, fast boolean DEFAULT false, exclusive boolean DEFAULT true)
+  RETURNS pg_lsn STRICT VOLATILE LANGUAGE internal AS 'pg_start_backup'
+  PARALLEL RESTRICTED;
 
+-- legacy definition for compatibility with 9.3
 CREATE OR REPLACE FUNCTION
   json_populate_record(base anyelement, from_json json, use_json_as_text boolean DEFAULT false)
-  RETURNS anyelement LANGUAGE internal STABLE AS 'json_populate_record';
+  RETURNS anyelement LANGUAGE internal STABLE AS 'json_populate_record' PARALLEL SAFE;
 
+-- legacy definition for compatibility with 9.3
 CREATE OR REPLACE FUNCTION
   json_populate_recordset(base anyelement, from_json json, use_json_as_text boolean DEFAULT false)
-  RETURNS SETOF anyelement LANGUAGE internal STABLE ROWS 100  AS 'json_populate_recordset';
-
-CREATE OR REPLACE FUNCTION
-  jsonb_populate_record(base anyelement, from_json jsonb, use_json_as_text boolean DEFAULT false)
-  RETURNS anyelement LANGUAGE internal STABLE AS 'jsonb_populate_record';
-
-CREATE OR REPLACE FUNCTION
-  jsonb_populate_recordset(base anyelement, from_json jsonb, use_json_as_text boolean DEFAULT false)
-  RETURNS SETOF anyelement LANGUAGE internal STABLE ROWS 100  AS 'jsonb_populate_recordset';
-
-CREATE OR REPLACE FUNCTION
-  json_to_record(from_json json, nested_as_text boolean DEFAULT false)
-  RETURNS record LANGUAGE internal STABLE AS 'json_to_record';
-
-CREATE OR REPLACE FUNCTION
-  json_to_recordset(from_json json, nested_as_text boolean DEFAULT false)
-  RETURNS SETOF record LANGUAGE internal STABLE ROWS 100  AS 'json_to_recordset';
-
-CREATE OR REPLACE FUNCTION
-  jsonb_to_record(from_json jsonb, nested_as_text boolean DEFAULT false)
-  RETURNS record LANGUAGE internal STABLE AS 'jsonb_to_record';
-
-CREATE OR REPLACE FUNCTION
-  jsonb_to_recordset(from_json jsonb, nested_as_text boolean DEFAULT false)
-  RETURNS SETOF record LANGUAGE internal STABLE ROWS 100  AS 'jsonb_to_recordset';
+  RETURNS SETOF anyelement LANGUAGE internal STABLE ROWS 100  AS 'json_populate_recordset' PARALLEL SAFE;
 
 CREATE OR REPLACE FUNCTION pg_logical_slot_get_changes(
     IN slot_name name, IN upto_lsn pg_lsn, IN upto_nchanges int, VARIADIC options text[] DEFAULT '{}',
@@ -1377,14 +1566,30 @@ LANGUAGE INTERNAL
 VOLATILE ROWS 1000 COST 1000
 AS 'pg_logical_slot_peek_binary_changes';
 
+CREATE OR REPLACE FUNCTION pg_create_physical_replication_slot(
+    IN slot_name name, IN immediately_reserve boolean DEFAULT false,
+    OUT slot_name name, OUT xlog_position pg_lsn)
+RETURNS RECORD
+LANGUAGE INTERNAL
+STRICT VOLATILE
+AS 'pg_create_physical_replication_slot';
+
 CREATE OR REPLACE FUNCTION
   make_interval(years int4 DEFAULT 0, months int4 DEFAULT 0, weeks int4 DEFAULT 0,
                 days int4 DEFAULT 0, hours int4 DEFAULT 0, mins int4 DEFAULT 0,
                 secs double precision DEFAULT 0.0)
 RETURNS interval
 LANGUAGE INTERNAL
-STRICT IMMUTABLE
+STRICT IMMUTABLE PARALLEL SAFE
 AS 'make_interval';
+
+CREATE OR REPLACE FUNCTION
+  jsonb_set(jsonb_in jsonb, path text[] , replacement jsonb,
+            create_if_missing boolean DEFAULT true)
+RETURNS jsonb
+LANGUAGE INTERNAL
+STRICT IMMUTABLE PARALLEL SAFE
+AS 'jsonb_set';
 
 -- pg_tablespace_location wrapper functions to see Greenplum cluster-wide tablespace locations
 CREATE FUNCTION gp_tablespace_segment_location (IN tblspc_oid oid, OUT gp_segment_id int, OUT tblspc_loc text)
@@ -1398,3 +1603,39 @@ AS
    UNION ALL
    SELECT pg_catalog.gp_execution_segment() as gp_segment_id, * FROM pg_catalog.pg_tablespace_location($1)'
 LANGUAGE SQL EXECUTE ON MASTER;
+
+CREATE OR REPLACE FUNCTION
+  parse_ident(str text, strict boolean DEFAULT true)
+RETURNS text[]
+LANGUAGE INTERNAL
+STRICT IMMUTABLE PARALLEL SAFE
+AS 'parse_ident';
+
+CREATE OR REPLACE FUNCTION
+  jsonb_insert(jsonb_in jsonb, path text[] , replacement jsonb,
+            insert_after boolean DEFAULT false)
+RETURNS jsonb
+LANGUAGE INTERNAL
+STRICT IMMUTABLE PARALLEL SAFE
+AS 'jsonb_insert';
+
+-- The default permissions for functions mean that anyone can execute them.
+-- A number of functions shouldn't be executable by just anyone, but rather
+-- than use explicit 'superuser()' checks in those functions, we use the GRANT
+-- system to REVOKE access to those functions at initdb time.  Administrators
+-- can later change who can access these functions, or leave them as only
+-- available to superuser / cluster owner, if they choose.
+REVOKE EXECUTE ON FUNCTION pg_start_backup(text, boolean, boolean) FROM public;
+REVOKE EXECUTE ON FUNCTION pg_stop_backup() FROM public;
+REVOKE EXECUTE ON FUNCTION pg_stop_backup(boolean) FROM public;
+REVOKE EXECUTE ON FUNCTION pg_create_restore_point(text) FROM public;
+REVOKE EXECUTE ON FUNCTION pg_switch_xlog() FROM public;
+REVOKE EXECUTE ON FUNCTION pg_xlog_replay_pause() FROM public;
+REVOKE EXECUTE ON FUNCTION pg_xlog_replay_resume() FROM public;
+REVOKE EXECUTE ON FUNCTION pg_rotate_logfile() FROM public;
+REVOKE EXECUTE ON FUNCTION pg_reload_conf() FROM public;
+
+REVOKE EXECUTE ON FUNCTION pg_stat_reset() FROM public;
+REVOKE EXECUTE ON FUNCTION pg_stat_reset_shared(text) FROM public;
+REVOKE EXECUTE ON FUNCTION pg_stat_reset_single_table_counters(oid) FROM public;
+REVOKE EXECUTE ON FUNCTION pg_stat_reset_single_function_counters(oid) FROM public;

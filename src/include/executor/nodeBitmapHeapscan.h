@@ -4,7 +4,7 @@
  *
  *
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/executor/nodeBitmapHeapscan.h
@@ -17,11 +17,10 @@
 #include "nodes/execnodes.h"
 
 extern BitmapHeapScanState *ExecInitBitmapHeapScan(BitmapHeapScan *node, EState *estate, int eflags);
+extern BitmapHeapScanState *ExecInitBitmapHeapScanForPartition(BitmapHeapScan *node, EState *estate, int eflags, Relation currentRelation);
 extern TupleTableSlot *ExecBitmapHeapScan(BitmapHeapScanState *node);
 extern void ExecEndBitmapHeapScan(BitmapHeapScanState *node);
 extern void ExecReScanBitmapHeapScan(BitmapHeapScanState *node);
-extern void ExecEagerFreeBitmapHeapScan(BitmapHeapScanState *node);
-
-extern void bitgetpage(HeapScanDesc scan, TBMIterateResult *tbmres);
+extern void ExecSquelchBitmapHeapScan(BitmapHeapScanState *node);
 
 #endif   /* NODEBITMAPHEAPSCAN_H */

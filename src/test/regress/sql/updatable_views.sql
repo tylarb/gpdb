@@ -69,6 +69,15 @@ DELETE FROM rw_view14 WHERE a=3; -- should be OK
 -- Partially updatable view
 INSERT INTO rw_view15 VALUES (3, 'ROW 3'); -- should fail
 INSERT INTO rw_view15 (a) VALUES (3); -- should be OK
+INSERT INTO rw_view15 (a) VALUES (3) ON CONFLICT DO NOTHING; -- succeeds
+SELECT * FROM rw_view15;
+INSERT INTO rw_view15 (a) VALUES (3) ON CONFLICT (a) DO NOTHING; -- succeeds
+SELECT * FROM rw_view15;
+INSERT INTO rw_view15 (a) VALUES (3) ON CONFLICT (a) DO UPDATE set a = excluded.a; -- succeeds
+SELECT * FROM rw_view15;
+INSERT INTO rw_view15 (a) VALUES (3) ON CONFLICT (a) DO UPDATE set upper = 'blarg'; -- fails
+SELECT * FROM rw_view15;
+SELECT * FROM rw_view15;
 ALTER VIEW rw_view15 ALTER COLUMN upper SET DEFAULT 'NOT SET';
 INSERT INTO rw_view15 (a) VALUES (4); -- should fail
 UPDATE rw_view15 SET upper='ROW 3' WHERE a=3; -- should fail
@@ -382,22 +391,22 @@ DROP TABLE base_tbl CASCADE;
 
 -- permissions checks
 
-CREATE USER view_user1;
-CREATE USER view_user2;
+CREATE USER regress_view_user1;
+CREATE USER regress_view_user2;
 
-SET SESSION AUTHORIZATION view_user1;
+SET SESSION AUTHORIZATION regress_view_user1;
 CREATE TABLE base_tbl(a int, b text, c float);
 INSERT INTO base_tbl VALUES (1, 'Row 1', 1.0);
 CREATE VIEW rw_view1 AS SELECT b AS bb, c AS cc, a AS aa FROM base_tbl;
 INSERT INTO rw_view1 VALUES ('Row 2', 2.0, 2);
 
-GRANT SELECT ON base_tbl TO view_user2;
-GRANT SELECT ON rw_view1 TO view_user2;
-GRANT UPDATE (a,c) ON base_tbl TO view_user2;
-GRANT UPDATE (bb,cc) ON rw_view1 TO view_user2;
+GRANT SELECT ON base_tbl TO regress_view_user2;
+GRANT SELECT ON rw_view1 TO regress_view_user2;
+GRANT UPDATE (a,c) ON base_tbl TO regress_view_user2;
+GRANT UPDATE (bb,cc) ON rw_view1 TO regress_view_user2;
 RESET SESSION AUTHORIZATION;
 
-SET SESSION AUTHORIZATION view_user2;
+SET SESSION AUTHORIZATION regress_view_user2;
 CREATE VIEW rw_view2 AS SELECT b AS bb, c AS cc, a AS aa FROM base_tbl;
 SELECT * FROM base_tbl; -- ok
 SELECT * FROM rw_view1; -- ok
@@ -419,11 +428,11 @@ DELETE FROM rw_view1; -- not allowed
 DELETE FROM rw_view2; -- not allowed
 RESET SESSION AUTHORIZATION;
 
-SET SESSION AUTHORIZATION view_user1;
-GRANT INSERT, DELETE ON base_tbl TO view_user2;
+SET SESSION AUTHORIZATION regress_view_user1;
+GRANT INSERT, DELETE ON base_tbl TO regress_view_user2;
 RESET SESSION AUTHORIZATION;
 
-SET SESSION AUTHORIZATION view_user2;
+SET SESSION AUTHORIZATION regress_view_user2;
 INSERT INTO base_tbl VALUES (3, 'Row 3', 3.0); -- ok
 INSERT INTO rw_view1 VALUES ('Row 4', 4.0, 4); -- not allowed
 INSERT INTO rw_view2 VALUES ('Row 4', 4.0, 4); -- ok
@@ -433,12 +442,12 @@ DELETE FROM rw_view2 WHERE aa=2; -- ok
 SELECT * FROM base_tbl;
 RESET SESSION AUTHORIZATION;
 
-SET SESSION AUTHORIZATION view_user1;
-REVOKE INSERT, DELETE ON base_tbl FROM view_user2;
-GRANT INSERT, DELETE ON rw_view1 TO view_user2;
+SET SESSION AUTHORIZATION regress_view_user1;
+REVOKE INSERT, DELETE ON base_tbl FROM regress_view_user2;
+GRANT INSERT, DELETE ON rw_view1 TO regress_view_user2;
 RESET SESSION AUTHORIZATION;
 
-SET SESSION AUTHORIZATION view_user2;
+SET SESSION AUTHORIZATION regress_view_user2;
 INSERT INTO base_tbl VALUES (5, 'Row 5', 5.0); -- not allowed
 INSERT INTO rw_view1 VALUES ('Row 5', 5.0, 5); -- ok
 INSERT INTO rw_view2 VALUES ('Row 6', 6.0, 6); -- not allowed
@@ -450,8 +459,8 @@ RESET SESSION AUTHORIZATION;
 
 DROP TABLE base_tbl CASCADE;
 
-DROP USER view_user1;
-DROP USER view_user2;
+DROP USER regress_view_user1;
+DROP USER regress_view_user2;
 
 -- column defaults
 
@@ -707,6 +716,25 @@ INSERT INTO rw_view3 VALUES (3); -- ok
 
 DROP TABLE base_tbl CASCADE;
 
+-- WITH CHECK OPTION with scalar array ops
+
+CREATE TABLE base_tbl (a int, b int[]);
+CREATE VIEW rw_view1 AS SELECT * FROM base_tbl WHERE a = ANY (b)
+  WITH CHECK OPTION;
+
+INSERT INTO rw_view1 VALUES (1, ARRAY[1,2,3]); -- ok
+INSERT INTO rw_view1 VALUES (10, ARRAY[4,5]); -- should fail
+
+UPDATE rw_view1 SET b[2] = -b[2] WHERE a = 1; -- ok
+UPDATE rw_view1 SET b[1] = -b[1] WHERE a = 1; -- should fail
+
+PREPARE ins(int, int[]) AS INSERT INTO rw_view1 VALUES($1, $2);
+EXECUTE ins(2, ARRAY[1,2,3]); -- ok
+EXECUTE ins(10, ARRAY[4,5]); -- should fail
+DEALLOCATE PREPARE ins;
+
+DROP TABLE base_tbl CASCADE;
+
 -- WITH CHECK OPTION with subquery
 
 CREATE TABLE base_tbl (a int);
@@ -790,6 +818,8 @@ INSERT INTO rw_view2 VALUES (-5); -- should fail
 INSERT INTO rw_view2 VALUES (5); -- ok
 INSERT INTO rw_view2 VALUES (50); -- ok, but not in view
 UPDATE rw_view2 SET a = a - 10; -- should fail
+-- Greenplum doesn't fail because nothing was inserted into view, which is
+-- because Greenplum doesn't support INSTEAD OF triggers.
 SELECT * FROM base_tbl;
 
 -- Check option won't cascade down to base view with INSTEAD OF triggers
@@ -836,6 +866,14 @@ DROP TABLE base_tbl CASCADE;
 -- security barrier view
 
 CREATE TABLE base_tbl (person text, visibility text);
+
+-- GPDB: The tests below which throw NOTICEs, throw them in indeterminate
+-- order, if the rows are hashed to different segments. Force all the rows
+-- to the same segment, by adding a dummy column and using it as the
+-- distribution key.
+alter table base_tbl add column distkey int;
+alter table base_tbl set distributed by (distkey);
+
 INSERT INTO base_tbl VALUES ('Tom', 'public'),
                             ('Dick', 'private'),
                             ('Harry', 'public');
@@ -946,7 +984,7 @@ SELECT * FROM base_tbl;
 
 DROP TABLE base_tbl CASCADE;
 
--- security barrier view based on inheiritance set
+-- security barrier view based on inheritance set
 CREATE TABLE t1 (a int, b float, c text);
 CREATE INDEX t1_a_idx ON t1(a);
 INSERT INTO t1
@@ -1020,3 +1058,95 @@ TABLE t1; -- verify all a<=5 are intact
 DROP TABLE t1, t11, t12, t111 CASCADE;
 DROP FUNCTION snoop(anyelement);
 DROP FUNCTION leakproof(anyelement);
+
+CREATE TABLE tx1 (a integer);
+CREATE TABLE tx2 (b integer);
+CREATE TABLE tx3 (c integer);
+CREATE VIEW vx1 AS SELECT a FROM tx1 WHERE EXISTS(SELECT 1 FROM tx2 JOIN tx3 ON b=c);
+INSERT INTO vx1 values (1);
+SELECT * FROM tx1;
+SELECT * FROM vx1;
+
+DROP VIEW vx1;
+DROP TABLE tx1;
+DROP TABLE tx2;
+DROP TABLE tx3;
+
+CREATE TABLE tx1 (a integer);
+CREATE TABLE tx2 (b integer);
+CREATE TABLE tx3 (c integer);
+CREATE VIEW vx1 AS SELECT a FROM tx1 WHERE EXISTS(SELECT 1 FROM tx2 JOIN tx3 ON b=c);
+INSERT INTO vx1 VALUES (1);
+INSERT INTO vx1 VALUES (1);
+SELECT * FROM tx1;
+SELECT * FROM vx1;
+
+DROP VIEW vx1;
+DROP TABLE tx1;
+DROP TABLE tx2;
+DROP TABLE tx3;
+
+CREATE TABLE tx1 (a integer, b integer);
+CREATE TABLE tx2 (b integer, c integer);
+CREATE TABLE tx3 (c integer, d integer);
+ALTER TABLE tx1 DROP COLUMN b;
+ALTER TABLE tx2 DROP COLUMN c;
+ALTER TABLE tx3 DROP COLUMN d;
+CREATE VIEW vx1 AS SELECT a FROM tx1 WHERE EXISTS(SELECT 1 FROM tx2 JOIN tx3 ON b=c);
+INSERT INTO vx1 VALUES (1);
+INSERT INTO vx1 VALUES (1);
+SELECT * FROM tx1;
+SELECT * FROM vx1;
+
+DROP VIEW vx1;
+DROP TABLE tx1;
+DROP TABLE tx2;
+DROP TABLE tx3;
+
+--
+-- Test handling of vars from correlated subqueries in quals from outer
+-- security barrier views, per bug #13988
+--
+CREATE TABLE t1 (a int, b text, c int);
+INSERT INTO t1 VALUES (1, 'one', 10);
+
+CREATE TABLE t2 (cc int);
+INSERT INTO t2 VALUES (10), (20);
+
+CREATE VIEW v1 WITH (security_barrier = true) AS
+  SELECT * FROM t1 WHERE (a > 0)
+  WITH CHECK OPTION;
+
+CREATE VIEW v2 WITH (security_barrier = true) AS
+  SELECT * FROM v1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.cc = v1.c)
+  WITH CHECK OPTION;
+
+INSERT INTO v2 VALUES (2, 'two', 20); -- ok
+INSERT INTO v2 VALUES (-2, 'minus two', 20); -- not allowed
+INSERT INTO v2 VALUES (3, 'three', 30); -- not allowed
+
+UPDATE v2 SET b = 'ONE' WHERE a = 1; -- ok
+UPDATE v2 SET a = -1 WHERE a = 1; -- not allowed
+UPDATE v2 SET c = 30 WHERE a = 1; -- not allowed
+
+DELETE FROM v2 WHERE a = 2; -- ok
+SELECT * FROM v2;
+
+DROP VIEW v2;
+DROP VIEW v1;
+DROP TABLE t2;
+DROP TABLE t1;
+
+--
+-- Test CREATE OR REPLACE VIEW turning a non-updatable view into an
+-- auto-updatable view and adding check options in a single step
+--
+CREATE TABLE t1 (a int, b text);
+CREATE VIEW v1 AS SELECT null::int AS a;
+CREATE OR REPLACE VIEW v1 AS SELECT * FROM t1 WHERE a > 0 WITH CHECK OPTION;
+
+INSERT INTO v1 VALUES (1, 'ok'); -- ok
+INSERT INTO v1 VALUES (-1, 'invalid'); -- should fail
+
+DROP VIEW v1;
+DROP TABLE t1;

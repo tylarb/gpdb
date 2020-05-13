@@ -22,7 +22,9 @@ OBJS += pg_exttable.o pg_extprotocol.o \
        aoseg.o aoblkdir.o gp_fastsequence.o gp_segment_config.o \
        pg_attribute_encoding.o pg_compression.o aovisimap.o \
        pg_appendonly.o \
-       oid_dispatch.o aocatalog.o
+       oid_dispatch.o aocatalog.o storage_tablespace.o storage_database.o \
+       storage_tablespace_twophase.o storage_tablespace_xact.o
+
 
 BKIFILES = postgres.bki postgres.description postgres.shdescription
 
@@ -30,7 +32,7 @@ CATALOG_JSON:= $(addprefix $(top_srcdir)/gpMgmt/bin/gppylib/data/, $(addsuffix .
 
 include $(top_srcdir)/src/backend/common.mk
 
-all: $(BKIFILES) schemapg.h $(CATALOG_JSON)
+all: $(BKIFILES) schemapg.h $(CATALOG_JSON) postgres.description postgres.shdescription
 
 # Note: there are some undocumented dependencies on the ordering in which
 # the catalog header files are assembled into postgres.bki.  In particular,
@@ -48,8 +50,6 @@ POSTGRES_BKI_SRCS = $(addprefix $(top_srcdir)/src/include/catalog/,\
 	pg_ts_config.h pg_ts_config_map.h pg_ts_dict.h \
 	pg_ts_parser.h pg_ts_template.h pg_extension.h \
 	pg_foreign_data_wrapper.h pg_foreign_server.h pg_user_mapping.h \
-	pg_foreign_table.h \
-	pg_default_acl.h pg_seclabel.h pg_shseclabel.h pg_collation.h pg_range.h \
 	pg_resqueue.h pg_resqueuecapability.h pg_resourcetype.h \
 	pg_resgroup.h pg_resgroupcapability.h \
 	gp_configuration_history.h gp_id.h gp_policy.h gp_version.h \
@@ -64,6 +64,9 @@ POSTGRES_BKI_SRCS = $(addprefix $(top_srcdir)/src/include/catalog/,\
 	pg_partition_encoding.h \
 	pg_type_encoding.h \
 	pg_stat_last_operation.h pg_stat_last_shoperation.h \
+	pg_foreign_table.h pg_policy.h pg_replication_origin.h \
+	pg_default_acl.h pg_init_privs.h pg_seclabel.h pg_shseclabel.h \
+	pg_collation.h pg_range.h pg_transform.h \
 	toasting.h indexing.h \
     )
 
@@ -76,18 +79,23 @@ catalogdir = $(top_srcdir)/src/backend/catalog
 # locations of headers that genbki.pl needs to read
 pg_includes = -I$(top_srcdir)/src/include/catalog -I$(top_builddir)/src/include/catalog
 
-# see explanation in ../parser/Makefile
-postgres.description: postgres.bki ;
+# see notes in src/backend/parser/Makefile about multiple output files
+postgres.description: postgres.bki
+	touch $@
 
-postgres.shdescription: postgres.bki ;
+postgres.shdescription: postgres.bki
+	touch $@
 
-schemapg.h: postgres.bki ;
+schemapg.h: postgres.bki
+	touch $@
 
 # In Greenplum, contents of the pg_proc catalog is in two files, pg_proc.h
 # and pg_proc_gp.h. Combine them into a single file, so that genbki.pl can
 # process it.
 pg_proc_combined.h: $(top_srcdir)/src/include/catalog/pg_proc.h $(top_srcdir)/src/include/catalog/pg_proc_gp.h
 	cat $^ > $@
+
+catalog_json: $(CATALOG_JSON)
 
 $(CATALOG_JSON): process_foreign_keys.pl $(POSTGRES_BKI_SRCS) $(top_srcdir)/src/include/catalog/catversion.h
 	cat $(POSTGRES_BKI_SRCS) $(top_srcdir)/src/include/catalog/catversion.h | $(PERL) process_foreign_keys.pl > $@
@@ -108,7 +116,6 @@ install-data: $(BKIFILES) installdirs
 	$(INSTALL_DATA) $(call vpathsearch,postgres.shdescription) '$(DESTDIR)$(datadir)/postgres.shdescription'
 	$(INSTALL_DATA) $(srcdir)/system_views.sql '$(DESTDIR)$(datadir)/system_views.sql'
 	$(INSTALL_DATA) $(srcdir)/information_schema.sql '$(DESTDIR)$(datadir)/information_schema.sql'
-	$(INSTALL_DATA) $(call vpathsearch,cdb_util.sql) '$(DESTDIR)$(datadir)/cdb_util.sql'
 	$(INSTALL_DATA) $(call vpathsearch,cdb_schema.sql) '$(DESTDIR)$(datadir)/cdb_init.d/cdb_schema.sql'
 	$(INSTALL_DATA) $(srcdir)/sql_features.txt '$(DESTDIR)$(datadir)/sql_features.txt'
 	$(INSTALL_DATA) $(call vpathsearch,gp_toolkit.sql) '$(DESTDIR)$(datadir)/cdb_init.d/gp_toolkit.sql'

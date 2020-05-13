@@ -21,11 +21,9 @@
  *
  *-------------------------------------------------------------------------
  */
-
 #ifndef __PG_BACKUP_ARCHIVE__
 #define __PG_BACKUP_ARCHIVE__
 
-#include "postgres_fe.h"
 
 #include <time.h>
 
@@ -66,7 +64,7 @@ typedef z_stream *z_streamp;
 
 /* Current archive version number (the format we can output) */
 #define K_VERS_MAJOR 1
-#define K_VERS_MINOR 12
+#define K_VERS_MINOR 13
 #define K_VERS_REV 0
 
 /* Data block types */
@@ -92,9 +90,11 @@ typedef z_stream *z_streamp;
 																 * indicator */
 #define K_VERS_1_12 (( (1 * 256 + 12) * 256 + 0) * 256 + 0)		/* add separate BLOB
 																 * entries */
+#define K_VERS_1_13 (( (1 * 256 + 13) * 256 + 0) * 256 + 0)		/* change search_path
+																 * behavior */
 
 /* Newest format we can read */
-#define K_VERS_MAX (( (1 * 256 + 12) * 256 + 255) * 256 + 0)
+#define K_VERS_MAX (( (1 * 256 + 13) * 256 + 255) * 256 + 0)
 
 
 /* Flags to indicate disposition of offsets stored in files */
@@ -111,9 +111,8 @@ typedef z_stream *z_streamp;
 #define WORKER_INHIBIT_DATA			  11
 #define WORKER_IGNORED_ERRORS		  12
 
-struct _archiveHandle;
-struct _tocEntry;
-struct _restoreList;
+typedef struct _archiveHandle ArchiveHandle;
+typedef struct _tocEntry TocEntry;
 struct ParallelArgs;
 struct ParallelState;
 
@@ -139,42 +138,40 @@ typedef enum T_Action
 	ACT_RESTORE
 } T_Action;
 
-typedef void (*ClosePtr) (struct _archiveHandle * AH);
-typedef void (*ReopenPtr) (struct _archiveHandle * AH);
-typedef void (*ArchiveEntryPtr) (struct _archiveHandle * AH, struct _tocEntry * te);
+typedef void (*ClosePtr) (ArchiveHandle *AH);
+typedef void (*ReopenPtr) (ArchiveHandle *AH);
+typedef void (*ArchiveEntryPtr) (ArchiveHandle *AH, TocEntry *te);
 
-typedef void (*StartDataPtr) (struct _archiveHandle * AH, struct _tocEntry * te);
-typedef void (*WriteDataPtr) (struct _archiveHandle * AH, const void *data, size_t dLen);
-typedef void (*EndDataPtr) (struct _archiveHandle * AH, struct _tocEntry * te);
+typedef void (*StartDataPtr) (ArchiveHandle *AH, TocEntry *te);
+typedef void (*WriteDataPtr) (ArchiveHandle *AH, const void *data, size_t dLen);
+typedef void (*EndDataPtr) (ArchiveHandle *AH, TocEntry *te);
 
-typedef void (*StartBlobsPtr) (struct _archiveHandle * AH, struct _tocEntry * te);
-typedef void (*StartBlobPtr) (struct _archiveHandle * AH, struct _tocEntry * te, Oid oid);
-typedef void (*EndBlobPtr) (struct _archiveHandle * AH, struct _tocEntry * te, Oid oid);
-typedef void (*EndBlobsPtr) (struct _archiveHandle * AH, struct _tocEntry * te);
+typedef void (*StartBlobsPtr) (ArchiveHandle *AH, TocEntry *te);
+typedef void (*StartBlobPtr) (ArchiveHandle *AH, TocEntry *te, Oid oid);
+typedef void (*EndBlobPtr) (ArchiveHandle *AH, TocEntry *te, Oid oid);
+typedef void (*EndBlobsPtr) (ArchiveHandle *AH, TocEntry *te);
 
-typedef int (*WriteBytePtr) (struct _archiveHandle * AH, const int i);
-typedef int (*ReadBytePtr) (struct _archiveHandle * AH);
-typedef void (*WriteBufPtr) (struct _archiveHandle * AH, const void *c, size_t len);
-typedef void (*ReadBufPtr) (struct _archiveHandle * AH, void *buf, size_t len);
-typedef void (*SaveArchivePtr) (struct _archiveHandle * AH);
-typedef void (*WriteExtraTocPtr) (struct _archiveHandle * AH, struct _tocEntry * te);
-typedef void (*ReadExtraTocPtr) (struct _archiveHandle * AH, struct _tocEntry * te);
-typedef void (*PrintExtraTocPtr) (struct _archiveHandle * AH, struct _tocEntry * te);
-typedef void (*PrintTocDataPtr) (struct _archiveHandle * AH, struct _tocEntry * te, RestoreOptions *ropt);
+typedef int (*WriteBytePtr) (ArchiveHandle *AH, const int i);
+typedef int (*ReadBytePtr) (ArchiveHandle *AH);
+typedef void (*WriteBufPtr) (ArchiveHandle *AH, const void *c, size_t len);
+typedef void (*ReadBufPtr) (ArchiveHandle *AH, void *buf, size_t len);
+typedef void (*SaveArchivePtr) (ArchiveHandle *AH);
+typedef void (*WriteExtraTocPtr) (ArchiveHandle *AH, TocEntry *te);
+typedef void (*ReadExtraTocPtr) (ArchiveHandle *AH, TocEntry *te);
+typedef void (*PrintExtraTocPtr) (ArchiveHandle *AH, TocEntry *te);
+typedef void (*PrintTocDataPtr) (ArchiveHandle *AH, TocEntry *te);
 
-typedef void (*ClonePtr) (struct _archiveHandle * AH);
-typedef void (*DeClonePtr) (struct _archiveHandle * AH);
+typedef void (*ClonePtr) (ArchiveHandle *AH);
+typedef void (*DeClonePtr) (ArchiveHandle *AH);
 
-typedef char *(*WorkerJobRestorePtr) (struct _archiveHandle * AH, struct _tocEntry * te);
-typedef char *(*WorkerJobDumpPtr) (struct _archiveHandle * AH, struct _tocEntry * te);
-typedef char *(*MasterStartParallelItemPtr) (struct _archiveHandle * AH, struct _tocEntry * te,
+typedef char *(*WorkerJobRestorePtr) (ArchiveHandle *AH, TocEntry *te);
+typedef char *(*WorkerJobDumpPtr) (ArchiveHandle *AH, TocEntry *te);
+typedef char *(*MasterStartParallelItemPtr) (ArchiveHandle *AH, TocEntry *te,
 														 T_Action act);
-typedef int (*MasterEndParallelItemPtr) (struct _archiveHandle * AH, struct _tocEntry * te,
+typedef int (*MasterEndParallelItemPtr) (ArchiveHandle *AH, TocEntry *te,
 											  const char *str, T_Action act);
 
-typedef size_t (*CustomOutPtr) (struct _archiveHandle * AH, const void *buf, size_t len);
-
-typedef void (*DieFuncPtr) (int taskRC, char * pszErrorMsg);
+typedef size_t (*CustomOutPtr) (ArchiveHandle *AH, const void *buf, size_t len);
 
 typedef enum
 {
@@ -205,6 +202,30 @@ typedef enum
 	OUTPUT_OTHERDATA			/* writing data as INSERT commands */
 } ArchiverOutput;
 
+/*
+ * For historical reasons, ACL items are interspersed with everything else in
+ * a dump file's TOC; typically they're right after the object they're for.
+ * However, we need to restore data before ACLs, as otherwise a read-only
+ * table (ie one where the owner has revoked her own INSERT privilege) causes
+ * data restore failures.  On the other hand, matview REFRESH commands should
+ * come out after ACLs, as otherwise non-superuser-owned matviews might not
+ * be able to execute.  (If the permissions at the time of dumping would not
+ * allow a REFRESH, too bad; we won't fix that for you.)  These considerations
+ * force us to make three passes over the TOC, restoring the appropriate
+ * subset of items in each pass.  We assume that the dependency sort resulted
+ * in an appropriate ordering of items within each subset.
+ * XXX This mechanism should be superseded by tracking dependencies on ACLs
+ * properly; but we'll still need it for old dump files even after that.
+ */
+typedef enum
+{
+	RESTORE_PASS_MAIN = 0,		/* Main pass (most TOC item types) */
+	RESTORE_PASS_ACL,			/* ACL item types */
+	RESTORE_PASS_REFRESH		/* Matview REFRESH items */
+
+#define RESTORE_PASS_LAST RESTORE_PASS_REFRESH
+} RestorePass;
+
 typedef enum
 {
 	REQ_SCHEMA = 0x01,			/* want schema */
@@ -212,7 +233,7 @@ typedef enum
 	REQ_SPECIAL = 0x04			/* for special TOC entries */
 } teReqs;
 
-typedef struct _archiveHandle
+struct _archiveHandle
 {
 	Archive		public;			/* Public part of archive */
 	char		vmaj;			/* Version of file */
@@ -286,10 +307,13 @@ typedef struct _archiveHandle
 
 	/* Stuff for direct DB connection */
 	char	   *archdbname;		/* DB name *read* from archive */
-	enum trivalue promptPassword;
+	trivalue	promptPassword;
 	char	   *savedPassword;	/* password for ropt->username, if known */
 	char	   *use_role;
 	PGconn	   *connection;
+	/* If connCancel isn't NULL, SIGINT handler will send a cancel */
+	PGcancel   *volatile connCancel;
+
 	int			connectToDB;	/* Flag to indicate if direct DB connection is
 								 * required */
 	ArchiverOutput outputKind;	/* Flag for what we're currently writing */
@@ -302,7 +326,6 @@ typedef struct _archiveHandle
 	char	   *fSpec;			/* Archive File Spec */
 	FILE	   *FH;				/* General purpose file handle */
 	void	   *OF;
-
 	int			gzOut;			/* Output file */
 
 	struct _tocEntry *toc;		/* Header of circular list of TOC entries */
@@ -321,9 +344,6 @@ typedef struct _archiveHandle
 	ArchiveMode mode;			/* File mode - r or w */
 	void	   *formatData;		/* Header data specific to file format */
 
-	RestoreOptions *ropt;		/* Used to check restore options in ahwrite
-								 * etc */
-
 	/* these vars track state to avoid sending redundant SET commands */
 	char	   *currUser;		/* current username, or NULL if unknown */
 	char	   *currSchema;		/* current schema, or NULL */
@@ -337,13 +357,12 @@ typedef struct _archiveHandle
 	int			noTocComments;
 	ArchiverStage stage;
 	ArchiverStage lastErrorStage;
+	RestorePass restorePass;	/* used only during parallel restore */
 	struct _tocEntry *currentTE;
 	struct _tocEntry *lastErrorTE;
+};
 
-	DieFuncPtr dieFuncPtr;      /* Called upon die to report the status */
-} ArchiveHandle;
-
-typedef struct _tocEntry
+struct _tocEntry
 {
 	struct _tocEntry *prev;
 	struct _tocEntry *next;
@@ -381,15 +400,13 @@ typedef struct _tocEntry
 	int			nRevDeps;		/* number of such dependencies */
 	DumpId	   *lockDeps;		/* dumpIds of objects this one needs lock on */
 	int			nLockDeps;		/* number of such dependencies */
-} TocEntry;
+};
 
 extern int	parallel_restore(struct ParallelArgs *args);
 extern void on_exit_close_archive(Archive *AHX);
 
-extern void warn_or_exit_horribly(ArchiveHandle *AH, const char *modulename, const char *fmt,...) __attribute__((format(PG_PRINTF_ATTRIBUTE, 3, 4)));
+extern void warn_or_exit_horribly(ArchiveHandle *AH, const char *modulename, const char *fmt,...) pg_attribute_printf(3, 4);
 
-extern void WriteTOC(ArchiveHandle *AH);
-extern void ReadTOC(ArchiveHandle *AH);
 extern void WriteHead(ArchiveHandle *AH);
 extern void ReadHead(ArchiveHandle *AH);
 extern void WriteToc(ArchiveHandle *AH);
@@ -437,8 +454,8 @@ extern int	ReconnectToServer(ArchiveHandle *AH, const char *dbname, const char *
 extern void DropBlobIfExists(ArchiveHandle *AH, Oid oid);
 
 void		ahwrite(const void *ptr, size_t size, size_t nmemb, ArchiveHandle *AH);
-int			ahprintf(ArchiveHandle *AH, const char *fmt,...) __attribute__((format(PG_PRINTF_ATTRIBUTE, 2, 3)));
+int			ahprintf(ArchiveHandle *AH, const char *fmt,...) pg_attribute_printf(2, 3);
 
-void		ahlog(ArchiveHandle *AH, int level, const char *fmt,...) __attribute__((format(PG_PRINTF_ATTRIBUTE, 3, 4)));
+void		ahlog(ArchiveHandle *AH, int level, const char *fmt,...) pg_attribute_printf(3, 4);
 
 #endif

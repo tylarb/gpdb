@@ -3,7 +3,7 @@
  * ts_type.h
  *	  Definitions for the tsvector and tsquery types
  *
- * Copyright (c) 1998-2014, PostgreSQL Global Development Group
+ * Copyright (c) 1998-2016, PostgreSQL Global Development Group
  *
  * src/include/tsearch/ts_type.h
  *
@@ -14,7 +14,6 @@
 
 #include "fmgr.h"
 #include "utils/memutils.h"
-#include "utils/pg_crc.h"
 
 
 /*
@@ -50,6 +49,8 @@ typedef struct
 #define MAXSTRLEN ( (1<<11) - 1)
 #define MAXSTRPOS ( (1<<20) - 1)
 
+extern int	compareWordEntryPos(const void *a, const void *b);
+
 /*
  * Equivalent to
  * typedef struct {
@@ -64,8 +65,15 @@ typedef uint16 WordEntryPos;
 typedef struct
 {
 	uint16		npos;
-	WordEntryPos pos[1];		/* variable length */
+	WordEntryPos pos[FLEXIBLE_ARRAY_MEMBER];
 } WordEntryPosVector;
+
+/* WordEntryPosVector with exactly 1 entry */
+typedef struct
+{
+	uint16		npos;
+	WordEntryPos pos[1];
+} WordEntryPosVector1;
 
 
 #define WEP_GETWEIGHT(x)	( (x) >> 14 )
@@ -83,7 +91,7 @@ typedef struct
 {
 	int32		vl_len_;		/* varlena header (do not touch directly!) */
 	int32		size;
-	WordEntry	entries[1];		/* variable length */
+	WordEntry	entries[FLEXIBLE_ARRAY_MEMBER];
 	/* lexemes follow the entries[] array */
 } TSVectorData;
 
@@ -135,7 +143,14 @@ extern Datum tsvector_cmp(PG_FUNCTION_ARGS);
 extern Datum tsvector_length(PG_FUNCTION_ARGS);
 extern Datum tsvector_strip(PG_FUNCTION_ARGS);
 extern Datum tsvector_setweight(PG_FUNCTION_ARGS);
+extern Datum tsvector_setweight_by_filter(PG_FUNCTION_ARGS);
 extern Datum tsvector_concat(PG_FUNCTION_ARGS);
+extern Datum tsvector_delete_str(PG_FUNCTION_ARGS);
+extern Datum tsvector_delete_arr(PG_FUNCTION_ARGS);
+extern Datum tsvector_unnest(PG_FUNCTION_ARGS);
+extern Datum tsvector_to_array(PG_FUNCTION_ARGS);
+extern Datum array_to_tsvector(PG_FUNCTION_ARGS);
+extern Datum tsvector_filter(PG_FUNCTION_ARGS);
 extern Datum tsvector_update_trigger_byid(PG_FUNCTION_ARGS);
 extern Datum tsvector_update_trigger_bycolumn(PG_FUNCTION_ARGS);
 
@@ -200,15 +215,27 @@ typedef struct
 } QueryOperand;
 
 
-/* Legal values for QueryOperator.operator */
-#define OP_NOT	1
-#define OP_AND	2
-#define OP_OR	3
+/*
+ * Legal values for QueryOperator.operator.
+ */
+#define OP_NOT			1
+#define OP_AND			2
+#define OP_OR			3
+#define OP_PHRASE		4		/* highest code, tsquery_cleanup.c */
+#define OP_COUNT		4
+
+extern const int tsearch_op_priority[OP_COUNT];
+
+/* get operation priority  by its code*/
+#define OP_PRIORITY(x)	( tsearch_op_priority[(x) - 1] )
+/* get QueryOperator priority */
+#define QO_PRIORITY(x)	OP_PRIORITY(((QueryOperator *) (x))->oper)
 
 typedef struct
 {
 	QueryItemType type;
 	int8		oper;			/* see above */
+	int16		distance;		/* distance between agrs for OP_PHRASE */
 	uint32		left;			/* pointer to left operand. Right operand is
 								 * item + 1, left operand is placed
 								 * item+item->left */
@@ -234,7 +261,7 @@ typedef struct
 {
 	int32		vl_len_;		/* varlena header (do not touch directly!) */
 	int32		size;			/* number of QueryItems */
-	char		data[1];		/* data starts here */
+	char		data[FLEXIBLE_ARRAY_MEMBER];	/* data starts here */
 } TSQueryData;
 
 typedef TSQueryData *TSQuery;
@@ -291,6 +318,8 @@ extern Datum tsquery_numnode(PG_FUNCTION_ARGS);
 
 extern Datum tsquery_and(PG_FUNCTION_ARGS);
 extern Datum tsquery_or(PG_FUNCTION_ARGS);
+extern Datum tsquery_phrase(PG_FUNCTION_ARGS);
+extern Datum tsquery_phrase_distance(PG_FUNCTION_ARGS);
 extern Datum tsquery_not(PG_FUNCTION_ARGS);
 
 extern Datum tsquery_rewrite(PG_FUNCTION_ARGS);

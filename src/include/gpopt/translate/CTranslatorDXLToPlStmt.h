@@ -125,7 +125,7 @@ namespace gpdxl
 			}; // SContextIndexVarAttno
 
 			// memory pool
-			IMemoryPool *m_mp;
+			CMemoryPool *m_mp;
 
 			// meta data accessor
 			CMDAccessor *m_md_accessor;
@@ -146,10 +146,7 @@ namespace gpdxl
 			// list of result relations range table indexes for DML statements,
 			// or NULL for select queries
 			List *m_result_rel_list;
-			
-			// external scan counter
-			ULONG m_external_scan_counter;
-			
+
 			// number of segments
 			ULONG m_num_of_segments;
 
@@ -165,7 +162,7 @@ namespace gpdxl
 
 		public:
 			// ctor
-			CTranslatorDXLToPlStmt(IMemoryPool *mp, CMDAccessor *md_accessor, CContextDXLToPlStmt *dxl_to_plstmt_context, ULONG num_of_segments);
+			CTranslatorDXLToPlStmt(CMemoryPool *mp, CMDAccessor *md_accessor, CContextDXLToPlStmt *dxl_to_plstmt_context, ULONG num_of_segments);
 
 			// dtor
 			~CTranslatorDXLToPlStmt();
@@ -179,7 +176,7 @@ namespace gpdxl
 				);
 
 			// main translation routine for DXL tree -> PlannedStmt
-			PlannedStmt *GetPlannedStmtFromDXL(const CDXLNode *dxlnode, bool can_set_tag);
+			PlannedStmt *GetPlannedStmtFromDXL(const CDXLNode *dxlnode, const Query *orig_query, bool can_set_tag);
 
 			// translate the join types from its DXL representation to the GPDB one
 			static JoinType GetGPDBJoinTypeFromDXLJoinType(EdxlJoinType join_type);
@@ -191,12 +188,6 @@ namespace gpdxl
 
 			// Set the bitmapset of a plan to the list of param_ids defined by the plan
 			void SetParamIds(Plan *);
-
-			// Set the qDispSliceId in the subplans defining an initplan
-			void SetInitPlanSliceInformation(SubPlan *);
-
-			// Set InitPlanVariable in PlannedStmt
-			void SetInitPlanVariables(PlannedStmt *);
 
 			// translate DXL table scan node into a SeqScan node
 			Plan *TranslateDXLTblScan
@@ -395,14 +386,6 @@ namespace gpdxl
 				CDXLTranslateContext *output_context,
 				CDXLTranslationContextArray *ctxt_translation_prev_siblings // translation contexts of previous siblings
 				);
-			
-			// translate a row trigger operator
-			Plan *TranslateDXLRowTrigger
-				(
-				const CDXLNode *row_trigger_dxlnode,
-				CDXLTranslateContext *output_context,
-				CDXLTranslationContextArray *ctxt_translation_prev_siblings // translation contexts of previous siblings
-				);
 
 			// translate an Assert operator
 			Plan *TranslateDXLAssert
@@ -418,9 +401,6 @@ namespace gpdxl
 				Plan *plan,
 				ULONG share_id
 				);
-
-			// retrieve the flow of the shared input scan of the cte consumers
-			Flow *GetFlowCTEConsumer(List *shared_scan_cte_consumer_list);
 
 			// translate a CTE producer into a GPDB share input scan
 			Plan *TranslateDXLCTEProducerToSharedScan
@@ -568,7 +548,7 @@ namespace gpdxl
 				const CDXLTableDescr *table_descr,
 				CDXLTranslateContextBaseTable *base_table_context,
 				CDXLTranslationContextArray *ctxt_translation_prev_siblings,
-				BitmapTableScan *bitmap_tbl_scan
+				BitmapHeapScan *bitmap_tbl_scan
 				);
 
 			// translate a bitmap bool op expression
@@ -580,7 +560,7 @@ namespace gpdxl
 				const CDXLTableDescr *table_descr,
 				CDXLTranslateContextBaseTable *base_table_context,
 				CDXLTranslationContextArray *ctxt_translation_prev_siblings,
-				BitmapTableScan *bitmap_tbl_scan
+				BitmapHeapScan *bitmap_tbl_scan
 				);
 			
 			// translate CDXLScalarBitmapIndexProbe into BitmapIndexScan or DynamicBitmapIndexScan
@@ -592,7 +572,7 @@ namespace gpdxl
 				const CDXLTableDescr *table_descr,
 				CDXLTranslateContextBaseTable *base_table_context,
 				CDXLTranslationContextArray *ctxt_translation_prev_siblings,
-				BitmapTableScan *bitmap_tbl_scan
+				BitmapHeapScan *bitmap_tbl_scan
 				);
 
 			void TranslateSortCols
@@ -620,13 +600,13 @@ namespace gpdxl
 			// check if the given operator is a DML operator on a distributed table
 			BOOL IsTgtTblDistributed(CDXLOperator *dxlop);
 
-			// add a target entry for the given colid to the given target list
-			ULONG AddTargetEntryForColId
+			// add a target entry for a junk column with given colid to the target list
+			void AddJunkTargetEntryForColId
 				(
 				List **target_list, 
 				CDXLTranslateContext *dxl_translate_ctxt, 
 				ULONG colid, 
-				BOOL is_resjunk
+				const char *resname
 				);
 			
 			// translate the index condition list in an Index scan
@@ -635,6 +615,7 @@ namespace gpdxl
 				CDXLNode *index_cond_list_dxlnode,
 				const CDXLTableDescr *dxl_tbl_descr,
 				BOOL is_index_only_scan,
+				BOOL is_bitmap_index_probe,
 				const IMDIndex *index,
 				const IMDRelation *md_rel,
 				CDXLTranslateContext *output_context,
@@ -679,7 +660,7 @@ namespace gpdxl
 			IntoClause *TranslateDXLPhyCtasToIntoClause(const CDXLPhysicalCTAS *dxlop);
 			
 			// translate the distribution policy for a DXL physical CTAS operator
-			GpPolicy *TranslateDXLPhyCtasToDistrPolicy(const CDXLPhysicalCTAS *dxlop);
+			GpPolicy *TranslateDXLPhyCtasToDistrPolicy(const CDXLPhysicalCTAS *dxlop, List *target_list);
 
 			// translate CTAS storage options
 			List *TranslateDXLCtasStorageOptions(CDXLCtasStorageOptions::CDXLCtasOptionArray *ctas_storage_options);

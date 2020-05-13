@@ -5,7 +5,7 @@
  *
  * Portions Copyright (c) 2005-2008, Greenplum inc
  * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -36,6 +36,7 @@ static void ExecMaterialExplainEnd(PlanState *planstate, struct StringInfoData *
 static void ExecChildRescan(MaterialState *node);
 static void DestroyTupleStore(MaterialState *node);
 
+static void ExecEagerFreeMaterial(MaterialState *node);
 
 /* ----------------------------------------------------------------
  *		ExecMaterial
@@ -86,24 +87,16 @@ ExecMaterial(MaterialState *node)
 		{
 			char rwfile_prefix[100];
 
-			if(ma->driver_slice != currentSliceId)
-			{
-				elog(LOG, "Material Exec on CrossSlice, current slice %d", currentSliceId);
-				return NULL;
-			}
-
 			shareinput_create_bufname_prefix(rwfile_prefix, sizeof(rwfile_prefix), ma->share_id);
 			elog(DEBUG1, "Material node creates shareinput rwfile %s", rwfile_prefix);
 
-			ts = ntuplestore_create_readerwriter(rwfile_prefix, PlanStateOperatorMemKB((PlanState *)node) * 1024, true);
+			ts = ntuplestore_create_readerwriter(rwfile_prefix, PlanStateOperatorMemKB((PlanState *)node) * 1024, true, true);
 			tsa = ntuplestore_create_accessor(ts, true);
 		}
 		else
 		{
 			/* Non-shared Materialize node */
-			workfile_set *work_set =  workfile_mgr_create_set(BUFFILE, false /* can_reuse */, &node->ss.ps);
-
-			ts = ntuplestore_create_workset(work_set, PlanStateOperatorMemKB((PlanState *) node) * 1024);
+			ts = ntuplestore_create(PlanStateOperatorMemKB((PlanState *) node) * 1024, "Materialize");
 			tsa = ntuplestore_create_accessor(ts, true /* isWriter */);
 		}
 
@@ -149,8 +142,6 @@ ExecMaterial(MaterialState *node)
 			ntuplestore_acc_put_tupleslot(tsa, outerslot);
 		}
 
-		CheckSendPlanStateGpmonPkt(&node->ss.ps);
-
 		if(forward)
 			ntuplestore_acc_seek_bof(tsa);
 		else
@@ -166,13 +157,7 @@ ExecMaterial(MaterialState *node)
 			 */
 			if (ma->share_type == SHARE_MATERIAL_XSLICE)
 			{
-				if (ma->driver_slice == currentSliceId)
-				{
-					ntuplestore_flush(ts);
-
-					node->share_lk_ctxt = shareinput_writer_notifyready(ma->share_id, ma->nsharer_xslice,
-							estate->es_plannedstmt->planGen);
-				}
+				ntuplestore_flush(ts);
 			}
 			return NULL;
 		}
@@ -220,7 +205,7 @@ ExecMaterial(MaterialState *node)
 		if (TupIsNull(outerslot))
 		{
 			node->eof_underlying = true;
-			if (!node->ss.ps.delayEagerFree)
+			if (!node->delayEagerFree)
 			{
 				ExecEagerFreeMaterial(node);
 			}
@@ -238,7 +223,7 @@ ExecMaterial(MaterialState *node)
 	}
 
 
-	if (!node->ss.ps.delayEagerFree)
+	if (!node->delayEagerFree)
 	{
 		ExecEagerFreeMaterial(node);
 	}
@@ -270,6 +255,19 @@ ExecInitMaterial(Material *node, EState *estate, int eflags)
 		eflags |= EXEC_FLAG_REWIND;
 
 	/*
+	 * If the Material node was inserted to protect the child node from rescanning, don't
+	 * eager free.
+	 *
+	 * XXX: The planner doesn't always set the flag for Material nodes that are put
+	 * directly on top of Motion nodes, so check for that, too. (Or is this for ORCA?)
+	 */
+	if (node->cdb_shield_child_from_rescans ||
+		IsA(outerPlan((Plan *) node), Motion))
+	{
+		eflags |= EXEC_FLAG_REWIND;
+	}
+
+	/*
 	 * We must have a tuplestore buffering the subplan output to do backward
 	 * scan or mark/restore.  We also prefer to materialize the subplan output
 	 * if we might be called on to rewind and replay it many times. However,
@@ -293,7 +291,6 @@ ExecInitMaterial(Material *node, EState *estate, int eflags)
 	matstate->ts_state = palloc0(sizeof(GenericTupStore));
 	matstate->ts_pos = NULL;
 	matstate->ts_markpos = NULL;
-	matstate->share_lk_ctxt = NULL;
 	matstate->ts_destroyed = false;
 
 	/*
@@ -315,7 +312,7 @@ ExecInitMaterial(Material *node, EState *estate, int eflags)
 	 * If eflag contains EXEC_FLAG_REWIND or EXEC_FLAG_BACKWARD or EXEC_FLAG_MARK,
 	 * then this node is not eager free safe.
 	 */
-	matstate->ss.ps.delayEagerFree =
+	matstate->delayEagerFree =
 		((eflags & (EXEC_FLAG_REWIND | EXEC_FLAG_BACKWARD | EXEC_FLAG_MARK)) != 0);
 
 	/*
@@ -345,18 +342,9 @@ ExecInitMaterial(Material *node, EState *estate, int eflags)
 	 * index into range table, while the material may refer to the same relation as "outer" varno)
 	 * [JIRA: MPP-25365]
 	 */
-	insist_log(list_length(node->plan.targetlist) == list_length(outerPlan->targetlist),
-			"Material operator does not support projection");
+	if (list_length(node->plan.targetlist) != list_length(outerPlan->targetlist))
+		elog(ERROR, "Material operator does not support projection");
 	outerPlanState(matstate) = ExecInitNode(outerPlan, estate, eflags);
-
-	/*
-	 * If the child node of a Material is a Motion, then this Material node is
-	 * not eager free safe.
-	 */
-	if (IsA(outerPlan((Plan *)node), Motion))
-	{
-		matstate->ss.ps.delayEagerFree = true;
-	}
 
 	/*
 	 * initialize tuple type.  no need to initialize projection info because
@@ -365,16 +353,6 @@ ExecInitMaterial(Material *node, EState *estate, int eflags)
 	ExecAssignResultTypeFromTL(&matstate->ss.ps);
 	ExecAssignScanTypeFromOuterPlan(&matstate->ss);
 	matstate->ss.ps.ps_ProjInfo = NULL;
-
-	/*
-	 * If share input, need to register with range table entry
-	 */
-	if (node->share_type != SHARE_NOTSHARED)
-	{
-		ShareNodeEntry *snEntry = ExecGetShareNodeEntry(estate, node->share_id, true);
-		snEntry->sharePlan = (Node *) node;
-		snEntry->shareState = (Node *) matstate;
-	}
 
 	return matstate;
 }
@@ -411,13 +389,7 @@ ExecEndMaterial(MaterialState *node)
 	 */
 	if (node->ts_state->matstore != NULL)
 	{
-		Material   *ma = (Material *) node->ss.ps.plan;
-		if (ma->share_type == SHARE_MATERIAL_XSLICE && node->share_lk_ctxt)
-		{
-			shareinput_writer_waitdone(node->share_lk_ctxt, ma->share_id, ma->nsharer_xslice);
-		}
 		Assert(node->ts_pos);
-
 		DestroyTupleStore(node);
 	}
 
@@ -425,7 +397,6 @@ ExecEndMaterial(MaterialState *node)
 	 * shut down the subplan
 	 */
 	ExecEndNode(outerPlanState(node));
-	EndPlanStateGpmonPkt(&node->ss.ps);
 }
 
 /* ----------------------------------------------------------------
@@ -548,6 +519,8 @@ ExecChildRescan(MaterialState *node)
 void
 ExecReScanMaterial(MaterialState *node)
 {
+	PlanState  *outerPlan = outerPlanState(node);
+
 	ExecClearTuple(node->ss.ps.ps_ResultTupleSlot);
 
 	if (node->eflags != 0)
@@ -579,12 +552,12 @@ ExecReScanMaterial(MaterialState *node)
 		 * Otherwise we can just rewind and rescan the stored output. The
 		 * state of the subnode does not change.
 		 */
-		if (node->ss.ps.lefttree->chgParam != NULL ||
+		if (outerPlan->chgParam != NULL ||
 			(node->eflags & EXEC_FLAG_REWIND) == 0)
 		{
 			DestroyTupleStore(node);
-			if (node->ss.ps.lefttree->chgParam == NULL)
-				ExecReScan(node->ss.ps.lefttree);
+			if (outerPlan->chgParam == NULL)
+				ExecReScan(outerPlan);
 		}
 		else
 		{
@@ -598,46 +571,35 @@ ExecReScanMaterial(MaterialState *node)
 	}
 }
 
-void
+static void
 ExecEagerFreeMaterial(MaterialState *node)
 {
-	Material   *ma = (Material *) node->ss.ps.plan;
-	EState	   *estate = node->ss.ps.state;
-
-	/*
-	 * If we still have potential readers assocated with this node,
-	 * we shouldn't free the tuplestore too early.  The eager-free message
-	 * doesn't know about upper ShareInputScan nodes, but those nodes
-	 * bumps up the reference count in their initializations and decrement
-	 * it in either EagerFree or ExecEnd.
-	 */
-	if (ma->share_type == SHARE_MATERIAL)
-	{
-		ShareNodeEntry	   *snEntry;
-
-		snEntry = ExecGetShareNodeEntry(estate, ma->share_id, false);
-
-		if (snEntry->refcount > 0)
-			return;
-	}
-
 	/*
 	 * Release tuplestore resources
 	 */
 	if (NULL != node->ts_state->matstore)
 	{
-		if (ma->share_type == SHARE_MATERIAL_XSLICE && node->share_lk_ctxt)
-		{
-			/*
-			 * MPP-22682: If this is a producer shared XSLICE, don't free up
-			 * the tuple store here. For XSLICE producers, that will wait for
-			 * consumers that haven't completed yet, which can cause deadlocks.
-			 * Wait until ExecEndMaterial to free it, which is safer.
-			 */
-			return;
-		}
 		Assert(node->ts_pos);
 
 		DestroyTupleStore(node);
+	}
+}
+
+void
+ExecSquelchMaterial(MaterialState *node)
+{
+	/*
+	 * If this Material is shielding the underlying nodes from rescanning (for
+	 * example, if there is a Motion node below), then keep the tuplestore.
+	 * Also, don't recurse to the subtree in that case, because we might need
+	 * to read more tuples from it after a ReScan. Most likely we have already
+	 * read all the tuples from the underlying node in that case, but it's
+	 * possible that ExecMaterial hasn't been called even once yet, and we
+	 * haven't created the tuplestore yet.
+	 */
+	if (!node->delayEagerFree)
+	{
+		ExecEagerFreeMaterial(node);
+		ExecSquelchNode(outerPlanState(node));
 	}
 }

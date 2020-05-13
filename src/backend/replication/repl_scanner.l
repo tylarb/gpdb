@@ -4,7 +4,7 @@
  * repl_scanner.l
  *	  a lexical scanner for the replication commands
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -89,12 +89,14 @@ EXCLUDE			{ return K_EXCLUDE; }
 PROGRESS			{ return K_PROGRESS; }
 MAX_RATE		{ return K_MAX_RATE; }
 WAL			{ return K_WAL; }
+TABLESPACE_MAP			{ return K_TABLESPACE_MAP; }
 TIMELINE			{ return K_TIMELINE; }
 START_REPLICATION	{ return K_START_REPLICATION; }
 CREATE_REPLICATION_SLOT		{ return K_CREATE_REPLICATION_SLOT; }
 DROP_REPLICATION_SLOT		{ return K_DROP_REPLICATION_SLOT; }
 TIMELINE_HISTORY	{ return K_TIMELINE_HISTORY; }
 PHYSICAL			{ return K_PHYSICAL; }
+RESERVE_WAL			{ return K_RESERVE_WAL; }
 LOGICAL				{ return K_LOGICAL; }
 SLOT				{ return K_SLOT; }
 
@@ -206,7 +208,7 @@ addlitchar(unsigned char ychar)
 	appendStringInfoChar(&litbuf, ychar);
 }
 
-void __attribute__((noreturn))
+void
 yyerror(const char *message)
 {
 	ereport(ERROR,
@@ -237,7 +239,7 @@ replication_scanner_init(const char *str)
 }
 
 void
-replication_scanner_finish()
+replication_scanner_finish(void)
 {
 	yy_delete_buffer(scanbufhandle);
 	scanbufhandle = NULL;

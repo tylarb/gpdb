@@ -5,7 +5,7 @@
  *	  along with the relation's initial contents.
  *
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/catalog/pg_class.h
@@ -67,6 +67,9 @@ CATALOG(pg_class,1259) BKI_BOOTSTRAP BKI_ROWTYPE_OID(83) BKI_SCHEMA_MACRO
 	bool		relhasrules;	/* has (or has had) any rules */
 	bool		relhastriggers; /* has (or has had) any TRIGGERs */
 	bool		relhassubclass; /* has (or has had) derived classes */
+	bool		relrowsecurity; /* row security is enabled or not */
+	bool		relforcerowsecurity;	/* row security forced for owners or
+										 * not */
 	bool		relispopulated; /* matview currently holds query results */
 	char		relreplident;	/* see REPLICA_IDENTITY_xxx constants  */
 	TransactionId relfrozenxid; /* all Xids < this are frozen in this rel */
@@ -104,7 +107,7 @@ typedef FormData_pg_class *Form_pg_class;
  * ----------------
  */
 
-#define Natts_pg_class					30
+#define Natts_pg_class					32
 #define Anum_pg_class_relname			1
 #define Anum_pg_class_relnamespace		2
 #define Anum_pg_class_reltype			3
@@ -130,12 +133,14 @@ GPDB_COLUMN_DEFAULT(relstorage, h);
 #define Anum_pg_class_relhasrules		22
 #define Anum_pg_class_relhastriggers	23
 #define Anum_pg_class_relhassubclass	24
-#define Anum_pg_class_relispopulated	25
-#define Anum_pg_class_relreplident		26
-#define Anum_pg_class_relfrozenxid		27
-#define Anum_pg_class_relminmxid		28
-#define Anum_pg_class_relacl			29
-#define Anum_pg_class_reloptions		30
+#define Anum_pg_class_relrowsecurity	25
+#define Anum_pg_class_relforcerowsecurity	26
+#define Anum_pg_class_relispopulated	27
+#define Anum_pg_class_relreplident		28
+#define Anum_pg_class_relfrozenxid		29
+#define Anum_pg_class_relminmxid		30
+#define Anum_pg_class_relacl			31
+#define Anum_pg_class_reloptions		32
 
 /* ----------------
  *		initial contents of pg_class
@@ -150,13 +155,13 @@ GPDB_COLUMN_DEFAULT(relstorage, h);
  * Note: "3" in the relfrozenxid column stands for FirstNormalTransactionId;
  * similarly, "1" in relminmxid stands for FirstMultiXactId
  */
-DATA(insert OID = 1247 (  pg_type		PGNSP 71 0 PGUID 0 0 0 0 0 0 0 f f p r 30 0 t f f f f t n 3 1 _null_ _null_ ));
+DATA(insert OID = 1247 (  pg_type		PGNSP 71 0 PGUID 0 0 0 0 0 0 0 f f p r 30 0 t f f f f f f t n 3 1 _null_ _null_ ));
 DESCR("");
-DATA(insert OID = 1249 (  pg_attribute	PGNSP 75 0 PGUID 0 0 0 0 0 0 0 f f p r 21 0 f f f f f t n 3 1 _null_ _null_ ));
+DATA(insert OID = 1249 (  pg_attribute	PGNSP 75 0 PGUID 0 0 0 0 0 0 0 f f p r 21 0 f f f f f f f t n 3 1 _null_ _null_ ));
 DESCR("");
-DATA(insert OID = 1255 (  pg_proc		PGNSP 81 0 PGUID 0 0 0 0 0 0 0 f f p r 29 0 t f f f f t n 3 1 _null_ _null_ ));
+DATA(insert OID = 1255 (  pg_proc		PGNSP 81 0 PGUID 0 0 0 0 0 0 0 f f p r 31 0 t f f f f f f t n 3 1 _null_ _null_ ));
 DESCR("");
-DATA(insert OID = 1259 (  pg_class		PGNSP 83 0 PGUID 0 0 0 0 0 0 0 f f p r 30 0 t f f f f t n 3 1 _null_ _null_ ));
+DATA(insert OID = 1259 (  pg_class		PGNSP 83 0 PGUID 0 0 0 0 0 0 0 f f p r 32 0 t f f f f f f t n 3 1 _null_ _null_ ));
 DESCR("");
 
 
@@ -172,10 +177,6 @@ DESCR("");
 #define		  RELKIND_AOSEGMENTS	  'o'		/* AO segment files and eof's */
 #define		  RELKIND_AOBLOCKDIR	  'b'		/* AO block directory */
 #define		  RELKIND_AOVISIMAP		  'M'		/* AO visibility map */
-// GPDB_93_MERGE_FIXME: RELKIND_AOVISIMAP used to be 'm', but that means MATVIEW now.
-// Find all the places where it might be referred to using just 'm', without using this
-// macro. E.g. pg_dump and psql. They might need to also work differently depending
-// on version.
 
 #define		  RELPERSISTENCE_PERMANENT	'p'		/* regular table */
 #define		  RELPERSISTENCE_UNLOGGED	'u'		/* unlogged permanent table */
@@ -185,7 +186,7 @@ DESCR("");
 #define		  REPLICA_IDENTITY_DEFAULT	'd'
 /* no replica identity is logged for this relation */
 #define		  REPLICA_IDENTITY_NOTHING	'n'
-/* all columns are loged as replica identity */
+/* all columns are logged as replica identity */
 #define		  REPLICA_IDENTITY_FULL		'f'
 /*
  * an explicitly chosen candidate key's columns are used as identity;
@@ -200,20 +201,18 @@ DESCR("");
  * RELSTORAGE_HEAP    - stored on disk using heap storage.
  * RELSTORAGE_AOROWS  - stored on disk using append only storage.
  * RELSTORAGE_AOCOLS  - stored on dist using append only column storage.
- * RELSTORAGE_PARQUET - nested data structures in a flat columnar format,
- * 						stored in any Hadoop ecosystem like Hive, Impala, Pig, and Spark.
  * RELSTORAGE_VIRTUAL - has virtual storage, meaning, relation has no
  *						data directly stored forit  (right now this
  *						relates to views and comp types).
- * RELSTORAGE_EXTERNAL-	stored externally using external tables.
  * RELSTORAGE_FOREIGN - stored in another server.  
+ *
+ * GPDB 6.x and below used RELSTORAGE_EXTERNAL ('x') for external tables.
+ * Now they look like foreign tables.
  */
 #define		  RELSTORAGE_HEAP	'h'
 #define		  RELSTORAGE_AOROWS	'a'
 #define 	  RELSTORAGE_AOCOLS	'c'
-#define		  RELSTORAGE_PARQUET 'p'
 #define		  RELSTORAGE_VIRTUAL	'v'
-#define		  RELSTORAGE_EXTERNAL 'x'
 #define		  RELSTORAGE_FOREIGN 'f'
 
 static inline bool relstorage_is_heap(char c)
@@ -224,16 +223,6 @@ static inline bool relstorage_is_heap(char c)
 static inline bool relstorage_is_ao(char c)
 {
 	return (c == RELSTORAGE_AOROWS || c == RELSTORAGE_AOCOLS);
-}
-
-static inline bool relstorage_is_external(char c)
-{
-	return (c == RELSTORAGE_EXTERNAL);
-}
-
-static inline bool relstorage_is_foreign(char c)
-{
-	return (c == RELSTORAGE_FOREIGN);
 }
 
 #endif   /* PG_CLASS_H */

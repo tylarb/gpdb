@@ -12,7 +12,7 @@
  *	  This information is needed by routines manipulating tuples
  *	  (getattribute, formtuple, etc.).
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -70,14 +70,7 @@
  *		- ExecSeqScan() calls ExecStoreTuple() to take the result
  *		  tuple from ExecProject() and place it into the result tuple slot.
  *
- *		- ExecutePlan() calls ExecSelect(), which passes the result slot
- *		  to printtup(), which uses slot_getallattrs() to extract the
- *		  individual Datums for printing.
- *
- *		At ExecutorEnd()
- *		----------------
- *		- EndPlan() calls ExecResetTupleTable() to clean up any remaining
- *		  tuples left over from executing the query.
+ *		- ExecutePlan() calls the output function.
  *
  *		The important thing to watch in the executor code is how pointers
  *		to the slots containing tuples are passed instead of the tuples
@@ -102,6 +95,7 @@
 #include "utils/lsyscache.h"
 #include "utils/typcache.h"
 
+#include "executor/execDynamicScan.h"
 #include "cdb/cdbvars.h"                    /* GpIdentity.segindex */
 
 static TupleDesc ExecTypeFromTLInternal(List *targetList,
@@ -632,51 +626,83 @@ ExecCopySlotMemTuple(TupleTableSlot *slot)
 	 * tts_mintuple since that's a tad cheaper.
 	 */
 	if (slot->PRIVATE_tts_memtuple)
-		return memtuple_copy_to(slot->PRIVATE_tts_memtuple, NULL, NULL);
+		return memtuple_copy(slot->PRIVATE_tts_memtuple);
 	
 	slot_getallattrs(slot);
 
 	/*
 	 * Otherwise we need to build a tuple from the Datum array.
 	 */
-	return memtuple_form_to(slot->tts_mt_bind, slot_get_values(slot), slot_get_isnull(slot), NULL, 0, false);
+	return memtuple_form(slot->tts_mt_bind, slot_get_values(slot), slot_get_isnull(slot));
 }
 
+/*
+ * Copy the tuple in 'slot' as a MemTuple, to a pre-allocated buffer.
+ *
+ * On entry, *destlen must be set to the size of the buffer. If the tuple doesn't
+ * fit and 'pctxt' is valid, a new buffer is allocated in that context. If it doesn't
+ * fit, and 'pctxt' is NULL, the function returns NULL.
+ *
+ * In all cases, *destlen is updated with the actual size of the tuple.
+ */
 MemTuple
-ExecCopySlotMemTupleTo(TupleTableSlot *slot, MemoryContext pctxt, char *dest, unsigned int *len)
+ExecCopySlotMemTupleTo(TupleTableSlot *slot, MemoryContext pctxt, char *dest, unsigned int *destlen)
 {
-	uint32 dumlen;
-	MemTuple mtup = NULL;
+	uint32		len;
+	uint32		null_save_len;
+	bool		has_nulls;
+	MemTuple	mtup;
 
+	Assert(destlen);
 	Assert(!TupIsNull(slot));
 	Assert(slot->tts_mt_bind);
 
-	if(!len)
-		len = &dumlen;
-	
 	if (TupHasMemTuple(slot))
 	{
-		mtup = memtuple_copy_to(slot->PRIVATE_tts_memtuple, (MemTuple) dest, len);
-		if(mtup || !pctxt)
-			return mtup;
+		len = memtuple_get_size(slot->PRIVATE_tts_memtuple);
 
-		mtup = (MemTuple) MemoryContextAlloc(pctxt, *len);
-		mtup = memtuple_copy_to(slot->PRIVATE_tts_memtuple, mtup, len);
-		Assert(mtup);
+		if (len > *destlen)
+		{
+			if (pctxt == NULL)
+			{
+				*destlen = len;
+				return NULL;
+			}
+			mtup = MemoryContextAlloc(pctxt, len);
+		}
+		else
+			mtup = (MemTuple) dest;
 
+		memcpy((char *) mtup, (char *) slot->PRIVATE_tts_memtuple, len);
+		*destlen = len;
 		return mtup;
 	}
+	else
+	{
 
-	slot_getallattrs(slot);
-	mtup = memtuple_form_to(slot->tts_mt_bind, slot_get_values(slot), slot_get_isnull(slot), (MemTuple) dest, len, false);
+		slot_getallattrs(slot);
 
-	if(mtup || !pctxt)
+		len = compute_memtuple_size(slot->tts_mt_bind, slot_get_values(slot), slot_get_isnull(slot),
+									&null_save_len, &has_nulls);
+
+		if (len > *destlen)
+		{
+			if (pctxt == NULL)
+			{
+				*destlen = len;
+				return NULL;
+			}
+			mtup = MemoryContextAlloc(pctxt, len);
+		}
+		else
+			mtup = (MemTuple) dest;
+
+		memtuple_form_to(slot->tts_mt_bind, slot_get_values(slot), slot_get_isnull(slot),
+						 len, null_save_len, has_nulls,
+						 mtup);
+		*destlen = len;
 		return mtup;
-	mtup = (MemTuple) MemoryContextAlloc(pctxt, *len);
-	mtup = memtuple_form_to(slot->tts_mt_bind, slot_get_values(slot), slot_get_isnull(slot), mtup, len, false);
-
-	Assert(mtup);
-	return mtup;
+	}
 }
 		
 /* --------------------------------
@@ -728,50 +754,37 @@ ExecFetchSlotHeapTuple(TupleTableSlot *slot)
  * --------------------------------
  */
 MemTuple
-ExecFetchSlotMemTuple(TupleTableSlot *slot, bool inline_toast)
+ExecFetchSlotMemTuple(TupleTableSlot *slot)
 {
-	MemTuple newTuple;
-	MemTuple oldTuple = NULL;
-	uint32 tuplen;
+	uint32		tuplen;
+	uint32		null_save_len;
+	bool		has_nulls;
 
 	Assert(!TupIsNull(slot));
 	Assert(slot->tts_mt_bind);
 
 	if(slot->PRIVATE_tts_memtuple)
-	{
-		if(!inline_toast || !memtuple_get_hasext(slot->PRIVATE_tts_memtuple))
-			return slot->PRIVATE_tts_memtuple;
-
-		oldTuple = slot->PRIVATE_tts_mtup_buf;
-		slot->PRIVATE_tts_mtup_buf = NULL;
-		slot->PRIVATE_tts_mtup_buf_len = 0;
-	}
+		return slot->PRIVATE_tts_memtuple;
 
 	slot_getallattrs(slot);
 
-	tuplen = slot->PRIVATE_tts_mtup_buf_len;
-	newTuple = memtuple_form_to(slot->tts_mt_bind, slot_get_values(slot), slot_get_isnull(slot),
-			(MemTuple) slot->PRIVATE_tts_mtup_buf, &tuplen, inline_toast);
+	tuplen = compute_memtuple_size(slot->tts_mt_bind, slot_get_values(slot), slot_get_isnull(slot),
+								   &null_save_len, &has_nulls);
 
-	if(!newTuple)
+	if (!slot->PRIVATE_tts_mtup_buf || tuplen > slot->PRIVATE_tts_mtup_buf_len)
 	{
-		if(slot->PRIVATE_tts_mtup_buf)
+		if (slot->PRIVATE_tts_mtup_buf)
 			pfree(slot->PRIVATE_tts_mtup_buf);
 
 		slot->PRIVATE_tts_mtup_buf = MemoryContextAlloc(slot->tts_mcxt, tuplen);
 		slot->PRIVATE_tts_mtup_buf_len = tuplen;
-
-		newTuple = memtuple_form_to(slot->tts_mt_bind, slot_get_values(slot), slot_get_isnull(slot),
-			(MemTuple) slot->PRIVATE_tts_mtup_buf, &tuplen, inline_toast);
 	}
+	memtuple_form_to(slot->tts_mt_bind, slot_get_values(slot), slot_get_isnull(slot),
+					 tuplen, null_save_len, has_nulls,
+					 (MemTuple) slot->PRIVATE_tts_mtup_buf);
+	slot->PRIVATE_tts_memtuple = (MemTuple) slot->PRIVATE_tts_mtup_buf;
 
-	Assert(newTuple);
-	slot->PRIVATE_tts_memtuple = newTuple;
-
-	if(oldTuple)
-		pfree(oldTuple);
-
-	return newTuple;
+	return (MemTuple) slot->PRIVATE_tts_mtup_buf;
 }
 
 /* --------------------------------
@@ -785,6 +798,9 @@ ExecFetchSlotMemTuple(TupleTableSlot *slot, bool inline_toast)
  *		for being stored on disk.  The original data may or may not be
  *		virtual, but in any case we need a private copy for heap_insert
  *		to scribble on.
+ *
+ *		Greenplum: this function is quite different from upstream because
+ *		the TupleTableSlot, HeapTuple and Memory/Minimal tuple differ.
  * --------------------------------
  */
 HeapTuple
@@ -792,6 +808,7 @@ ExecMaterializeSlot(TupleTableSlot *slot)
 {
 	uint32		tuplen;
 	HeapTuple	htup;
+	void	   *htup_buf;
 
 	/*
 	 * sanity checks
@@ -800,23 +817,54 @@ ExecMaterializeSlot(TupleTableSlot *slot)
 
 	/*
 	 * If we have a regular physical tuple, and it's locally palloc'd, we have
-	 * nothing to do.
+	 * nothing to do, else make a copy.
+	 *
+	 * Don't transform the heaptuple if possible, transforming heaptuples to
+	 * other types will lose the system columns and waste computing resources.
 	 */
-	if (slot->PRIVATE_tts_heaptuple &&
-		(TupShouldFree(slot) || slot->PRIVATE_tts_heaptuple == slot->PRIVATE_tts_htup_buf))
-		return slot->PRIVATE_tts_heaptuple;
+	if (slot->PRIVATE_tts_heaptuple)
+	{
+		if (TupShouldFree(slot) || slot->PRIVATE_tts_heaptuple == slot->PRIVATE_tts_htup_buf)
+		{
+			return slot->PRIVATE_tts_heaptuple;
+		}
+		else
+		{
+			htup_buf = slot->PRIVATE_tts_htup_buf;
+			tuplen = HEAPTUPLESIZE + slot->PRIVATE_tts_heaptuple->t_len;
+
+			slot->PRIVATE_tts_htup_buf = (HeapTuple) MemoryContextAlloc(slot->tts_mcxt, tuplen);
+
+			htup = heaptuple_copy_to(slot->PRIVATE_tts_heaptuple, slot->PRIVATE_tts_htup_buf, &tuplen);
+			Assert(htup);
+
+			if (htup_buf)
+				pfree(htup_buf);
+
+			slot->PRIVATE_tts_heaptuple = htup;
+			slot->PRIVATE_tts_nvalid = 0;
+			return htup;
+		}
+	}
 
 	/*
 	 * Otherwise, copy or build a physical tuple, and store it into the slot.
+	 */
+
+	/*
+	 * Transform any tuple to a virtual tuple, system columns would be lost
+	 * here since virtual tuples have no system columns.
 	 */
 	slot_getallattrs(slot);
 
 	Assert(slot->PRIVATE_tts_nvalid == slot->tts_tupleDescriptor->natts);
 
+	/* Form a heaptuple from the virtual tuple */
 	tuplen = slot->PRIVATE_tts_htup_buf_len;
 	htup = heaptuple_form_to(slot->tts_tupleDescriptor, slot_get_values(slot), slot_get_isnull(slot),
 			slot->PRIVATE_tts_htup_buf, &tuplen);
 
+	/* The buf space is not large enough */
 	if (!htup)
 	{
 		/* enlarge the buffer and retry */
@@ -834,6 +882,14 @@ ExecMaterializeSlot(TupleTableSlot *slot)
 	}
 
 	slot->PRIVATE_tts_heaptuple = htup;
+
+	/*
+	 * Mark extracted state invalid.  This is important because the slot is
+	 * not supposed to depend any more on the previous external data; we
+	 * mustn't leave any dangling pass-by-reference datums in PRIVATE_tts_values.
+	 */
+	slot->PRIVATE_tts_nvalid = 0;
+
 	return htup;
 }
 
@@ -897,70 +953,6 @@ ExecCopySlot(TupleTableSlot *dstslot, TupleTableSlot *srcslot)
 	return dstslot;
 }
 
-/* XXX
- * This function is not very efficient.  We should detech if we can modify
- * the memtuple inline so no deform/form is needed
- */
-void ExecModifyMemTuple(TupleTableSlot *slot, Datum *values, bool *isnull, bool *doRepl)
-{
-	int i;
-	MemTuple mtup;
-	uint32 tuplen;
-	Assert(slot->PRIVATE_tts_memtuple);
-
-	/* First, get all the attrs.  Note we set PRIVATE_tts_nvalid to 0
-	 * so we force the attrs are from memtuple
-	 */
-	slot->PRIVATE_tts_nvalid = 0;
-	slot_getallattrs(slot);
-	
-	/* Next, we construct a new memtuple, on the htup buf to avoid palloc */
-	slot->PRIVATE_tts_heaptuple = NULL;
-	for(i = 0; i<slot->tts_tupleDescriptor->natts; ++i)
-	{
-		if(doRepl[i])
-		{
-			slot->PRIVATE_tts_values[i] = values[i];
-			slot->PRIVATE_tts_isnull[i] = isnull[i];
-		}
-	}
-
-	tuplen = slot->PRIVATE_tts_htup_buf_len;
-	mtup = memtuple_form_to(slot->tts_mt_bind, slot->PRIVATE_tts_values, slot->PRIVATE_tts_isnull,
-			slot->PRIVATE_tts_htup_buf, &tuplen, false);
-	if(!mtup)
-	{
-		slot->PRIVATE_tts_htup_buf = MemoryContextAlloc(slot->tts_mcxt, tuplen);
-		slot->PRIVATE_tts_htup_buf_len = tuplen;
-
-		mtup = memtuple_form_to(slot->tts_mt_bind, slot->PRIVATE_tts_values, slot->PRIVATE_tts_isnull,
-			slot->PRIVATE_tts_htup_buf, &tuplen, false);
-
-		Assert(mtup);
-	}
-
-	/* Check if we need to free this mem tuple */
-	if(TupShouldFree(slot)
-			&& slot->PRIVATE_tts_memtuple
-			&& slot->PRIVATE_tts_memtuple != slot->PRIVATE_tts_mtup_buf
-	  )
-		pfree(slot->PRIVATE_tts_memtuple);
-
-	slot->PRIVATE_tts_memtuple = mtup;
-	/* swap mtup_buf and htup_buf stuff */
-
-	mtup = (MemTuple) slot->PRIVATE_tts_mtup_buf;
-	tuplen = slot->PRIVATE_tts_mtup_buf_len;
-
-	slot->PRIVATE_tts_mtup_buf = slot->PRIVATE_tts_htup_buf;
-	slot->PRIVATE_tts_mtup_buf_len = slot->PRIVATE_tts_htup_buf_len;
-	slot->PRIVATE_tts_htup_buf = (void *) mtup;
-	slot->PRIVATE_tts_htup_buf_len = tuplen;
-
-	/* don't forget to reset PRIVATE_tts_nvalid, because we modified the memtuple */
-	slot->PRIVATE_tts_nvalid = 0;
-}
-
 
 /* ----------------------------------------------------------------
  *				convenience initialization routines
@@ -1019,7 +1011,10 @@ ExecInitScanTupleSlot(EState *estate, ScanState *scanstate)
     {
         case RTE_RELATION:
             /* Set 'tableoid' sysattr to the Oid of baserel's pg_class row. */
-            slot->tts_tableOid = rtentry->relid;
+			if (isDynamicScan(&scan->plan))
+				slot->tts_tableOid = DynamicScan_GetTableOid(scanstate);
+			else
+				slot->tts_tableOid = rtentry->relid;
             break;
 
         default:
@@ -1123,28 +1118,25 @@ ExecTypeFromTLInternal(List *targetList, bool hasoid, bool skipjunk)
 /*
  * ExecTypeFromExprList - build a tuple descriptor from a list of Exprs
  *
- * Caller must also supply a list of field names (String nodes).
+ * This is roughly like ExecTypeFromTL, but we work from bare expressions
+ * not TargetEntrys.  No names are attached to the tupledesc's columns.
  */
 TupleDesc
-ExecTypeFromExprList(List *exprList, List *namesList)
+ExecTypeFromExprList(List *exprList)
 {
 	TupleDesc	typeInfo;
-	ListCell   *le;
-	ListCell   *ln;
+	ListCell   *lc;
 	int			cur_resno = 1;
-
-	Assert(list_length(exprList) == list_length(namesList));
 
 	typeInfo = CreateTemplateTupleDesc(list_length(exprList), false);
 
-	forboth(le, exprList, ln, namesList)
+	foreach(lc, exprList)
 	{
-		Node	   *e = lfirst(le);
-		char	   *n = strVal(lfirst(ln));
+		Node	   *e = lfirst(lc);
 
 		TupleDescInitEntry(typeInfo,
 						   cur_resno,
-						   n,
+						   NULL,
 						   exprType(e),
 						   exprTypmod(e),
 						   0);
@@ -1155,6 +1147,54 @@ ExecTypeFromExprList(List *exprList, List *namesList)
 	}
 
 	return typeInfo;
+}
+
+/*
+ * ExecTypeSetColNames - set column names in a TupleDesc
+ *
+ * Column names must be provided as an alias list (list of String nodes).
+ *
+ * For some callers, the supplied tupdesc has a named rowtype (not RECORD)
+ * and it is moderately likely that the alias list matches the column names
+ * already present in the tupdesc.  If we do change any column names then
+ * we must reset the tupdesc's type to anonymous RECORD; but we avoid doing
+ * so if no names change.
+ */
+void
+ExecTypeSetColNames(TupleDesc typeInfo, List *namesList)
+{
+	bool		modified = false;
+	int			colno = 0;
+	ListCell   *lc;
+
+	foreach(lc, namesList)
+	{
+		char	   *cname = strVal(lfirst(lc));
+		Form_pg_attribute attr;
+
+		/* Guard against too-long names list */
+		if (colno >= typeInfo->natts)
+			break;
+		attr = typeInfo->attrs[colno++];
+
+		/* Ignore empty aliases (these must be for dropped columns) */
+		if (cname[0] == '\0')
+			continue;
+
+		/* Change tupdesc only if alias is actually different */
+		if (strcmp(cname, NameStr(attr->attname)) != 0)
+		{
+			namestrcpy(&(attr->attname), cname);
+			modified = true;
+		}
+	}
+
+	/* If we modified the tupdesc, it's now a new record type */
+	if (modified)
+	{
+		typeInfo->tdtypeid = RECORDOID;
+		typeInfo->tdtypmod = -1;
+	}
 }
 
 /*
@@ -1401,7 +1441,7 @@ do_tup_output(TupOutputState *tstate, Datum *values, bool *isnull)
 	ExecStoreVirtualTuple(slot);
 
 	/* send the tuple to the receiver */
-	(*tstate->dest->receiveSlot) (slot, tstate->dest);
+	(void) (*tstate->dest->receiveSlot) (slot, tstate->dest);
 
 	/* clean up */
 	ExecClearTuple(slot);
@@ -1413,33 +1453,32 @@ do_tup_output(TupOutputState *tstate, Datum *values, bool *isnull)
  * Should only be used with a single-TEXT-attribute tupdesc.
  */
 void
-do_text_output_multiline(TupOutputState *tstate, char *text)
+do_text_output_multiline(TupOutputState *tstate, const char *txt)
 {
 	Datum		values[1];
 	bool		isnull[1] = {false};
 
-	while (*text)
+	while (*txt)
 	{
-		char	   *eol;
+		const char *eol;
 		int			len;
 
-		eol = strchr(text, '\n');
+		eol = strchr(txt, '\n');
 		if (eol)
 		{
-			len = eol - text;
-
+			len = eol - txt;
 			eol++;
 		}
 		else
 		{
-			len = strlen(text);
-			eol += len;
+			len = strlen(txt);
+			eol = txt + len;
 		}
 
-		values[0] = PointerGetDatum(cstring_to_text_with_len(text, len));
+		values[0] = PointerGetDatum(cstring_to_text_with_len(txt, len));
 		do_tup_output(tstate, values, isnull);
 		pfree(DatumGetPointer(values[0]));
-		text = eol;
+		txt = eol;
 	}
 }
 
@@ -1455,12 +1494,14 @@ end_tup_output(TupOutputState *tstate)
 /*
  * Get a system attribute from the tuple table slot.
  */
-Datum
-slot_getsysattr(TupleTableSlot *slot, int attnum, bool *isnull)
+bool
+slot_getsysattr(TupleTableSlot *slot, int attnum, Datum *result, bool *isnull)
 {
-        Datum   result = 0;
-        Assert(!TupIsNull(slot));
+		Assert(attnum < 0);         /* else caller error */
+		if (TupIsNull(slot))
+			return false;
 
+		*result = 0;
         /* Currently, no sys attribute ever reads as NULL. */
         if (isnull)
                 *isnull = false;
@@ -1474,18 +1515,26 @@ slot_getsysattr(TupleTableSlot *slot, int attnum, bool *isnull)
                 switch(attnum)
                 {
                         case SelfItemPointerAttributeNumber:
-							Assert(ItemPointerIsValid(&(htup->t_self)));
+							/*
+							 * GPDB_95_MERGE_FIXME: Assert below doesn't hold
+							 * when querying with "FOR UPDATE" row-level locks
+							 * on a table whose inheritance hierarcy includes a
+							 * foreign table. Seen in contrib/file_fdw test.
+							 *
+							 * Assert(ItemPointerIsValid(&(htup->t_self)));
+							 */
+							Assert(PointerIsValid(&(htup->t_self)));
 							
-							result = PointerGetDatum(&(htup->t_self));
+							*result = PointerGetDatum(&(htup->t_self));
 							break;
                         case ObjectIdAttributeNumber:
-							result = ObjectIdGetDatum(HeapTupleGetOid(htup));
+							*result = ObjectIdGetDatum(HeapTupleGetOid(htup));
 							break;
                         case TableOidAttributeNumber:
-							result = ObjectIdGetDatum(slot->tts_tableOid);
+							*result = ObjectIdGetDatum(slot->tts_tableOid);
 							break;
                         default:
-							result = heap_getsysattr(htup, attnum, slot->tts_tupleDescriptor, isnull);
+							*result = heap_getsysattr(htup, attnum, slot->tts_tupleDescriptor, isnull);
 							break;
                 }
         }
@@ -1499,62 +1548,25 @@ slot_getsysattr(TupleTableSlot *slot, int attnum, bool *isnull)
                 {
                         case SelfItemPointerAttributeNumber:
 							Assert(ItemPointerIsValid(&(slot->PRIVATE_tts_synthetic_ctid)));
-							result = PointerGetDatum(&(slot->PRIVATE_tts_synthetic_ctid));
+							*result = PointerGetDatum(&(slot->PRIVATE_tts_synthetic_ctid));
 							break;
                         case ObjectIdAttributeNumber:
 							if(slot->PRIVATE_tts_memtuple)
-								result = ObjectIdGetDatum(MemTupleGetOid(slot->PRIVATE_tts_memtuple,
+								*result = ObjectIdGetDatum(MemTupleGetOid(slot->PRIVATE_tts_memtuple,
 																		 slot->tts_mt_bind));
 							else
-								result = ObjectIdGetDatum(InvalidOid);
+								*result = ObjectIdGetDatum(InvalidOid);
 							break;
                         case GpSegmentIdAttributeNumber:
-							result = Int32GetDatum(GpIdentity.segindex);
+							*result = Int32GetDatum(GpIdentity.segindex);
 							break;
                         case TableOidAttributeNumber:
-							result = ObjectIdGetDatum(slot->tts_tableOid);
+							*result = ObjectIdGetDatum(slot->tts_tableOid);
 							break;
                         default:
 							elog(ERROR, "Invalid attnum: %d", attnum);
                 }
         }
 
-        return result;
+        return true;
 }                               /* slot_getsysattr */
-
-/*
- * Set a synthetic ctid based on a fake ctid. Fake ctid is incremented before
- * the assignment.
- */
-void
-slot_set_ctid_from_fake(TupleTableSlot *slot, ItemPointerData *fake_ctid)
-{
-	/* Uninitialized */
-	if (!ItemPointerIsValid(fake_ctid))
-	{
-		ItemPointerSetBlockNumber(fake_ctid, 0);
-		ItemPointerSetOffsetNumber(fake_ctid, FirstOffsetNumber);
-	}
-	else
-	{
-		/* would we overflow? */
-		if (ItemPointerGetOffsetNumber(fake_ctid) ==
-			MaxOffsetNumber - 1)
-		{
-			/* How can we overflow 2^46? */
-			Assert(ItemPointerGetBlockNumber(fake_ctid) !=
-				   MaxBlockNumber - 1);
-			ItemPointerSetBlockNumber(fake_ctid,
-					ItemPointerGetBlockNumber(fake_ctid) + 1);
-			ItemPointerSetOffsetNumber(fake_ctid,
-					FirstOffsetNumber);
-		}
-		else
-		{
-			ItemPointerSetOffsetNumber(fake_ctid,
-				ItemPointerGetOffsetNumber(fake_ctid) + 1);
-		}
-	}
-
-	slot_set_ctid(slot, fake_ctid);
-}

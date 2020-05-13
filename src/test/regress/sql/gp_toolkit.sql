@@ -24,6 +24,9 @@ subpartition by range (n_regionkey) subpartition template (start('0') end('1') i
 partition p1 start('0') end('10') WITH (appendonly=true,checksum=true,compresslevel=9), partition p2 start('10') end('25') WITH (checksum=false,appendonly=true,compresslevel=7)
 );
 
+CREATE MATERIALIZED VIEW toolkit_matview AS SELECT * FROM toolkit_heap;
+CREATE MATERIALIZED VIEW toolkit_matview_nodata AS SELECT * FROM toolkit_heap WITH NO DATA;
+
 select count(iaotype),iaotype
 from gp_toolkit.__gp_is_append_only iao
 inner join pg_catalog.pg_class c on iao.iaooid = c.oid
@@ -137,6 +140,13 @@ select btdrelpages > 0 as btdrelpages_over_0,
        btdexppages < 10 as btdexppages_below_10
 from gp_toolkit.gp_bloat_expected_pages where btdrelid = 'toolkit_skew'::regclass;
 select * from gp_toolkit.gp_bloat_diag where bdirelid = 'toolkit_skew'::regclass;
+
+-- Test that gp_toolkit.gp_skew* functions works for the replicated table.
+create table toolkit_skew_rpt (i int, j int) distributed replicated;
+insert into toolkit_skew_rpt select i, i from generate_series(1, 100) i;
+select segid, segtupcount FROM gp_toolkit.gp_skew_details('toolkit_skew_rpt'::regclass);
+select skccoeff from gp_toolkit.gp_skew_coefficient('toolkit_skew_rpt'::regclass);
+select siffraction from gp_toolkit.gp_skew_idle_fraction('toolkit_skew_rpt'::regclass);
 
 -- Make sure gp_toolkit.gp_bloat_expected_pages does not report partition roots
 create table do_not_report_partition_root (i int, j int) distributed by (i)

@@ -19,7 +19,7 @@
  *
  * Portions Copyright (c) 2006-2008, Greenplum inc
  * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -37,13 +37,12 @@
 #include "access/sysattr.h"
 #include "catalog/pg_inherits_fn.h"
 #include "catalog/pg_type.h"
-#include "cdb/cdbpartition.h"
-#include "commands/tablecmds.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
 #include "optimizer/cost.h"
 #include "optimizer/pathnode.h"
+#include "optimizer/paths.h"
 #include "optimizer/planmain.h"
 #include "optimizer/planner.h"
 #include "optimizer/prep.h"
@@ -54,9 +53,11 @@
 #include "utils/rel.h"
 #include "utils/selfuncs.h"
 
-#include "cdb/cdbllize.h"                   /* pull_up_Flow() */
-#include "cdb/cdbvars.h"
+#include "cdb/cdbpartition.h"
+#include "cdb/cdbpath.h"
 #include "cdb/cdbsetop.h"
+#include "cdb/cdbvars.h"
+#include "commands/tablecmds.h"
 
 
 typedef struct
@@ -66,35 +67,33 @@ typedef struct
 	int			sublevels_up;
 } adjust_appendrel_attrs_context;
 
-static Plan *recurse_set_operations(Node *setOp, PlannerInfo *root,
-					   double tuple_fraction,
+static Path *recurse_set_operations(Node *setOp, PlannerInfo *root,
 					   List *colTypes, List *colCollations,
 					   bool junkOK,
 					   int flag, List *refnames_tlist,
-					   List **sortClauses, double *pNumGroups);
-static Plan *generate_recursion_plan(SetOperationStmt *setOp,
-						PlannerInfo *root, double tuple_fraction,
+					   List **pTargetList,
+					   double *pNumGroups);
+static Path *generate_recursion_path(SetOperationStmt *setOp,
+						PlannerInfo *root,
 						List *refnames_tlist,
-						List **sortClauses);
-static Plan *generate_union_plan(SetOperationStmt *op, PlannerInfo *root,
-					double tuple_fraction,
+						List **pTargetList);
+static Path *generate_union_path(SetOperationStmt *op, PlannerInfo *root,
 					List *refnames_tlist,
-					List **sortClauses, double *pNumGroups);
-static Plan *generate_nonunion_plan(SetOperationStmt *op, PlannerInfo *root,
-					   double tuple_fraction,
+					List **pTargetList,
+					double *pNumGroups);
+static Path *generate_nonunion_path(SetOperationStmt *op, PlannerInfo *root,
 					   List *refnames_tlist,
-					   List **sortClauses, double *pNumGroups);
+					   List **pTargetList,
+					   double *pNumGroups);
 static List *recurse_union_children(Node *setOp, PlannerInfo *root,
-					   double tuple_fraction,
 					   SetOperationStmt *top_union,
-					   List *refnames_tlist);
-static Plan *make_union_unique(SetOperationStmt *op, Plan *plan,
-				  PlannerInfo *root, double tuple_fraction,
-				  List **sortClauses);
+					   List *refnames_tlist,
+					   List **tlist_list);
+static Path *make_union_unique(SetOperationStmt *op, Path *path, List *tlist,
+				  PlannerInfo *root);
 static bool choose_hashed_setop(PlannerInfo *root, List *groupClauses,
-					Plan *input_plan,
+					Path *input_path,
 					double dNumGroups, double dNumOutputRows,
-					double tuple_fraction,
 					const char *construct);
 static List *generate_setop_tlist(List *colTypes, List *colCollations,
 					 int flag,
@@ -104,7 +103,7 @@ static List *generate_setop_tlist(List *colTypes, List *colCollations,
 					 List *refnames_tlist);
 static List *generate_append_tlist(List *colTypes, List *colCollations,
 					  bool flag,
-					  List *input_plans,
+					  List *input_tlists,
 					  List *refnames_tlist);
 static List *generate_setop_grouplist(SetOperationStmt *op, List *targetlist);
 static void expand_inherited_rtentry(PlannerInfo *root, RangeTblEntry *rte,
@@ -119,8 +118,7 @@ static Node *adjust_appendrel_attrs_mutator(Node *node,
 							   adjust_appendrel_attrs_context *context);
 static Relids adjust_relid_set(Relids relids, Index oldrelid, Index newrelid);
 static List *adjust_inherited_tlist(List *tlist,
-					   AppendRelInfo *apprelinfo);
-
+					   AppendRelInfo *context);
 
 /*
  * plan_set_operations
@@ -128,27 +126,24 @@ static List *adjust_inherited_tlist(List *tlist,
  *	  Plans the queries for a tree of set operations (UNION/INTERSECT/EXCEPT)
  *
  * This routine only deals with the setOperations tree of the given query.
- * Any top-level ORDER BY requested in root->parse->sortClause will be added
- * when we return to grouping_planner.
+ * Any top-level ORDER BY requested in root->parse->sortClause will be handled
+ * when we return to grouping_planner; likewise for LIMIT.
  *
- * tuple_fraction is the fraction of tuples we expect will be retrieved.
- * tuple_fraction is interpreted as for grouping_planner(); in particular,
- * zero means "all the tuples will be fetched".  Any LIMIT present at the
- * top level has already been factored into tuple_fraction.
- *
- * *sortClauses is an output argument: it is set to a list of SortGroupClauses
- * representing the result ordering of the topmost set operation.  (This will
- * be NIL if the output isn't ordered.)
+ * What we return is an "upperrel" RelOptInfo containing at least one Path
+ * that implements the set-operation tree.  In addition, root->processed_tlist
+ * receives a targetlist representing the output of the topmost setop node.
  */
-Plan *
-plan_set_operations(PlannerInfo *root, double tuple_fraction,
-					List **sortClauses)
+RelOptInfo *
+plan_set_operations(PlannerInfo *root)
 {
 	Query	   *parse = root->parse;
 	SetOperationStmt *topop = (SetOperationStmt *) parse->setOperations;
 	Node	   *node;
 	RangeTblEntry *leftmostRTE;
 	Query	   *leftmostQuery;
+	RelOptInfo *setop_rel;
+	Path	   *path;
+	List	   *top_tlist;
 
 	Assert(topop && IsA(topop, SetOperationStmt));
 
@@ -180,54 +175,94 @@ plan_set_operations(PlannerInfo *root, double tuple_fraction,
 	Assert(leftmostQuery != NULL);
 
 	/*
+	 * We return our results in the (SETOP, NULL) upperrel.  For the moment,
+	 * this is also the parent rel of all Paths in the setop tree; we may well
+	 * change that in future.
+	 */
+	setop_rel = fetch_upper_rel(root, UPPERREL_SETOP, NULL);
+
+	/*
+	 * We don't currently worry about setting setop_rel's consider_parallel
+	 * flag, nor about allowing FDWs to contribute paths to it.
+	 */
+
+	/*
 	 * If the topmost node is a recursive union, it needs special processing.
 	 */
 	if (root->hasRecursion)
-		return generate_recursion_plan(topop, root, tuple_fraction,
+	{
+		path = generate_recursion_path(topop, root,
 									   leftmostQuery->targetList,
-									   sortClauses);
+									   &top_tlist);
+	}
+	else
+	{
+		/*
+		 * Recurse on setOperations tree to generate paths for set ops. The
+		 * final output path should have just the column types shown as the
+		 * output from the top-level node, plus possibly resjunk working
+		 * columns (we can rely on upper-level nodes to deal with that).
+		 */
+		path = recurse_set_operations((Node *) topop, root,
+									  topop->colTypes, topop->colCollations,
+									  true, -1,
+									  leftmostQuery->targetList,
+									  &top_tlist,
+									  NULL);
+	}
 
-	/*
-	 * Recurse on setOperations tree to generate plans for set ops. The final
-	 * output plan should have just the column types shown as the output from
-	 * the top-level node, plus possibly resjunk working columns (we can rely
-	 * on upper-level nodes to deal with that).
-	 */
-	return recurse_set_operations((Node *) topop, root, tuple_fraction,
-								  topop->colTypes, topop->colCollations,
-								  true, -1,
-								  leftmostQuery->targetList,
-								  sortClauses, NULL);
+	/* Must return the built tlist into root->processed_tlist. */
+	root->processed_tlist = top_tlist;
+
+	/* Add only the final path to the SETOP upperrel. */
+	add_path(setop_rel, path);
+
+	/* Let extensions possibly add some more paths */
+	if (create_upper_paths_hook)
+		(*create_upper_paths_hook) (root, UPPERREL_SETOP,
+									NULL, setop_rel);
+
+	/* Select cheapest path */
+	set_cheapest(setop_rel);
+
+	return setop_rel;
 }
 
 /*
  * recurse_set_operations
  *	  Recursively handle one step in a tree of set operations
  *
- * tuple_fraction: fraction of tuples we expect to retrieve from node
  * colTypes: OID list of set-op's result column datatypes
  * colCollations: OID list of set-op's result column collations
  * junkOK: if true, child resjunk columns may be left in the result
  * flag: if >= 0, add a resjunk output column indicating value of flag
  * refnames_tlist: targetlist to take column names from
  *
- * Returns a plan for the subtree, as well as these output parameters:
- * *sortClauses: receives list of SortGroupClauses for result plan, if any
+ * Returns a path for the subtree, as well as these output parameters:
+ * *pTargetList: receives the fully-fledged tlist for the subtree's top plan
  * *pNumGroups: if not NULL, we estimate the number of distinct groups
  *		in the result, and store it there
+ *
+ * The pTargetList output parameter is mostly redundant with the pathtarget
+ * of the returned path, but for the moment we need it because much of the
+ * logic in this file depends on flag columns being marked resjunk.  Pending
+ * a redesign of how that works, this is the easy way out.
  *
  * We don't have to care about typmods here: the only allowed difference
  * between set-op input and output typmods is input is a specific typmod
  * and output is -1, and that does not require a coercion.
  */
-static Plan *
+static Path *
 recurse_set_operations(Node *setOp, PlannerInfo *root,
-					   double tuple_fraction,
 					   List *colTypes, List *colCollations,
 					   bool junkOK,
 					   int flag, List *refnames_tlist,
-					   List **sortClauses, double *pNumGroups)
+					   List **pTargetList,
+					   double *pNumGroups)
 {
+	/* Guard against stack overflow due to overly complex setop nests */
+	check_stack_depth();
+
 	if (IsA(setOp, RangeTblRef))
 	{
 		RangeTblRef *rtr = (RangeTblRef *) setOp;
@@ -235,14 +270,16 @@ recurse_set_operations(Node *setOp, PlannerInfo *root,
 		Query	   *subquery = rte->subquery;
 		RelOptInfo *rel;
 		PlannerInfo *subroot;
-		Plan	   *subplan,
-				   *plan;
+		RelOptInfo *final_rel;
+		Path	   *subpath;
+		Path	   *path;
+		List	   *tlist;
 
 		Assert(subquery != NULL);
 
 		/*
 		 * We need to build a RelOptInfo for each leaf subquery.  This isn't
-		 * used for anything here, but it carries the subroot data structures
+		 * used for much here, but it carries the subroot data structures
 		 * forward to setrefs.c processing.
 		 */
 		rel = build_simple_rel(root, rtr->rtindex, RELOPT_BASEREL);
@@ -250,21 +287,14 @@ recurse_set_operations(Node *setOp, PlannerInfo *root,
 		/* plan_params should not be in use in current query level */
 		Assert(root->plan_params == NIL);
 
-		/*
-		 * Generate plan for primitive subquery
-		 */
+		/* Generate a subroot and Paths for the subquery */
 		PlannerConfig *config = CopyPlannerConfig(root->config);
 		config->honor_order_by = false;
-		subplan = subquery_planner(root->glob, subquery,
-								   root,
-								   false,
-								   tuple_fraction,
-								   &subroot,
-								   config);
-
-		/* Save subroot and subplan in RelOptInfo for setrefs.c */
-		rel->subplan = subplan;
-		rel->subroot = subroot;
+		subroot = rel->subroot = subquery_planner(root->glob, subquery,
+												  root,
+												  false,
+												  root->tuple_fraction,
+												  config);
 
 		/*
 		 * It should not be possible for the primitive query to contain any
@@ -274,58 +304,90 @@ recurse_set_operations(Node *setOp, PlannerInfo *root,
 			elog(ERROR, "unexpected outer reference in set operation subquery");
 
 		/*
+		 * Mark rel with estimated output rows, width, etc.  Note that we have
+		 * to do this before generating outer-query paths, else
+		 * cost_subqueryscan is not happy.
+		 */
+		set_subquery_size_estimates(root, rel);
+
+		/*
+		 * For the moment, we consider only a single Path for the subquery.
+		 * This should change soon (make it look more like
+		 * set_subquery_pathlist).
+		 */
+		final_rel = fetch_upper_rel(subroot, UPPERREL_FINAL, NULL);
+		subpath = get_cheapest_fractional_path(final_rel,
+											   root->tuple_fraction);
+
+		/*
+		 * Stick a SubqueryScanPath atop that.
+		 *
+		 * We don't bother to determine the subquery's output ordering since
+		 * it won't be reflected in the set-op result anyhow; so just label
+		 * the SubqueryScanPath with nil pathkeys.  (XXX that should change
+		 * soon too, likely.)
+		 */
+		/*
+		 * GPDB_96_MERGE_FIXME: can we really use the subpath's locus here unmodified?
+		 * Shouldn't we convert it to use Vars pointing to the outputs of the subquery,
+		 * like in subquery_pathlist()
+		 */
+		path = (Path *) create_subqueryscan_path(root, rel, subpath,
+												 NIL, subpath->locus, NULL);
+
+		/*
+		 * Figure out the appropriate target list, and update the
+		 * SubqueryScanPath with the PathTarget form of that.
+		 */
+		tlist = generate_setop_tlist(colTypes, colCollations,
+									 flag,
+									 rtr->rtindex,
+									 true,
+									 subroot->processed_tlist,
+									 refnames_tlist);
+
+		path = apply_projection_to_path(root, rel, path,
+										create_pathtarget(root, tlist));
+
+		/* Return the fully-fledged tlist to caller, too */
+		*pTargetList = tlist;
+
+		/*
 		 * Estimate number of groups if caller wants it.  If the subquery used
 		 * grouping or aggregation, its output is probably mostly unique
 		 * anyway; otherwise do statistical estimation.
 		 */
 		if (pNumGroups)
 		{
-			if (subquery->groupClause || subquery->distinctClause ||
+			if (subquery->groupClause || subquery->groupingSets ||
+				subquery->distinctClause ||
 				subroot->hasHavingQual || subquery->hasAggs)
-				*pNumGroups = subplan->plan_rows;
+				*pNumGroups = subpath->rows;
 			else
 				*pNumGroups = estimate_num_groups(subroot,
-								get_tlist_exprs(subquery->targetList, false),
-												  subplan->plan_rows);
+							get_tlist_exprs(subroot->processed_tlist, false),
+												  subpath->rows,
+												  NULL);
 		}
 
-		/*
-		 * Add a SubqueryScan with the caller-requested targetlist
-		 */
-		plan = (Plan *)
-			make_subqueryscan(generate_setop_tlist(colTypes, colCollations,
-												   flag,
-												   rtr->rtindex,
-												   true,
-												   subplan->targetlist,
-												   refnames_tlist),
-							  NIL,
-							  rtr->rtindex,
-							  subplan);
-		mark_passthru_locus(plan, FALSE, FALSE); /* CDB: no hash/sort keys */
-
-		/*
-		 * We don't bother to determine the subquery's output ordering since
-		 * it won't be reflected in the set-op result anyhow.
-		 */
-		*sortClauses = NIL;
-
-		return plan;
+		return (Path *) path;
 	}
 	else if (IsA(setOp, SetOperationStmt))
 	{
 		SetOperationStmt *op = (SetOperationStmt *) setOp;
-		Plan	   *plan;
+		Path	   *path;
 
 		/* UNIONs are much different from INTERSECT/EXCEPT */
 		if (op->op == SETOP_UNION)
-			plan = generate_union_plan(op, root, tuple_fraction,
+			path = generate_union_path(op, root,
 									   refnames_tlist,
-									   sortClauses, pNumGroups);
+									   pTargetList,
+									   pNumGroups);
 		else
-			plan = generate_nonunion_plan(op, root, tuple_fraction,
+			path = generate_nonunion_path(op, root,
 										  refnames_tlist,
-										  sortClauses, pNumGroups);
+										  pTargetList,
+										  pNumGroups);
 
 		/*
 		 * If necessary, add a Result node to project the caller-requested
@@ -342,46 +404,49 @@ recurse_set_operations(Node *setOp, PlannerInfo *root,
          * better EXPLAIN output in CDB/MPP; varno 0 is used in PostgreSQL).
 		 */
 		if (flag >= 0 ||
-			!tlist_same_datatypes(plan->targetlist, colTypes, junkOK) ||
-			!tlist_same_collations(plan->targetlist, colCollations, junkOK))
+			!tlist_same_datatypes(*pTargetList, colTypes, junkOK) ||
+			!tlist_same_collations(*pTargetList, colCollations, junkOK))
 		{
-			plan = (Plan *)
-				make_result(root,
-							generate_setop_tlist(colTypes, colCollations,
-												 flag,
-												 OUTER_VAR,
-												 false,
-												 plan->targetlist,
-												 refnames_tlist),
-							NULL,
-							plan);
-            plan->flow = pull_up_Flow(plan, plan->lefttree);
+			*pTargetList = generate_setop_tlist(colTypes, colCollations,
+												flag,
+												OUTER_VAR,
+												false,
+												*pTargetList,
+												refnames_tlist);
+			path = apply_projection_to_path(root,
+											path->parent,
+											path,
+											create_pathtarget(root,
+															  *pTargetList));
 		}
-		return plan;
+		return path;
 	}
 	else
 	{
 		elog(ERROR, "unrecognized node type: %d",
 			 (int) nodeTag(setOp));
+		*pTargetList = NIL;
 		return NULL;			/* keep compiler quiet */
 	}
 }
 
 /*
- * Generate plan for a recursive UNION node
+ * Generate path for a recursive UNION node
  */
-static Plan *
-generate_recursion_plan(SetOperationStmt *setOp, PlannerInfo *root,
-						double tuple_fraction,
+static Path *
+generate_recursion_path(SetOperationStmt *setOp, PlannerInfo *root,
 						List *refnames_tlist,
-						List **sortClauses)
+						List **pTargetList)
 {
-	Plan	   *plan;
-	Plan	   *lplan;
-	Plan	   *rplan;
+	RelOptInfo *result_rel = fetch_upper_rel(root, UPPERREL_SETOP, NULL);
+	Path	   *path;
+	Path	   *lpath;
+	Path	   *rpath;
+	List	   *lpath_tlist;
+	List	   *rpath_tlist;
 	List	   *tlist;
 	List	   *groupList;
-	long		numGroups;
+	double		dNumGroups;
 
 	/* Parser should have rejected other cases */
 	if (setOp->op != SETOP_UNION)
@@ -393,24 +458,52 @@ generate_recursion_plan(SetOperationStmt *setOp, PlannerInfo *root,
 	 * Unlike a regular UNION node, process the left and right inputs
 	 * separately without any intention of combining them into one Append.
 	 */
-	lplan = recurse_set_operations(setOp->larg, root, tuple_fraction,
+	lpath = recurse_set_operations(setOp->larg, root,
 								   setOp->colTypes, setOp->colCollations,
 								   false, -1,
-								   refnames_tlist, sortClauses, NULL);
-	/* The right plan will want to look at the left one ... */
-	root->non_recursive_plan = lplan;
-	rplan = recurse_set_operations(setOp->rarg, root, tuple_fraction,
-								   setOp->colTypes, setOp->colCollations,
-								   false, -1,
-								   refnames_tlist, sortClauses, NULL);
-	root->non_recursive_plan = NULL;
+								   refnames_tlist,
+								   &lpath_tlist,
+								   NULL);
 
 	/*
-	 * Generate tlist for RecursiveUnion plan node --- same as in Append cases
+	 * If the non-recursive side is SegmentGeneral, force it to be executed
+	 * on exactly one segment. The worktable scan we build on the recursive
+	 * side will use the same locus as the non-recursive side, and if it's
+	 * SegmentGeneral, the result of the join may end up having a different
+	 * locus.
+	 *
+	 * GPDB_96_MERGE_FIXME: On master, before the merge, more complicated
+	 * logic was added in commit ad6a6067d9 to make the loci on the WorkTableScan
+	 * and the RecursiveUnion correct. That was largely reverted as part of the
+	 * merge, and things seem to be working with this much simpler thing, but
+	 * I'm not sure if the logic is 100% correct now.
+	 */
+	if (CdbPathLocus_IsSegmentGeneral(lpath->locus))
+	{
+		CdbPathLocus gather_locus;
+
+		CdbPathLocus_MakeSingleQE(&gather_locus, lpath->locus.numsegments);
+		lpath = cdbpath_create_motion_path(root, lpath, NIL, false, gather_locus);
+	}
+
+	/* The right path will want to look at the left one ... */
+	root->non_recursive_path = lpath;
+	rpath = recurse_set_operations(setOp->rarg, root,
+								   setOp->colTypes, setOp->colCollations,
+								   false, -1,
+								   refnames_tlist,
+								   &rpath_tlist,
+								   NULL);
+	root->non_recursive_path = NULL;
+
+	/*
+	 * Generate tlist for RecursiveUnion path node --- same as in Append cases
 	 */
 	tlist = generate_append_tlist(setOp->colTypes, setOp->colCollations, false,
-								  list_make2(lplan, rplan),
+								  list_make2(lpath_tlist, rpath_tlist),
 								  refnames_tlist);
+
+	*pTargetList = tlist;
 
 	/*
 	 * If UNION, identify the grouping operators
@@ -418,12 +511,10 @@ generate_recursion_plan(SetOperationStmt *setOp, PlannerInfo *root,
 	if (setOp->all)
 	{
 		groupList = NIL;
-		numGroups = 0;
+		dNumGroups = 0;
 	}
 	else
 	{
-		double		dNumGroups;
-
 		/* Identify the grouping semantics */
 		groupList = generate_setop_grouplist(setOp, tlist);
 
@@ -438,36 +529,42 @@ generate_recursion_plan(SetOperationStmt *setOp, PlannerInfo *root,
 		 * For the moment, take the number of distinct groups as equal to the
 		 * total input size, ie, the worst case.
 		 */
-		dNumGroups = lplan->plan_rows + rplan->plan_rows * 10;
-
-		/* Also convert to long int --- but 'ware overflow! */
-		numGroups = (long) Min(dNumGroups, (double) LONG_MAX);
+		dNumGroups = lpath->rows + rpath->rows * 10;
 	}
 
 	/*
 	 * And make the plan node.
 	 */
-	plan = (Plan *) make_recursive_union(tlist, lplan, rplan,
-										 root->wt_param_id,
-										 groupList, numGroups);
+	path = (Path *) create_recursiveunion_path(root,
+											   result_rel,
+											   lpath,
+											   rpath,
+											   create_pathtarget(root, tlist),
+											   groupList,
+											   root->wt_param_id,
+											   dNumGroups);
+	path->locus = rpath->locus;
 
-	*sortClauses = NIL;			/* RecursiveUnion result is always unsorted */
-
-	return plan;
+	return path;
 }
 
 /*
- * Generate plan for a UNION or UNION ALL node
+ * Generate path for a UNION or UNION ALL node
  */
-static Plan *
-generate_union_plan(SetOperationStmt *op, PlannerInfo *root,
-					double tuple_fraction,
+static Path *
+generate_union_path(SetOperationStmt *op, PlannerInfo *root,
 					List *refnames_tlist,
-					List **sortClauses, double *pNumGroups)
+					List **pTargetList,
+					double *pNumGroups)
 {
-	List	   *planlist;
+	RelOptInfo *result_rel = fetch_upper_rel(root, UPPERREL_SETOP, NULL);
+	double		save_fraction = root->tuple_fraction;
+	List	   *pathlist;
+	List	   *child_tlists1;
+	List	   *child_tlists2;
+	List	   *tlist_list;
 	List	   *tlist;
-	Plan	   *plan;
+	Path	   *path;
 	GpSetOpType optype = PSETOP_NONE; /* CDB */
 
 	/*
@@ -482,26 +579,32 @@ generate_union_plan(SetOperationStmt *op, PlannerInfo *root,
 	 * of preferring fast-start plans.
 	 */
 	if (!op->all)
-		tuple_fraction = 0.0;
+		root->tuple_fraction = 0.0;
 
 	/*
 	 * If any of my children are identical UNION nodes (same op, all-flag, and
 	 * colTypes) then they can be merged into this node so that we generate
 	 * only one Append and unique-ification for the lot.  Recurse to find such
-	 * nodes and compute their children's plans.
+	 * nodes and compute their children's paths.
 	 */
-	planlist = list_concat(recurse_union_children(op->larg, root,
-												  tuple_fraction,
-												  op, refnames_tlist),
+	pathlist = list_concat(recurse_union_children(op->larg, root,
+												  op, refnames_tlist,
+												  &child_tlists1),
 						   recurse_union_children(op->rarg, root,
-												  tuple_fraction,
-												  op, refnames_tlist));
-	
+												  op, refnames_tlist,
+												  &child_tlists2));
+	tlist_list = list_concat(child_tlists1, child_tlists2);
+
+	/* GPDB_96_MERGE_FIXME: We should use the new pathified upper planner
+	 * infrastructure for this. I think we should create multiple Paths,
+	 * representing different kinds of PSETOP_* implementations, and
+	 * let the "add_path()" choose the cheapest one.
+	 */
 	/* CDB: Decide on approach, condition argument plans to suit. */
 	if ( Gp_role == GP_ROLE_DISPATCH )
 	{
-		optype = choose_setop_type(planlist);
-		adjust_setop_arguments(root, planlist, optype);
+		optype = choose_setop_type(pathlist);
+		adjust_setop_arguments(root, pathlist, tlist_list, optype);
 	}
 	else if (Gp_role == GP_ROLE_UTILITY ||
 			 Gp_role == GP_ROLE_EXECUTE) /* MPP-2928 */
@@ -517,28 +620,32 @@ generate_union_plan(SetOperationStmt *op, PlannerInfo *root,
 	 * next plan level up.
 	 */
 	tlist = generate_append_tlist(op->colTypes, op->colCollations, false,
-								  planlist, refnames_tlist);
+								  tlist_list, refnames_tlist);
+
+	*pTargetList = tlist;
 
 	/*
 	 * Append the child results together.
 	 */
-	plan = (Plan *) make_append(planlist, tlist);
-	mark_append_locus(plan, optype); /* CDB: Mark the plan result locus. */
+	path = (Path *) create_append_path(root, result_rel, pathlist, NULL, 0);
+	// GPDB_96_MERGE_FIXME: Where should this go now?
+	//mark_append_locus(plan, optype); /* CDB: Mark the plan result locus. */
+
+	/* We have to manually jam the right tlist into the path; ick */
+	path->pathtarget = create_pathtarget(root, tlist);
 
 	/*
-	 * For UNION ALL, we just need the Append plan.  For UNION, need to add
+	 * For UNION ALL, we just need the Append path.  For UNION, need to add
 	 * node(s) to remove duplicates.
 	 */
-	if (op->all)
-		*sortClauses = NIL;		/* result of UNION ALL is always unsorted */
-	else
+	if (!op->all)
 	{
 		if ( optype == PSETOP_PARALLEL_PARTITIONED )
 		{
 			/* CDB: Hash motion to collocate non-distinct tuples. */
-			plan = (Plan *) make_motion_hash_all_targets(root, plan);
+			path = make_motion_hash_all_targets(root, path, tlist);
 		}
-		plan = make_union_unique(op, plan, root, tuple_fraction, sortClauses);
+		path = make_union_unique(op, path, tlist, root);
 	}
 
 	/*
@@ -547,50 +654,64 @@ generate_union_plan(SetOperationStmt *op, PlannerInfo *root,
 	 * we want worst-case estimates anyway.
 	 */
 	if (pNumGroups)
-		*pNumGroups = plan->plan_rows;
+		*pNumGroups = path->rows;
 
-	return plan;
+	/* Undo effects of possibly forcing tuple_fraction to 0 */
+	root->tuple_fraction = save_fraction;
+
+	return path;
 }
 
 /*
- * Generate plan for an INTERSECT, INTERSECT ALL, EXCEPT, or EXCEPT ALL node
+ * Generate path for an INTERSECT, INTERSECT ALL, EXCEPT, or EXCEPT ALL node
  */
-static Plan *
-generate_nonunion_plan(SetOperationStmt *op, PlannerInfo *root,
-					   double tuple_fraction,
+static Path *
+generate_nonunion_path(SetOperationStmt *op, PlannerInfo *root,
 					   List *refnames_tlist,
-					   List **sortClauses, double *pNumGroups)
+					   List **pTargetList,
+					   double *pNumGroups)
 {
-	Plan	   *lplan,
-			   *rplan,
-			   *plan;
-	List	   *tlist,
+	RelOptInfo *result_rel = fetch_upper_rel(root, UPPERREL_SETOP, NULL);
+	double		save_fraction = root->tuple_fraction;
+	Path	   *lpath,
+			   *rpath,
+			   *path;
+	List	   *lpath_tlist,
+			   *rpath_tlist,
+			   *tlist_list,
+			   *tlist,
 			   *groupList,
-			   *planlist,
-			   *child_sortclauses;
+			   *pathlist;
 	double		dLeftGroups,
 				dRightGroups,
 				dNumGroups,
 				dNumOutputRows;
-	long		numGroups;
 	bool		use_hash;
 	SetOpCmd	cmd;
 	int			firstFlag;
 	GpSetOpType optype = PSETOP_NONE; /* CDB */
 
+	/*
+	 * Tell children to fetch all tuples.
+	 */
+	root->tuple_fraction = 0.0;
+
 	/* Recurse on children, ensuring their outputs are marked */
-	lplan = recurse_set_operations(op->larg, root,
-								   0.0 /* all tuples needed */ ,
+	lpath = recurse_set_operations(op->larg, root,
 								   op->colTypes, op->colCollations,
 								   false, 0,
 								   refnames_tlist,
-								   &child_sortclauses, &dLeftGroups);
-	rplan = recurse_set_operations(op->rarg, root,
-								   0.0 /* all tuples needed */ ,
+								   &lpath_tlist,
+								   &dLeftGroups);
+	rpath = recurse_set_operations(op->rarg, root,
 								   op->colTypes, op->colCollations,
 								   false, 1,
 								   refnames_tlist,
-								   &child_sortclauses, &dRightGroups);
+								   &rpath_tlist,
+								   &dRightGroups);
+
+	/* Undo effects of forcing tuple_fraction to 0 */
+	root->tuple_fraction = save_fraction;
 
 	/*
 	 * For EXCEPT, we must put the left input first.  For INTERSECT, either
@@ -600,20 +721,28 @@ generate_nonunion_plan(SetOperationStmt *op, PlannerInfo *root,
 	 */
 	if (op->op == SETOP_EXCEPT || dLeftGroups <= dRightGroups)
 	{
-		planlist = list_make2(lplan, rplan);
+		pathlist = list_make2(lpath, rpath);
+		tlist_list = list_make2(lpath_tlist, rpath_tlist);
 		firstFlag = 0;
 	}
 	else
 	{
-		planlist = list_make2(rplan, lplan);
+		pathlist = list_make2(rpath, lpath);
+		tlist_list = list_make2(rpath_tlist, lpath_tlist);
 		firstFlag = 1;
 	}
+
+	/* GPDB_96_MERGE_FIXME: We should use the new pathified upper planner
+	 * infrastructure for this. I think we should create multiple Paths,
+	 * representing different kinds of PSETOP_* implementations, and
+	 * let the "add_path()" choose the cheapest one.
+	 */
 
 	/* CDB: Decide on approach, condition argument plans to suit. */
 	if ( Gp_role == GP_ROLE_DISPATCH )
 	{
-		optype = choose_setop_type(planlist);
-		adjust_setop_arguments(root, planlist, optype);
+		optype = choose_setop_type(pathlist);
+		adjust_setop_arguments(root, pathlist, tlist_list, optype);
 	}
 	else if ( Gp_role == GP_ROLE_UTILITY 
 			|| Gp_role == GP_ROLE_EXECUTE ) /* MPP-2928 */
@@ -628,13 +757,16 @@ generate_nonunion_plan(SetOperationStmt *op, PlannerInfo *root,
 		 * put the Redistribute nodes below the Append, otherwise we lose
 		 * the order of the firstFlags.
 		 */
-		ListCell   *lc;
-		List	   *l = NIL;
+		ListCell   *pathcell;
+		ListCell   *tlistcell;
+		List	   *newpathlist = NIL;
 
-		foreach(lc, planlist)
+		forboth(pathcell, pathlist, tlistcell, tlist_list)
 		{
-			Plan	   *subplan = (Plan *) lfirst(lc);
-
+			Path	   *subpath = (Path *) lfirst(pathcell);
+			List	   *subtlist = (List *) lfirst(tlistcell);
+#if 0
+			/* GPDB_96_MERGE_FIXME */
 			/*
 			 * If the subplan already has a Motion at the top, peel it off
 			 * first, so that we don't have a Motion on top of a Motion.
@@ -642,12 +774,13 @@ generate_nonunion_plan(SetOperationStmt *op, PlannerInfo *root,
 			 * create such a Motion in the first place, but it's too late
 			 * for that here.
 			 */
-			while (IsA(subplan, Motion))
-				subplan = subplan->lefttree;
-
-			l = lappend(l, make_motion_hash_all_targets(root, subplan));
+			while (IsA(subpath, Motion))
+				subpath = subpath->lefttree;
+#endif
+			newpathlist = lappend(newpathlist,
+								  make_motion_hash_all_targets(root, subpath, subtlist));
 		}
-		planlist = l;
+		pathlist = newpathlist;
 	}
 
 	/*
@@ -660,23 +793,29 @@ generate_nonunion_plan(SetOperationStmt *op, PlannerInfo *root,
 	 * confused.
 	 */
 	tlist = generate_append_tlist(op->colTypes, op->colCollations, true,
-								  planlist, refnames_tlist);
+								  tlist_list, refnames_tlist);
+
+	*pTargetList = tlist;
 
 	/*
 	 * Append the child results together.
 	 */
-	plan = (Plan *) make_append(planlist, tlist);
-	mark_append_locus(plan, optype); /* CDB: Mark the plan result locus. */
+	path = (Path *) create_append_path(root, result_rel, pathlist, NULL, 0);
+	mark_append_locus(path, optype); /* CDB: Mark the plan result locus. */
+
+	/* We have to manually jam the right tlist into the path; ick */
+	path->pathtarget = create_pathtarget(root, tlist);
 
 	/* Identify the grouping semantics */
 	groupList = generate_setop_grouplist(op, tlist);
 
-	/* punt if nothing to group on (can this happen?) */
+	/* punt if nothing to group on (not worth fixing in back branches) */
 	if (groupList == NIL)
-	{
-		*sortClauses = NIL;
-		return plan;
-	}
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 /* translator: %s is UNION, INTERSECT, or EXCEPT */
+				 errmsg("%s over no columns is not supported",
+						(op->op == SETOP_INTERSECT) ? "INTERSECT" : "EXCEPT")));
 
 	/*
 	 * Estimate number of distinct groups that we'll need hashtable entries
@@ -689,32 +828,32 @@ generate_nonunion_plan(SetOperationStmt *op, PlannerInfo *root,
 	if (op->op == SETOP_EXCEPT)
 	{
 		dNumGroups = dLeftGroups;
-		dNumOutputRows = op->all ? lplan->plan_rows : dNumGroups;
+		dNumOutputRows = op->all ? lpath->rows : dNumGroups;
 	}
 	else
 	{
 		dNumGroups = Min(dLeftGroups, dRightGroups);
-		dNumOutputRows = op->all ? Min(lplan->plan_rows, rplan->plan_rows) : dNumGroups;
+		dNumOutputRows = op->all ? Min(lpath->rows, rpath->rows) : dNumGroups;
 	}
-
-	/* Also convert to long int --- but 'ware overflow! */
-	numGroups = (long) Min(dNumGroups, (double) LONG_MAX);
 
 	/*
 	 * Decide whether to hash or sort, and add a sort node if needed.
 	 */
-	use_hash = choose_hashed_setop(root, groupList, plan,
-								   dNumGroups, dNumOutputRows, tuple_fraction,
+	use_hash = choose_hashed_setop(root, groupList, path,
+								   dNumGroups, dNumOutputRows,
 					   (op->op == SETOP_INTERSECT) ? "INTERSECT" : "EXCEPT");
 
 	if (!use_hash)
-	{
-		plan = (Plan *) make_sort_from_sortclauses(root, groupList, plan);
-		mark_sort_locus(plan); /* CDB */
-	}
+		path = (Path *) create_sort_path(root,
+										 result_rel,
+										 path,
+										 make_pathkeys_for_sortclauses(root,
+																   groupList,
+																	   tlist),
+										 -1.0);
 
 	/*
-	 * Finally, add a SetOp plan node to generate the correct output.
+	 * Finally, add a SetOp path node to generate the correct output.
 	 */
 	switch (op->op)
 	{
@@ -729,20 +868,21 @@ generate_nonunion_plan(SetOperationStmt *op, PlannerInfo *root,
 			cmd = SETOPCMD_INTERSECT;	/* keep compiler quiet */
 			break;
 	}
-	plan = (Plan *) make_setop(cmd, use_hash ? SETOP_HASHED : SETOP_SORTED,
-							   plan, groupList,
-							   list_length(op->colTypes) + 1,
-							   use_hash ? firstFlag : -1,
-							   numGroups, dNumOutputRows);
-    plan->flow = pull_up_Flow(plan, plan->lefttree);
-
-	/* Result is sorted only if we're not hashing */
-	*sortClauses = use_hash ? NIL : groupList;
+	path = (Path *) create_setop_path(root,
+									  result_rel,
+									  path,
+									  cmd,
+									  use_hash ? SETOP_HASHED : SETOP_SORTED,
+									  groupList,
+									  list_length(op->colTypes) + 1,
+									  use_hash ? firstFlag : -1,
+									  dNumGroups,
+									  dNumOutputRows);
 
 	if (pNumGroups)
 		*pNumGroups = dNumGroups;
 
-	return plan;
+	return path;
 }
 
 /*
@@ -756,15 +896,16 @@ generate_nonunion_plan(SetOperationStmt *op, PlannerInfo *root,
  * collations have the same notion of equality.  It is valid from an
  * implementation standpoint because we don't care about the ordering of
  * a UNION child's result: UNION ALL results are always unordered, and
- * generate_union_plan will force a fresh sort if the top level is a UNION.
+ * generate_union_path will force a fresh sort if the top level is a UNION.
  */
 static List *
 recurse_union_children(Node *setOp, PlannerInfo *root,
-					   double tuple_fraction,
 					   SetOperationStmt *top_union,
-					   List *refnames_tlist)
+					   List *refnames_tlist,
+					   List **tlist_list)
 {
-	List	   *child_sortclauses;
+	List	   *result;
+	List	   *child_tlist;
 
 	if (IsA(setOp, SetOperationStmt))
 	{
@@ -774,15 +915,20 @@ recurse_union_children(Node *setOp, PlannerInfo *root,
 			(op->all == top_union->all || op->all) &&
 			equal(op->colTypes, top_union->colTypes))
 		{
-			/* Same UNION, so fold children into parent's subplan list */
-			return list_concat(recurse_union_children(op->larg, root,
-													  tuple_fraction,
-													  top_union,
-													  refnames_tlist),
-							   recurse_union_children(op->rarg, root,
-													  tuple_fraction,
-													  top_union,
-													  refnames_tlist));
+			/* Same UNION, so fold children into parent's subpath list */
+			List	   *child_tlists1;
+			List	   *child_tlists2;
+
+			result = list_concat(recurse_union_children(op->larg, root,
+														top_union,
+														refnames_tlist,
+														&child_tlists1),
+								 recurse_union_children(op->rarg, root,
+														top_union,
+														refnames_tlist,
+														&child_tlists2));
+			*tlist_list = list_concat(child_tlists1, child_tlists2);
+			return result;
 		}
 	}
 
@@ -795,36 +941,37 @@ recurse_union_children(Node *setOp, PlannerInfo *root,
 	 * tuples have junk and some don't.  This case only arises when we have an
 	 * EXCEPT or INTERSECT as child, else there won't be resjunk anyway.
 	 */
-	return list_make1(recurse_set_operations(setOp, root,
-											 tuple_fraction,
-											 top_union->colTypes,
-											 top_union->colCollations,
-											 false, -1,
-											 refnames_tlist,
-											 &child_sortclauses, NULL));
+	result = list_make1(recurse_set_operations(setOp, root,
+											   top_union->colTypes,
+											   top_union->colCollations,
+											   false, -1,
+											   refnames_tlist,
+											   &child_tlist,
+											   NULL));
+	*tlist_list = list_make1(child_tlist);
+	return result;
 }
 
 /*
- * Add nodes to the given plan tree to unique-ify the result of a UNION.
+ * Add nodes to the given path tree to unique-ify the result of a UNION.
  */
-static Plan *
-make_union_unique(SetOperationStmt *op, Plan *plan,
-				  PlannerInfo *root, double tuple_fraction,
-				  List **sortClauses)
+static Path *
+make_union_unique(SetOperationStmt *op, Path *path, List *tlist,
+				  PlannerInfo *root)
 {
+	RelOptInfo *result_rel = fetch_upper_rel(root, UPPERREL_SETOP, NULL);
 	List	   *groupList;
 	double		dNumGroups;
-	long		numGroups;
 
 	/* Identify the grouping semantics */
-	groupList = generate_setop_grouplist(op, plan->targetlist);
+	groupList = generate_setop_grouplist(op, tlist);
 
-	/* punt if nothing to group on (can this happen?) */
+	/* punt if nothing to group on (not worth fixing in back branches) */
 	if (groupList == NIL)
-	{
-		*sortClauses = NIL;
-		return plan;
-	}
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 /* translator: %s is UNION, INTERSECT, or EXCEPT */
+				 errmsg("%s over no columns is not supported", "UNION")));
 
 	/*
 	 * XXX for the moment, take the number of distinct groups as equal to the
@@ -834,49 +981,47 @@ make_union_unique(SetOperationStmt *op, Plan *plan,
 	 * as well the propensity of novices to write UNION rather than UNION ALL
 	 * even when they don't expect any duplicates...
 	 */
-	dNumGroups = plan->plan_rows;
-
-	/* Also convert to long int --- but 'ware overflow! */
-	numGroups = (long) Min(dNumGroups, (double) LONG_MAX);
+	dNumGroups = path->rows;
 
 	/* Decide whether to hash or sort */
-	if (choose_hashed_setop(root, groupList, plan,
-							dNumGroups, dNumGroups, tuple_fraction,
+	if (choose_hashed_setop(root, groupList, path,
+							dNumGroups, dNumGroups,
 							"UNION"))
 	{
 		/* Hashed aggregate plan --- no sort needed */
-		plan = (Plan *) make_agg(root,
-								 plan->targetlist,
-								 NIL,
-								 AGG_HASHED,
-								 NULL,
-								 false, /* streaming */
-								 list_length(groupList),
-								 extract_grouping_cols(groupList,
-													   plan->targetlist),
-								 extract_grouping_ops(groupList),
-								 numGroups,
-								 0, /* num_nullcols */
-								 0, /* input_grouping */
-								 0, /* grouping */
-								 0, /* rollupGSTimes */
-								 plan);
-		/* Hashed aggregation produces randomly-ordered results */
-		*sortClauses = NIL;
+		path = (Path *) create_agg_path(root,
+										result_rel,
+										path,
+										create_pathtarget(root, tlist),
+										AGG_HASHED,
+										AGGSPLIT_SIMPLE,
+										false, /* streaming */
+										groupList,
+										NIL,
+										NULL,
+										dNumGroups,
+										NULL);
 	}
 	else
 	{
 		/* Sort and Unique */
-		plan = (Plan *) make_sort_from_sortclauses(root, groupList, plan);
-		mark_sort_locus(plan); /* CDB */
-		plan = (Plan *) make_unique(plan, groupList);
-		plan->plan_rows = dNumGroups;
-		/* We know the sort order of the result */
-		*sortClauses = groupList;
+		path = (Path *) create_sort_path(root,
+										 result_rel,
+										 path,
+										 make_pathkeys_for_sortclauses(root,
+																   groupList,
+																	   tlist),
+										 -1.0);
+		/* We have to manually jam the right tlist into the path; ick */
+		path->pathtarget = create_pathtarget(root, tlist);
+		path = (Path *) create_upper_unique_path(root,
+												 result_rel,
+												 path,
+												 list_length(path->pathkeys),
+												 dNumGroups);
 	}
-	plan->flow = pull_up_Flow(plan, plan->lefttree);
 
-	return plan;
+	return path;
 }
 
 /*
@@ -884,9 +1029,8 @@ make_union_unique(SetOperationStmt *op, Plan *plan,
  */
 static bool
 choose_hashed_setop(PlannerInfo *root, List *groupClauses,
-					Plan *input_plan,
+					Path *input_path,
 					double dNumGroups, double dNumOutputRows,
-					double tuple_fraction,
 					const char *construct)
 {
 	int			numGroupCols = list_length(groupClauses);
@@ -895,6 +1039,7 @@ choose_hashed_setop(PlannerInfo *root, List *groupClauses,
 	Size		hashentrysize;
 	Path		hashed_p;
 	Path		sorted_p;
+	double		tuple_fraction;
 
 	/* Check whether the operators support sorting or hashing */
 	can_sort = grouping_is_sortable(groupClauses);
@@ -921,14 +1066,19 @@ choose_hashed_setop(PlannerInfo *root, List *groupClauses,
 	/*
 	 * Don't do it if it doesn't look like the hashtable will fit into
 	 * work_mem.
+	 *
+	 * GPDB: In other places where we are building a Hash Aggregate, we use
+	 * calcHashAggTableSizes(), which takes into account that in GPDB, a Hash
+	 * Aggregate can spill to disk. We must *not* do that here, because we
+	 * might be building a Hashed SetOp, not a Hash Aggregate. A Hashed SetOp
+	 * uses the upstream hash table implementation unmodified, and cannot
+	 * spill.
+	 * FIXME: It's a bit lame that Hashed SetOp cannot spill to disk. And it's
+	 * even more lame that we don't account the spilling correctly, if we are
+	 * in fact constructing a Hash Aggregate. A UNION is implemented with a
+	 * Hash Aggregate, only INTERSECT and EXCEPT use Hashed SetOp.
 	 */
-
-	/*
-	 * Note that SetOp uses a TupleHashTable and not GPDB's HHashTable for
-	 * performing set operations. So, use the hash entry size calculations from
-	 * upstream.
-	 */
-	hashentrysize = MAXALIGN(input_plan->plan_width) + MAXALIGN(sizeof(MinimalTupleData));
+	hashentrysize = MAXALIGN(input_path->pathtarget->width) + MAXALIGN(SizeofMinimalTupleHeader);
 
 	if (hashentrysize * dNumGroups > work_mem * 1024L)
 		return false;
@@ -945,32 +1095,32 @@ choose_hashed_setop(PlannerInfo *root, List *groupClauses,
 	 * make actual Paths for these steps.
 	 */
 	cost_agg(&hashed_p, root, AGG_HASHED, NULL,
-			 numGroupCols, dNumGroups,
-			 input_plan->startup_cost, input_plan->total_cost,
-			 input_plan->plan_rows,
-			 hashentrysize, /* input_width */
-			 0, /* hash_batches - so spilling expected with TupleHashTable */
-			 hashentrysize, /* hashentry_width */
+			 numGroupCols, dNumGroups / planner_segment_count(NULL),
+			 input_path->startup_cost, input_path->total_cost,
+			 input_path->rows,
+			 NULL, /* GPDB: We are using the upstream hash table implementation,
+					* which does not spill. */
 			 false /* hash_streaming */);
 
 	/*
 	 * Now for the sorted case.  Note that the input is *always* unsorted,
 	 * since it was made by appending unrelated sub-relations together.
 	 */
-	sorted_p.startup_cost = input_plan->startup_cost;
-	sorted_p.total_cost = input_plan->total_cost;
+	sorted_p.startup_cost = input_path->startup_cost;
+	sorted_p.total_cost = input_path->total_cost;
 	/* XXX cost_sort doesn't actually look at pathkeys, so just pass NIL */
 	cost_sort(&sorted_p, root, NIL, sorted_p.total_cost,
-			  input_plan->plan_rows, input_plan->plan_width,
+			  input_path->rows, input_path->pathtarget->width,
 			  0.0, work_mem, -1.0);
 	cost_group(&sorted_p, root, numGroupCols, dNumGroups,
 			   sorted_p.startup_cost, sorted_p.total_cost,
-			   input_plan->plan_rows);
+			   input_path->rows);
 
 	/*
 	 * Now make the decision using the top-level tuple fraction.  First we
 	 * have to convert an absolute count (LIMIT) into fractional form.
 	 */
+	tuple_fraction = root->tuple_fraction;
 	if (tuple_fraction >= 1.0)
 		tuple_fraction /= dNumOutputRows;
 
@@ -1090,6 +1240,14 @@ generate_setop_tlist(List *colTypes, List *colCollations,
 							  (AttrNumber) resno++,
 							  pstrdup(reftle->resname),
 							  false);
+
+		/*
+		 * By convention, all non-resjunk columns in a setop tree have
+		 * ressortgroupref equal to their resno.  In some cases the ref isn't
+		 * needed, but this is a cleaner way than modifying the tlist later.
+		 */
+		tle->ressortgroupref = tle->resno;
+
 		tlist = lappend(tlist, tle);
 	}
 
@@ -1120,18 +1278,22 @@ generate_setop_tlist(List *colTypes, List *colCollations,
  * colTypes: OID list of set-op's result column datatypes
  * colCollations: OID list of set-op's result column collations
  * flag: true to create a flag column copied up from subplans
- * input_plans: list of sub-plans of the Append
+ * input_tlists: list of tlists for sub-plans of the Append
  * refnames_tlist: targetlist to take column names from
  *
  * The entries in the Append's targetlist should always be simple Vars;
  * we just have to make sure they have the right datatypes/typmods/collations.
  * The Vars are always generated with varno OUTER (CDB/MPP change for
  * EXPLAIN; varno 0 was used in PostgreSQL).
+ *
+ * XXX a problem with the varno-zero approach is that set_pathtarget_cost_width
+ * cannot figure out a realistic width for the tlist we make here.  But we
+ * ought to refactor this code to produce a PathTarget directly, anyway.
  */
 static List *
 generate_append_tlist(List *colTypes, List *colCollations,
 					  bool flag,
-					  List *input_plans,
+					  List *input_tlists,
 					  List *refnames_tlist)
 {
 	List	   *tlist = NIL;
@@ -1142,7 +1304,7 @@ generate_append_tlist(List *colTypes, List *colCollations,
 	int			colindex;
 	TargetEntry *tle;
 	Node	   *expr;
-	ListCell   *planl;
+	ListCell   *tlistl;
 	int32	   *colTypmods;
 
 	/*
@@ -1153,16 +1315,16 @@ generate_append_tlist(List *colTypes, List *colCollations,
 	 */
 	colTypmods = (int32 *) palloc(list_length(colTypes) * sizeof(int32));
 
-	foreach(planl, input_plans)
+	foreach(tlistl, input_tlists)
 	{
-		Plan	   *subplan = (Plan *) lfirst(planl);
-		ListCell   *subtlist;
+		List	   *subtlist = (List *) lfirst(tlistl);
+		ListCell   *subtlistl;
 
 		curColType = list_head(colTypes);
 		colindex = 0;
-		foreach(subtlist, subplan->targetlist)
+		foreach(subtlistl, subtlist)
 		{
-			TargetEntry *subtle = (TargetEntry *) lfirst(subtlist);
+			TargetEntry *subtle = (TargetEntry *) lfirst(subtlistl);
 
 			if (subtle->resjunk)
 				continue;
@@ -1172,7 +1334,7 @@ generate_append_tlist(List *colTypes, List *colCollations,
 				/* If first subplan, copy the typmod; else compare */
 				int32		subtypmod = exprTypmod((Node *) subtle->expr);
 
-				if (planl == list_head(input_plans))
+				if (tlistl == list_head(input_tlists))
 					colTypmods[colindex] = subtypmod;
 				else if (subtypmod != colTypmods[colindex])
 					colTypmods[colindex] = -1;
@@ -1212,6 +1374,14 @@ generate_append_tlist(List *colTypes, List *colCollations,
 							  (AttrNumber) resno++,
 							  pstrdup(reftle->resname),
 							  false);
+
+		/*
+		 * By convention, all non-resjunk columns in a setop tree have
+		 * ressortgroupref equal to their resno.  In some cases the ref isn't
+		 * needed, but this is a cleaner way than modifying the tlist later.
+		 */
+		tle->ressortgroupref = tle->resno;
+
 		tlist = lappend(tlist, tle);
 	}
 
@@ -1246,7 +1416,7 @@ generate_append_tlist(List *colTypes, List *colCollations,
  * list, except that the entries do not have sortgrouprefs set because
  * the parser output representation doesn't include a tlist for each
  * setop.  So what we need to do here is copy that list and install
- * proper sortgrouprefs into it and into the targetlist.
+ * proper sortgrouprefs into it (copying those from the targetlist).
  */
 static List *
 generate_setop_grouplist(SetOperationStmt *op, List *targetlist)
@@ -1254,7 +1424,6 @@ generate_setop_grouplist(SetOperationStmt *op, List *targetlist)
 	List	   *grouplist = (List *) copyObject(op->groupClauses);
 	ListCell   *lg;
 	ListCell   *lt;
-	Index		refno = 1;
 
 	lg = list_head(grouplist);
 	foreach(lt, targetlist)
@@ -1262,11 +1431,15 @@ generate_setop_grouplist(SetOperationStmt *op, List *targetlist)
 		TargetEntry *tle = (TargetEntry *) lfirst(lt);
 		SortGroupClause *sgc;
 
-		/* tlist shouldn't have any sortgrouprefs yet */
-		Assert(tle->ressortgroupref == 0);
-
 		if (tle->resjunk)
+		{
+			/* resjunk columns should not have sortgrouprefs */
+			Assert(tle->ressortgroupref == 0);
 			continue;			/* ignore resjunk columns */
+		}
+
+		/* non-resjunk columns should have sortgroupref = resno */
+		Assert(tle->ressortgroupref == tle->resno);
 
 		/* non-resjunk columns should have grouping clauses */
 		Assert(lg != NULL);
@@ -1274,8 +1447,7 @@ generate_setop_grouplist(SetOperationStmt *op, List *targetlist)
 		lg = lnext(lg);
 		Assert(sgc->tleSortGroupRef == 0);
 
-		/* we could use assignSortGroupRef here, but seems a bit silly */
-		sgc->tleSortGroupRef = tle->ressortgroupref = refno++;
+		sgc->tleSortGroupRef = tle->ressortgroupref;
 	}
 	Assert(lg == NULL);
 	return grouplist;
@@ -1370,7 +1542,7 @@ expand_inherited_rtentry(PlannerInfo *root, RangeTblEntry *rte, Index rti)
 	 *
 	 * If the parent relation is the query's result relation, then we need
 	 * RowExclusiveLock.  Otherwise, if it's accessed FOR UPDATE/SHARE, we
-	 * need RowShareLock; otherwise AccessShareLock.  We can't just grab
+	 * need ExclusiveLock; otherwise AccessShareLock.  We can't just grab
 	 * AccessShareLock because then the executor would be trying to upgrade
 	 * the lock, leading to possible deadlocks.  (This code should match the
 	 * parser and rewriter.)
@@ -1378,8 +1550,24 @@ expand_inherited_rtentry(PlannerInfo *root, RangeTblEntry *rte, Index rti)
 	oldrc = get_plan_rowmark(root->rowMarks, rti);
 	if (rti == parse->resultRelation)
 		lockmode = RowExclusiveLock;
-	else if (oldrc && RowMarkRequiresRowShareLock(oldrc->markType))
-		lockmode = RowShareLock;
+	else if (oldrc)
+	{
+		/*
+		 * Greenplum specific behavior:
+		 * The implementation of select statement with locking clause
+		 * (for update | no key update | share | key share) in postgres
+		 * is to hold RowShareLock on tables during parsing stage, and
+		 * generate a LockRows plan node for executor to lock the tuples.
+		 * It is not easy to lock tuples in Greenplum database, since
+		 * tuples may be fetched through motion nodes.
+		 *
+		 * But when Global Deadlock Detector is enabled, and the select
+		 * statement with locking clause contains only one table, we are
+		 * sure that there are no motions. For such simple cases, we could
+		 * make the behavior just the same as Postgres.
+		 */
+		lockmode = oldrc->canOptSelectLockingClause ? RowShareLock : ExclusiveLock;
+	}
 	else
 		lockmode = AccessShareLock;
 
@@ -1452,12 +1640,13 @@ expand_inherited_rtentry(PlannerInfo *root, RangeTblEntry *rte, Index rti)
 
 		/*
 		 * Build an RTE for the child, and attach to query's rangetable list.
-		 * We copy most fields of the parent's RTE, but replace relation OID,
-		 * and set inh = false.  Also, set requiredPerms to zero since all
-		 * required permissions checks are done on the original RTE.
+		 * We copy most fields of the parent's RTE, but replace relation OID
+		 * and relkind, and set inh = false.  Also, set requiredPerms to zero
+		 * since all required permissions checks are done on the original RTE.
 		 */
 		childrte = copyObject(rte);
 		childrte->relid = childOID;
+		childrte->relkind = newrelation->rd_rel->relkind;
 		childrte->inh = false;
 		childrte->requiredPerms = 0;
 		parse->rtable = lappend(parse->rtable, childrte);
@@ -1484,14 +1673,16 @@ expand_inherited_rtentry(PlannerInfo *root, RangeTblEntry *rte, Index rti)
 		 * if this is the parent table, leave copyObject's result alone.
 		 *
 		 * Note: we need to do this even though the executor won't run any
-		 * permissions checks on the child RTE.  The modifiedCols bitmap may
-		 * be examined for trigger-firing purposes.
+		 * permissions checks on the child RTE.  The insertedCols/updatedCols
+		 * bitmaps may be examined for trigger-firing purposes.
 		 */
 		if (childOID != parentOID)
 		{
 			childrte->selectedCols = translate_col_privs(rte->selectedCols,
 												   appinfo->translated_vars);
-			childrte->modifiedCols = translate_col_privs(rte->modifiedCols,
+			childrte->insertedCols = translate_col_privs(rte->insertedCols,
+												   appinfo->translated_vars);
+			childrte->updatedCols = translate_col_privs(rte->updatedCols,
 												   appinfo->translated_vars);
 		}
 
@@ -1505,9 +1696,15 @@ expand_inherited_rtentry(PlannerInfo *root, RangeTblEntry *rte, Index rti)
 			newrc->rti = childRTindex;
 			newrc->prti = rti;
 			newrc->rowmarkId = oldrc->rowmarkId;
-			newrc->markType = oldrc->markType;
-			newrc->noWait = oldrc->noWait;
+			/* Reselect rowmark type, because relkind might not match parent */
+			newrc->markType = select_rowmark_type(childrte, oldrc->strength);
+			newrc->allMarkTypes = (1 << newrc->markType);
+			newrc->strength = oldrc->strength;
+			newrc->waitPolicy = oldrc->waitPolicy;
 			newrc->isParent = false;
+
+			/* Include child's rowmark type in parent's allMarkTypes */
+			oldrc->allMarkTypes |= newrc->allMarkTypes;
 
 			root->rowMarks = lappend(root->rowMarks, newrc);
 		}
@@ -1619,7 +1816,7 @@ make_inh_translation_list(Relation oldrelation, Relation newrelation,
 		 */
 		if (old_attno < newnatts &&
 			(att = new_tupdesc->attrs[old_attno]) != NULL &&
-			!att->attisdropped && att->attinhcount != 0 &&
+			!att->attisdropped &&
 			strcmp(attname, NameStr(att->attname)) == 0)
 			new_attno = old_attno;
 		else
@@ -1627,7 +1824,7 @@ make_inh_translation_list(Relation oldrelation, Relation newrelation,
 			for (new_attno = 0; new_attno < newnatts; new_attno++)
 			{
 				att = new_tupdesc->attrs[new_attno];
-				if (!att->attisdropped && att->attinhcount != 0 &&
+				if (!att->attisdropped &&
 					strcmp(attname, NameStr(att->attname)) == 0)
 					break;
 			}
@@ -1912,7 +2109,6 @@ adjust_appendrel_attrs_mutator(Node *node,
 	}
 	/* Shouldn't need to handle planner auxiliary nodes here */
 	Assert(!IsA(node, SpecialJoinInfo));
-	Assert(!IsA(node, LateralJoinInfo));
 	Assert(!IsA(node, AppendRelInfo));
 	Assert(!IsA(node, PlaceHolderInfo));
 	Assert(!IsA(node, MinMaxAggInfo));
@@ -2013,7 +2209,7 @@ adjust_appendrel_attrs_mutator(Node *node,
 	 */
 	if (IsA(node, SubPlan))
 	{
-		SubPlan *sp = (SubPlan *) node;
+		SubPlan	   *sp = (SubPlan *) node;
 
 		if (!sp->is_initplan)
 		{
@@ -2021,7 +2217,6 @@ adjust_appendrel_attrs_mutator(Node *node,
 			Plan *newsubplan = (Plan *) copyObject(planner_subplan_get_plan(root, sp));
 			PlannerInfo *newsubroot = makeNode(PlannerInfo);
 
-			/* GPDB_92_MERGE_FIXME: Do we just need a reference or maybe deep copy instead? */
 			memcpy(newsubroot, planner_subplan_get_root(root, sp), sizeof(PlannerInfo));
 
 			/*
@@ -2035,6 +2230,7 @@ adjust_appendrel_attrs_mutator(Node *node,
 			 * we can modify it directly.
 			 */
 			sp->plan_id = list_length(root->glob->subplans);
+			sp->plan_name = psprintf("%s (copy %d)", sp->plan_name, sp->plan_id);
 		}
 	}
 
@@ -2153,4 +2349,27 @@ adjust_inherited_tlist(List *tlist, AppendRelInfo *context)
 	}
 
 	return new_tlist;
+}
+
+/*
+ * adjust_appendrel_attrs_multilevel
+ *	  Apply Var translations from a toplevel appendrel parent down to a child.
+ *
+ * In some cases we need to translate expressions referencing a baserel
+ * to reference an appendrel child that's multiple levels removed from it.
+ */
+Node *
+adjust_appendrel_attrs_multilevel(PlannerInfo *root, Node *node,
+								  RelOptInfo *child_rel)
+{
+	AppendRelInfo *appinfo = find_childrel_appendrelinfo(root, child_rel);
+	RelOptInfo *parent_rel = find_base_rel(root, appinfo->parent_relid);
+
+	/* If parent is also a child, first recurse to apply its translations */
+	if (parent_rel->reloptkind == RELOPT_OTHER_MEMBER_REL)
+		node = adjust_appendrel_attrs_multilevel(root, node, parent_rel);
+	else
+		Assert(parent_rel->reloptkind == RELOPT_BASEREL);
+	/* Now translate for this child */
+	return adjust_appendrel_attrs(root, node, appinfo);
 }

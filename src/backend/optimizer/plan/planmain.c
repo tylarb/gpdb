@@ -11,7 +11,7 @@
  *
  * Portions Copyright (c) 2005-2008, Greenplum inc
  * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -22,6 +22,7 @@
  */
 #include "postgres.h"
 
+#include "optimizer/clauses.h"
 #include "optimizer/orclauses.h"
 #include "optimizer/pathnode.h"
 #include "optimizer/paths.h"
@@ -34,7 +35,6 @@
 #include "cdb/cdbvars.h"
 #include "optimizer/cost.h"
 
-static Bitmapset *distcols_in_groupclause(List *gc, Bitmapset *bms);
 
 /*
  * query_planner
@@ -44,9 +44,7 @@ static Bitmapset *distcols_in_groupclause(List *gc, Bitmapset *bms);
  * Since query_planner does not handle the toplevel processing (grouping,
  * sorting, etc) it cannot select the best path by itself.  Instead, it
  * returns the RelOptInfo for the top level of joining, and the caller
- * (grouping_planner) can choose one of the surviving paths for the rel.
- * Normally it would choose either the rel's cheapest path, or the cheapest
- * path for the desired sort order.
+ * (grouping_planner) can choose among the surviving paths for the rel.
  *
  * root describes the query to plan
  * tlist is the target list the query should produce
@@ -81,8 +79,21 @@ query_planner(PlannerInfo *root, List *tlist,
 		/* We need a dummy joinrel to describe the empty set of baserels */
 		final_rel = build_empty_join_rel(root);
 
+		/*
+		 * If query allows parallelism in general, check whether the quals are
+		 * parallel-restricted.  There's currently no real benefit to setting
+		 * this flag correctly because we can't yet reference subplans from
+		 * parallel workers.  But that might change someday, so set this
+		 * correctly anyway.
+		 */
+		if (root->glob->parallelModeOK)
+			final_rel->consider_parallel =
+				!has_parallel_hazard(parse->jointree->quals, false);
+
 		/* The only path for it is a trivial Result path */
-		result_path = (Path *) create_result_path((List *) parse->jointree->quals);
+		result_path = (Path *) create_result_path(root, final_rel,
+												  final_rel->reltarget,
+												  (List *) parse->jointree->quals);
 		add_path(final_rel, result_path);
 
 		/* Select cheapest path (pretty easy in this case...) */
@@ -95,17 +106,20 @@ query_planner(PlannerInfo *root, List *tlist,
 		root->canon_pathkeys = NIL;
 		(*qp_callback) (root, qp_extra);
 
+		if (Gp_role == GP_ROLE_DISPATCH)
 		{
 			char		exec_location;
 
 			exec_location = check_execute_on_functions((Node *) parse->targetList);
 
-			if (exec_location == PROEXECLOCATION_MASTER)
+			if (exec_location == PROEXECLOCATION_MASTER || exec_location == PROEXECLOCATION_INITPLAN)
 				CdbPathLocus_MakeEntry(&result_path->locus);
 			else if (exec_location == PROEXECLOCATION_ALL_SEGMENTS)
 				CdbPathLocus_MakeStrewn(&result_path->locus,
-										GP_POLICY_ALL_NUMSEGMENTS);
+										getgpsegmentCount());
 		}
+		else
+			CdbPathLocus_MakeEntry(&result_path->locus);
 
 		return final_rel;
 	}
@@ -114,7 +128,7 @@ query_planner(PlannerInfo *root, List *tlist,
 	 * Init planner lists to empty.
 	 *
 	 * NOTE: append_rel_list was set up by subquery_planner, so do not touch
-	 * here; eq_classes and minmax_aggs may contain data already, too.
+	 * here.
 	 */
 	root->join_rel_list = NIL;
 	root->join_rel_hash = NULL;
@@ -125,8 +139,8 @@ query_planner(PlannerInfo *root, List *tlist,
 	root->right_join_clauses = NIL;
 	root->full_join_clauses = NIL;
 	root->join_info_list = NIL;
-	root->lateral_info_list = NIL;
 	root->placeholder_list = NIL;
+	root->fkey_list = NIL;
 	root->initial_rels = NIL;
 
 	/*
@@ -160,6 +174,8 @@ query_planner(PlannerInfo *root, List *tlist,
 	 * work from.
 	 */
 	build_base_rel_tlists(root, tlist);
+
+	make_placeholders_for_subplans(root);
 
 	find_placeholders_in_jointree(root);
 
@@ -213,16 +229,23 @@ query_planner(PlannerInfo *root, List *tlist,
 	/*
 	 * Now distribute "placeholders" to base rels as needed.  This has to be
 	 * done after join removal because removal could change whether a
-	 * placeholder is evaluatable at a base rel.
+	 * placeholder is evaluable at a base rel.
 	 */
 	add_placeholders_to_base_rels(root);
 
 	/*
-	 * Create the LateralJoinInfo list now that we have finalized
-	 * PlaceHolderVar eval levels and made any necessary additions to the
-	 * lateral_vars lists for lateral references within PlaceHolderVars.
+	 * Construct the lateral reference sets now that we have finalized
+	 * PlaceHolderVar eval levels.
 	 */
 	create_lateral_join_info(root);
+
+	/*
+	 * Match foreign keys to equivalence classes and join quals.  This must be
+	 * done after finalizing equivalence classes, and it's useful to wait till
+	 * after join removal so that we can skip processing foreign keys
+	 * involving removed relations.
+	 */
+	match_foreign_keys_to_quals(root);
 
 	/*
 	 * Look for join OR clauses that we can extract single-relation
@@ -273,68 +296,6 @@ query_planner(PlannerInfo *root, List *tlist,
 	return final_rel;
 }
 
-/*
- * distcols_in_groupclause -
- *     Return all distinct tleSortGroupRef values in a GROUP BY clause.
- *
- * If this is a GROUPING_SET, this function is called recursively to
- * find the tleSortGroupRef values for underlying grouping columns.
- */
-static Bitmapset *
-distcols_in_groupclause(List *gc, Bitmapset *bms)
-{
-	ListCell *l;
-
-	foreach(l, gc)
-	{
-		Node *node = lfirst(l);
-
-		if (node == NULL)
-			continue;
-
-		Assert(IsA(node, SortGroupClause) ||
-			   IsA(node, List) ||
-			   IsA(node, GroupingClause));
-
-		if (IsA(node, SortGroupClause))
-		{
-			bms = bms_add_member(bms, ((SortGroupClause *) node)->tleSortGroupRef);
-		}
-
-		else if (IsA(node, List))
-		{
-			bms = distcols_in_groupclause((List *)node, bms);
-		}
-
-		else if (IsA(node, GroupingClause))
-		{
-			List *groupsets = ((GroupingClause *)node)->groupsets;
-			bms = distcols_in_groupclause(groupsets, bms);
-		}
-	}
-
-	return bms;
-}
-
-/*
- * num_distcols_in_grouplist -
- *      Return number of distinct columns/expressions that appeared in
- *      a list of GroupClauses or GroupingClauses.
- */
-int
-num_distcols_in_grouplist(List *gc)
-{
-	Bitmapset *bms = NULL;
-	int num_cols;
-
-	bms = distcols_in_groupclause(gc, bms);
-
-	num_cols = bms_num_members(bms);
-	bms_free(bms);
-
-	return num_cols;
-}
-
 /**
  * Planner configuration related
  */
@@ -345,42 +306,18 @@ num_distcols_in_grouplist(List *gc)
 PlannerConfig *DefaultPlannerConfig(void)
 {
 	PlannerConfig *c1 = (PlannerConfig *) palloc(sizeof(PlannerConfig));
-	c1->cdbpath_segments = planner_segment_count(NULL);
-	c1->enable_seqscan = enable_seqscan;
-	c1->enable_indexscan = enable_indexscan;
-	c1->enable_bitmapscan = enable_bitmapscan;
-	c1->enable_tidscan = enable_tidscan;
-	c1->enable_sort = enable_sort;
-	c1->enable_hashagg = enable_hashagg;
-	c1->enable_groupagg = enable_groupagg;
-	c1->enable_nestloop = enable_nestloop;
-	c1->enable_mergejoin = enable_mergejoin;
-	c1->enable_hashjoin = enable_hashjoin;
-	c1->gp_enable_hashjoin_size_heuristic = gp_enable_hashjoin_size_heuristic;
-	c1->gp_enable_predicate_propagation = gp_enable_predicate_propagation;
-	c1->constraint_exclusion = constraint_exclusion;
 
 	c1->gp_enable_minmax_optimization = gp_enable_minmax_optimization;
 	c1->gp_enable_multiphase_agg = gp_enable_multiphase_agg;
-	c1->gp_enable_preunique = gp_enable_preunique;
-	c1->gp_eager_preunique = gp_eager_preunique;
-	c1->gp_hashagg_streambottom = gp_hashagg_streambottom;
-	c1->gp_enable_agg_distinct = gp_enable_agg_distinct;
-	c1->gp_enable_dqa_pruning = gp_enable_dqa_pruning;
-	c1->gp_eager_dqa_pruning = gp_eager_dqa_pruning;
-	c1->gp_eager_one_phase_agg = gp_eager_one_phase_agg;
-	c1->gp_eager_two_phase_agg = gp_eager_two_phase_agg;
-	c1->gp_enable_groupext_distinct_pruning = gp_enable_groupext_distinct_pruning;
-	c1->gp_enable_groupext_distinct_gather = gp_enable_groupext_distinct_gather;
-	c1->gp_enable_sort_limit = gp_enable_sort_limit;
-	c1->gp_enable_sort_distinct = gp_enable_sort_distinct;
-
 	c1->gp_enable_direct_dispatch = gp_enable_direct_dispatch;
-	c1->gp_dynamic_partition_pruning = gp_dynamic_partition_pruning;
 
 	c1->gp_cte_sharing = gp_cte_sharing;
 
 	c1->honor_order_by = true;
+
+	c1->is_under_subplan = false;
+
+	c1->force_singleQE = false;
 
 	return c1;
 }

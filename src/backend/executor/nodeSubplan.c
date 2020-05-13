@@ -1,11 +1,19 @@
 /*-------------------------------------------------------------------------
  *
  * nodeSubplan.c
- *	  routines to support subselects
+ *	  routines to support sub-selects appearing in expressions
+ *
+ * This module is concerned with executing SubPlan expression nodes, which
+ * should not be confused with sub-SELECTs appearing in FROM.  SubPlans are
+ * divided into "initplans", which are those that need only one evaluation per
+ * query (among other restrictions, this requires that they don't use any
+ * direct correlation variables from the parent plan level), and "regular"
+ * subplans, which are re-evaluated every time their result is required.
+ *
  *
  * Portions Copyright (c) 2005-2010, Greenplum inc
  * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -32,7 +40,9 @@
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "access/heapam.h"
+#include "utils/tuplestorenew.h"
 #include "cdb/cdbexplain.h"             /* cdbexplain_recvExecStats */
+#include "cdb/cdbsubplan.h"
 #include "cdb/cdbvars.h"
 #include "cdb/cdbdisp.h"
 #include "cdb/cdbdisp_query.h"
@@ -43,10 +53,6 @@ static Datum ExecSubPlan(SubPlanState *node,
 			ExprContext *econtext,
 			bool *isNull,
 			ExprDoneCond *isDone);
-static Datum ExecAlternativeSubPlan(AlternativeSubPlanState *node,
-					   ExprContext *econtext,
-					   bool *isNull,
-					   ExprDoneCond *isDone);
 static Datum ExecHashSubPlan(SubPlanState *node,
 				ExprContext *econtext,
 				bool *isNull);
@@ -62,6 +68,8 @@ static bool slotNoNulls(TupleTableSlot *slot);
 
 /* ----------------------------------------------------------------
  *		ExecSubPlan
+ *
+ * This is the main entry point for execution of a regular SubPlan.
  * ----------------------------------------------------------------
  */
 static Datum
@@ -71,7 +79,9 @@ ExecSubPlan(SubPlanState *node,
 			ExprDoneCond *isDone)
 {
 	SubPlan    *subplan = (SubPlan *) node->xprstate.expr;
-	Datum		result;
+	EState	   *estate = node->planstate->state;
+	ScanDirection dir = estate->es_direction;
+	Datum		retval;
 
 	/* Set default values for result flags: non-null, not a set result */
 	*isNull = false;
@@ -81,21 +91,22 @@ ExecSubPlan(SubPlanState *node,
 	/* Sanity checks */
 	if (subplan->subLinkType == CTE_SUBLINK)
 		elog(ERROR, "CTE subplans should not be executed via ExecSubPlan");
-	if (subplan->setParam != NIL)
+	if (subplan->setParam != NIL && subplan->subLinkType != MULTIEXPR_SUBLINK)
 		elog(ERROR, "cannot set parent params from subquery");
 
-	/* Remember that we're recursing into a sub-plan */
-	node->planstate->state->currentSubplanLevel++;
+	/* Force forward-scan mode for evaluation */
+	estate->es_direction = ForwardScanDirection;
 
 	/* Select appropriate evaluation strategy */
 	if (subplan->useHashTable)
-		result = ExecHashSubPlan(node, econtext, isNull);
+		retval = ExecHashSubPlan(node, econtext, isNull);
 	else
-		result = ExecScanSubPlan(node, econtext, isNull);
+		retval = ExecScanSubPlan(node, econtext, isNull);
 
-	node->planstate->state->currentSubplanLevel--;
+	/* restore scan direction */
+	estate->es_direction = dir;
 
-	return result;
+	return retval;
 }
 
 /*
@@ -237,7 +248,38 @@ ExecScanSubPlan(SubPlanState *node,
 	bool		found = false;	/* TRUE if got at least one subplan tuple */
 	ListCell   *pvar;
 	ListCell   *l;
-	ArrayBuildState *astate = NULL;
+	ArrayBuildStateAny *astate = NULL;
+
+	/*
+	 * MULTIEXPR subplans, when "executed", just return NULL; but first we
+	 * mark the subplan's output parameters as needing recalculation.  (This
+	 * is a bit of a hack: it relies on the subplan appearing later in its
+	 * targetlist than any of the referencing Params, so that all the Params
+	 * have been evaluated before we re-mark them for the next evaluation
+	 * cycle.  But in general resjunk tlist items appear after non-resjunk
+	 * ones, so this should be safe.)  Unlike ExecReScanSetParamPlan, we do
+	 * *not* set bits in the parent plan node's chgParam, because we don't
+	 * want to cause a rescan of the parent.
+	 */
+	if (subLinkType == MULTIEXPR_SUBLINK)
+	{
+		EState	   *estate = node->parent->state;
+
+		foreach(l, subplan->setParam)
+		{
+			int			paramid = lfirst_int(l);
+			ParamExecData *prm = &(estate->es_param_exec_vals[paramid]);
+
+			prm->execPlan = node;
+		}
+		*isNull = true;
+		return (Datum) 0;
+	}
+
+	/* Initialize ArrayBuildStateAny in caller's context, if needed */
+	if (subLinkType == ARRAY_SUBLINK)
+		astate = initArrayResultAny(subplan->firstColType,
+									CurrentMemoryContext, true);
 
 	/*
 	 * We are probably in a short-lived expression-evaluation context. Switch
@@ -354,8 +396,8 @@ ExecScanSubPlan(SubPlanState *node,
 			/* stash away current value */
 			Assert(subplan->firstColType == slot->tts_tupleDescriptor->attrs[0]->atttypid);
 			dvalue = slot_getattr(slot, 1, &disnull);
-			astate = accumArrayResult(astate, dvalue, disnull,
-									  subplan->firstColType, oldcontext);
+			astate = accumArrayResultAny(astate, dvalue, disnull,
+										 subplan->firstColType, oldcontext);
 			/* keep scanning subplan to collect all values */
 			continue;
 		}
@@ -425,10 +467,7 @@ ExecScanSubPlan(SubPlanState *node,
 	if (subLinkType == ARRAY_SUBLINK)
 	{
 		/* We return the result in the caller's context */
-		if (astate != NULL)
-			result = makeArrayResult(astate, oldcontext);
-		else
-			result = PointerGetDatum(construct_empty_array(subplan->firstColType));
+		result = makeArrayResultAny(astate, oldcontext, true);
 	}
 	else if (!found)
 	{
@@ -691,6 +730,9 @@ ExecInitSubPlan(SubPlan *subplan, PlanState *parent)
 	sstate->planstate = (PlanState *) list_nth(estate->es_subplanstates,
 											   subplan->plan_id - 1);
 
+	/* ... and to its parent's state */
+	sstate->parent = parent;
+
 	/* Initialize subexpressions */
 	sstate->testexpr = ExecInitExpr((Expr *) subplan->testexpr, parent);
 	sstate->args = (List *) ExecInitExpr((Expr *) subplan->args, parent);
@@ -712,17 +754,20 @@ ExecInitSubPlan(SubPlan *subplan, PlanState *parent)
 	sstate->tab_eq_funcs = NULL;
 	sstate->lhs_hash_funcs = NULL;
 	sstate->cur_eq_funcs = NULL;
+	sstate->ts_state = palloc0(sizeof(GenericTupStore));
+	sstate->ts_pos = NULL;
 
 	/*
-	 * If this plan is un-correlated or undirect correlated one and want to
-	 * set params for parent plan then mark parameters as needing evaluation.
+	 * If this is an initplan or MULTIEXPR subplan, it has output parameters
+	 * that the parent plan will use, so mark those parameters as needing
+	 * evaluation.  We don't actually run the subplan until we first need one
+	 * of its outputs.
 	 *
 	 * A CTE subplan's output parameter is never to be evaluated in the normal
 	 * way, so skip this in that case.
 	 *
-	 * Note that in the case of un-correlated subqueries we don't care about
-	 * setting parent->chgParam here: indices take care about it, for others -
-	 * it doesn't matter...
+	 * Note that we don't set parent->chgParam here: the parent plan hasn't
+	 * been run yet, so no need to force it to re-run.
 	 */
 	if (subplan->setParam != NIL && subplan->subLinkType != CTE_SUBLINK)
 	{
@@ -736,7 +781,8 @@ ExecInitSubPlan(SubPlan *subplan, PlanState *parent)
 			/**
 			 * If we need to evaluate a parameter, save the planstate to do so.
 			 */
-			if ((Gp_role != GP_ROLE_EXECUTE || !subplan->is_initplan))
+			if ((Gp_role != GP_ROLE_EXECUTE || !subplan->is_initplan ||
+				 estate->es_sliceTable == NULL))
 			{
 				prmExec->execPlan = sstate;
 			}
@@ -920,7 +966,7 @@ ExecInitSubPlan(SubPlan *subplan, PlanState *parent)
 /* ----------------------------------------------------------------
  *		ExecSetParamPlan
  *
- *		Executes an InitPlan subplan and sets its output parameters.
+ *		Executes a subplan and sets its output parameters.
  *
  * This is called from ExecEvalParamExec() when the value of a PARAM_EXEC
  * parameter is requested and the param's execPlan field is set (indicating
@@ -928,43 +974,60 @@ ExecInitSubPlan(SubPlan *subplan, PlanState *parent)
  * of initplans: we don't run the subplan until/unless we need its output.
  * Note that this routine MUST clear the execPlan fields of the plan's
  * output parameters after evaluating them!
+ *
+ * The results of this function are stored in the EState associated with the
+ * ExprContext (particularly, its ecxt_param_exec_vals); any pass-by-ref
+ * result Datums are allocated in the EState's per-query memory.  The passed
+ * econtext can be any ExprContext belonging to that EState; which one is
+ * important only to the extent that the ExprContext's per-tuple memory
+ * context is used to evaluate any parameters passed down to the subplan.
+ * (Thus in principle, the shorter-lived the ExprContext the better, since
+ * that data isn't needed after we return.  In practice, because initplan
+ * parameters are never more complex than Vars, Aggrefs, etc, evaluating them
+ * currently never leaks any memory anyway.)
  * ----------------------------------------------------------------
  */
 
 /*
  * Greenplum Database Changes:
- * In the case where this is running on the dispatcher, and it's a parallel dispatch
- * subplan, we need to dispatch the query to the qExecs as well, like in ExecutorRun.
- * except in this case we don't have to worry about insert statements.
- * In order to serialize the parameters (including PARAM_EXEC parameters that
- * are converted into PARAM_EXEC_REMOTE parameters, I had to add a parameter to this
- * function: ParamListInfo p.  This may be NULL in the non-dispatch case.
+ * In the case where this is running on the dispatcher, and it's a parallel
+ * dispatch subplan, we need to dispatch the query to the qExecs as well, like
+ * in ExecutorRun. Except in this case we don't have to worry about insert
+ * statements.
  */
-
 void
 ExecSetParamPlan(SubPlanState *node, ExprContext *econtext, QueryDesc *queryDesc)
 {
 	SubPlan    *subplan = (SubPlan *) node->xprstate.expr;
 	PlanState  *planstate = node->planstate;
 	SubLinkType subLinkType = subplan->subLinkType;
+	EState	   *estate = planstate->state;
+	ScanDirection dir = estate->es_direction;
 	MemoryContext oldcontext;
 	TupleTableSlot *slot;
+	ListCell   *pvar;
 	ListCell   *l;
 	bool		found = false;
-	ArrayBuildState *astate = NULL;
+	ArrayBuildState *astate pg_attribute_unused() = NULL;
 	Size		savepeakspace = MemoryContextGetPeakSpace(planstate->state->es_query_cxt);
 
-	bool		needDtxTwoPhase;
+	bool		needDtx;
 	bool		shouldDispatch = false;
 	volatile bool explainRecvStats = false;
 
 	if (Gp_role == GP_ROLE_DISPATCH &&
 		planstate != NULL &&
 		planstate->plan != NULL &&
-		subplan->initPlanParallel)
-		shouldDispatch = true;
+		queryDesc)
+	{
+		int			subsliceIndex = queryDesc->plannedstmt->subplan_sliceIds[subplan->plan_id - 1];
+		ExecSlice  *subslice;
 
-	planstate->state->currentSubplanLevel++;
+		subslice = &estate->es_sliceTable->slices[subsliceIndex];
+
+		if (subslice->gangType != GANGTYPE_UNALLOCATED || subslice->children)
+			shouldDispatch = true;
+	}
 
 	/*
 	 * Reset memory high-water mark so EXPLAIN ANALYZE can report each
@@ -982,14 +1045,16 @@ PG_TRY();
 {
 	if (shouldDispatch)
 	{			
-		needDtxTwoPhase = isCurrentDtxTwoPhase();
+		needDtx = isCurrentDtxActivated();
 
 		/*
 		 * This call returns after launching the threads that send the
 		 * command to the appropriate segdbs.  It does not wait for them
 		 * to finish unless an error is detected before all are dispatched.
 		 */
-		CdbDispatchPlan(queryDesc, needDtxTwoPhase, true);
+		CdbDispatchPlan(queryDesc,
+						estate->es_param_exec_vals,
+						needDtx, true);
 
 		/*
 		 * Set up the interconnect for execution of the initplan root slice.
@@ -999,23 +1064,8 @@ PG_TRY();
 		Assert((queryDesc->estate->interconnect_context));
 
 		UpdateMotionExpectedReceivers(queryDesc->estate->motionlayer_context, queryDesc->estate->es_sliceTable);
-
-		ExecUpdateTransportState(planstate, queryDesc->estate->interconnect_context);
-
-		/*
-		 * MPP-7504/MPP-7448: the pre-dispatch function evaluator
-		 * may mess up our snapshot-sync mechanism. So we've
-		 * called verify_shared_snapshot() down in the dispatcher.
-		 */
-		if (queryDesc->extended_query)
-		{
-			/*
-			 * We rewind the segmateSync value since the InitPlan can
-			 * share the same value with its parent plan. See MPP-4504.
-			 */
-			DtxContextInfo_RewindSegmateSync();
-		}
 	}
+	ArrayBuildStateAny *astate = NULL;
 
 	if (subLinkType == ANY_SUBLINK ||
 		subLinkType == ALL_SUBLINK)
@@ -1023,10 +1073,61 @@ PG_TRY();
 	if (subLinkType == CTE_SUBLINK)
 		elog(ERROR, "CTE subplans should not be executed via ExecSetParamPlan");
 
+	/* Initialize ArrayBuildStateAny in caller's context, if needed */
+	if (subLinkType == ARRAY_SUBLINK)
+		astate = initArrayResultAny(subplan->firstColType,
+									CurrentMemoryContext, true);
+
+	/*
+	 * Enforce forward scan direction regardless of caller. It's hard but not
+	 * impossible to get here in backward scan, so make it work anyway.
+	 */
+	estate->es_direction = ForwardScanDirection;
+
 	/*
 	 * Must switch to per-query memory context.
 	 */
 	oldcontext = MemoryContextSwitchTo(econtext->ecxt_per_query_memory);
+
+	/*
+	 * Set Params of this plan from parent plan correlation values. (Any
+	 * calculation we have to do is done in the parent econtext, since the
+	 * Param values don't need to have per-query lifetime.)  Currently, we
+	 * expect only MULTIEXPR_SUBLINK plans to have any correlation values.
+	 */
+	Assert(subplan->parParam == NIL || subLinkType == MULTIEXPR_SUBLINK);
+	Assert(list_length(subplan->parParam) == list_length(node->args));
+
+	forboth(l, subplan->parParam, pvar, node->args)
+	{
+		int			paramid = lfirst_int(l);
+		ParamExecData *prm = &(econtext->ecxt_param_exec_vals[paramid]);
+
+		prm->value = ExecEvalExprSwitchContext((ExprState *) lfirst(pvar),
+											   econtext,
+											   &(prm->isnull),
+											   NULL);
+		planstate->chgParam = bms_add_member(planstate->chgParam, paramid);
+	}
+
+	/*
+	 * Setup the tuplestore writer for functionscan initplan
+	 * 
+	 * Note that the file of tuplestore should not be deleted when
+	 * closing file. This is due to the tuplestore reader is outside
+	 * initplan, and reader will delete the file when it finished.
+	 */
+	if (subLinkType == INITPLAN_FUNC_SUBLINK && !node->ts_state->matstore)
+	{
+		char rwfile_prefix[100];
+
+		function_scan_create_bufname_prefix(rwfile_prefix, sizeof(rwfile_prefix));
+		
+		node->ts_state->matstore = ntuplestore_create_readerwriter(rwfile_prefix, PlanStateOperatorMemKB((PlanState *)(node->planstate)) * 1024, true, false);
+		ntuplestore_set_is_temp_file(node->ts_state->matstore, false);
+		
+		node->ts_pos = (void *)ntuplestore_create_accessor(node->ts_state->matstore, true);
+	}
 
 	/*
 	 * Run the plan.  (If it needs to be rescanned, the first ExecProcNode
@@ -1037,6 +1138,12 @@ PG_TRY();
 		 slot = ExecProcNode(planstate))
 	{
 		int			i = 1;
+
+		if (subLinkType == INITPLAN_FUNC_SUBLINK)
+		{
+			ntuplestore_acc_put_tupleslot((NTupleStoreAccessor *) node->ts_pos, slot);
+			continue;
+		}
 
 		if (subLinkType == EXISTS_SUBLINK || subLinkType == NOT_EXISTS_SUBLINK)
 		{
@@ -1052,12 +1159,6 @@ PG_TRY();
 			prm->isnull = false;
 			found = true;
 
-			if (shouldDispatch)
-			{
-				/* Tell MPP we're done with this plan. */
-				ExecSquelchNode(planstate);
-			}
-
 			break;
 		}
 
@@ -1070,14 +1171,15 @@ PG_TRY();
 			/* stash away current value */
 			Assert(subplan->firstColType == slot->tts_tupleDescriptor->attrs[0]->atttypid);
 			dvalue = slot_getattr(slot, 1, &disnull);
-			astate = accumArrayResult(astate, dvalue, disnull,
-									  subplan->firstColType, oldcontext);
+			astate = accumArrayResultAny(astate, dvalue, disnull,
+										 subplan->firstColType, oldcontext);
 			/* keep scanning subplan to collect all values */
 			continue;
 		}
 
 		if (found &&
 			(subLinkType == EXPR_SUBLINK ||
+			 subLinkType == MULTIEXPR_SUBLINK ||
 			 subLinkType == ROWCOMPARE_SUBLINK))
 			ereport(ERROR,
 					(errcode(ERRCODE_CARDINALITY_VIOLATION),
@@ -1107,6 +1209,23 @@ PG_TRY();
 			prm->value = memtuple_getattr(node->curTuple, slot->tts_mt_bind, i, &(prm->isnull));
 			i++;
 		}
+	}
+
+	/*
+	 * Flush and cleanup the tuplestore writer
+	 *
+	 * Note that the file of tuplestore will not be deleted at here.
+	 * This is due to the tuplestore reader is outside initplan, and
+	 * reader will delete the file when it finished.
+	 *
+	 */
+	if (subLinkType == INITPLAN_FUNC_SUBLINK && node->ts_state->matstore)
+	{
+		ntuplestore_acc_seek_bof((NTupleStoreAccessor *) node->ts_pos);
+		ntuplestore_flush(node->ts_state->matstore);
+		
+		ntuplestore_destroy_accessor((NTupleStoreAccessor *) node->ts_pos);
+		ntuplestore_destroy(node->ts_state->matstore);
 	}
 
 	if (!found)
@@ -1150,31 +1269,42 @@ PG_TRY();
 		 */
 		if (node->curArray != PointerGetDatum(NULL))
 			pfree(DatumGetPointer(node->curArray));
-		if (astate != NULL)
-			node->curArray = makeArrayResult(astate,
-											 econtext->ecxt_per_query_memory);
-		else
-		{
-			MemoryContextSwitchTo(econtext->ecxt_per_query_memory);
-			node->curArray = PointerGetDatum(construct_empty_array(subplan->firstColType));
-		}
+		node->curArray = makeArrayResultAny(astate,
+											econtext->ecxt_per_query_memory,
+											true);
 		prm->execPlan = NULL;
 		prm->value = node->curArray;
 		prm->isnull = false;
 	}
 
+	/* Clean up the interconnect. */
+	if (queryDesc && queryDesc->estate && queryDesc->estate->es_interconnect_is_setup)
+	{
+		TeardownInterconnect(queryDesc->estate->interconnect_context, false); /* following success on QD */
+		queryDesc->estate->interconnect_context = NULL;
+		queryDesc->estate->es_interconnect_is_setup = false;
+	}
+
 	/*
-	 * If we dispatched to QEs, wait for completion and check for errors.
+	 * If we dispatched to QEs, wait for completion.
 	 */
 	if (shouldDispatch && 
 		queryDesc && queryDesc->estate &&
 		queryDesc->estate->dispatcherState &&
 		queryDesc->estate->dispatcherState->primaryResults)
 	{
+		ErrorData *qeError = NULL;
 		CdbDispatcherState *ds = queryDesc->estate->dispatcherState;
 
-		/* Wait for all gangs to finish. */
 		cdbdisp_checkDispatchResult(ds, DISPATCH_WAIT_NONE);
+		cdbdisp_getDispatchResults(ds, &qeError);		
+
+		if (qeError)
+		{
+			queryDesc->estate->dispatcherState = NULL;
+			FlushErrorState();
+			ReThrowError(qeError);
+		}
 
 		/* If EXPLAIN ANALYZE, collect execution stats from qExecs. */
 		if (planstate->instrument && planstate->instrument->need_cdb)
@@ -1190,22 +1320,14 @@ PG_TRY();
 		queryDesc->estate->dispatcherState = NULL;
 		cdbdisp_destroyDispatcherState(ds);
 	}
-
-	/* Clean up the interconnect. */
-	if (queryDesc && queryDesc->estate && queryDesc->estate->es_interconnect_is_setup)
-	{
-		TeardownInterconnect(queryDesc->estate->interconnect_context,
-							 false, false); /* following success on QD */
-		queryDesc->estate->interconnect_context = NULL;
-		queryDesc->estate->es_interconnect_is_setup = false;
-	}
 }
 PG_CATCH();
 {
 	/* If EXPLAIN ANALYZE, collect local and distributed execution stats. */
 	if (planstate->instrument && planstate->instrument->need_cdb)
 	{
-		cdbexplain_localExecStats(planstate, econtext->ecxt_estate->showstatctx);
+		if(Gp_role == GP_ROLE_DISPATCH)
+			cdbexplain_localExecStats(planstate, econtext->ecxt_estate->showstatctx);
 		if (!explainRecvStats &&
 			shouldDispatch &&
 			queryDesc->estate->dispatcherState)
@@ -1224,6 +1346,17 @@ PG_CATCH();
 	MemoryContextSetPeakSpace(planstate->state->es_query_cxt, savepeakspace);
 
 	/*
+	 * Clean up the interconnect.
+	 * CDB TODO: Is this needed following failure on QD?
+	 */
+	if (queryDesc && queryDesc->estate && queryDesc->estate->es_interconnect_is_setup)
+	{
+		TeardownInterconnect(queryDesc->estate->interconnect_context, true);
+		queryDesc->estate->interconnect_context = NULL;
+		queryDesc->estate->es_interconnect_is_setup = false;
+	}
+
+	/*
 	 * Request any commands still executing on qExecs to stop.
 	 * Wait for them to finish and clean up the dispatching structures.
 	 * Replace current error info with QE error info if more interesting.
@@ -1236,31 +1369,52 @@ PG_CATCH();
 		CdbDispatchHandleError(ds);
 	}
 
-	/*
-	 * Clean up the interconnect.
-	 * CDB TODO: Is this needed following failure on QD?
-	 */
-	if (queryDesc && queryDesc->estate && queryDesc->estate->es_interconnect_is_setup)
-	{
-		TeardownInterconnect(queryDesc->estate->interconnect_context,
-							 true, false);
-		queryDesc->estate->interconnect_context = NULL;
-		queryDesc->estate->es_interconnect_is_setup = false;
-	}
 	PG_RE_THROW();
 }
 PG_END_TRY();
 
-	planstate->state->currentSubplanLevel--;
-
 	/* If EXPLAIN ANALYZE, collect local execution stats. */
-	if (planstate->instrument && planstate->instrument->need_cdb)
+	if (Gp_role == GP_ROLE_DISPATCH && planstate->instrument && planstate->instrument->need_cdb)
 		cdbexplain_localExecStats(planstate, econtext->ecxt_estate->showstatctx);
 
 	/* Restore memory high-water mark for root slice of main query. */
 	MemoryContextSetPeakSpace(planstate->state->es_query_cxt, savepeakspace);
 
 	MemoryContextSwitchTo(oldcontext);
+
+	/* restore scan direction */
+	estate->es_direction = dir;
+}
+
+/*
+ * ExecSetParamPlanMulti
+ *
+ * Apply ExecSetParamPlan to evaluate any not-yet-evaluated initplan output
+ * parameters whose ParamIDs are listed in "params".  Any listed params that
+ * are not initplan outputs are ignored.
+ *
+ * As with ExecSetParamPlan, any ExprContext belonging to the current EState
+ * can be used, but in principle a shorter-lived ExprContext is better than a
+ * longer-lived one.
+ */
+void
+ExecSetParamPlanMulti(const Bitmapset *params, ExprContext *econtext, QueryDesc *queryDesc)
+{
+	int			paramid;
+
+	paramid = -1;
+	while ((paramid = bms_next_member(params, paramid)) >= 0)
+	{
+		ParamExecData *prm = &(econtext->ecxt_param_exec_vals[paramid]);
+
+		if (prm->execPlan != NULL)
+		{
+			/* Parameter not evaluated yet, so go do it */
+			ExecSetParamPlan(prm->execPlan, econtext, queryDesc);
+			/* ExecSetParamPlan should have processed this param... */
+			Assert(prm->execPlan == NULL);
+		}
+	}
 }
 
 /*
@@ -1368,7 +1522,7 @@ ExecInitAlternativeSubPlan(AlternativeSubPlan *asplan, PlanState *parent)
  * Note: in future we might consider changing to different subplans on the
  * fly, in case the original rowcount estimate turns out to be way off.
  */
-static Datum
+Datum
 ExecAlternativeSubPlan(AlternativeSubPlanState *node,
 					   ExprContext *econtext,
 					   bool *isNull,

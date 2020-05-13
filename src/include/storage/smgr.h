@@ -6,7 +6,7 @@
  *
  * Portions Copyright (c) 2006-2008, Greenplum inc
  * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/storage/smgr.h
@@ -19,6 +19,7 @@
 #include "fmgr.h"
 #include "storage/block.h"
 #include "storage/relfilenode.h"
+#include "storage/dbdirnode.h"
 
 
 /*
@@ -90,8 +91,6 @@ extern void smgrcreate(SMgrRelation reln, ForkNumber forknum, bool isRedo);
 extern void smgrcreate_ao(RelFileNodeBackend rnode, int32 segmentFileNum, bool isRedo);
 extern void smgrdounlink(SMgrRelation reln, bool isRedo, char relstorage);
 extern void smgrdounlinkall(SMgrRelation *rels, int nrels, bool isRedo, char *relstorages);
-extern void smgrdounlinkfork(SMgrRelation reln, ForkNumber forknum,
-		bool isRedo, char relstorage);
 extern void smgrextend(SMgrRelation reln, ForkNumber forknum,
 		   BlockNumber blocknum, char *buffer, bool skipFsync);
 extern void smgrprefetch(SMgrRelation reln, ForkNumber forknum,
@@ -100,6 +99,8 @@ extern void smgrread(SMgrRelation reln, ForkNumber forknum,
 		 BlockNumber blocknum, char *buffer);
 extern void smgrwrite(SMgrRelation reln, ForkNumber forknum,
 		  BlockNumber blocknum, char *buffer, bool skipFsync);
+extern void smgrwriteback(SMgrRelation reln, ForkNumber forknum,
+			  BlockNumber blocknum, BlockNumber nblocks);
 extern BlockNumber smgrnblocks(SMgrRelation reln, ForkNumber forknum);
 extern void smgrtruncate(SMgrRelation reln, ForkNumber forknum,
 			 BlockNumber nblocks);
@@ -127,6 +128,8 @@ extern void mdread(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 	   char *buffer);
 extern void mdwrite(SMgrRelation reln, ForkNumber forknum,
 		BlockNumber blocknum, char *buffer, bool skipFsync);
+extern void mdwriteback(SMgrRelation reln, ForkNumber forknum,
+			BlockNumber blocknum, BlockNumber nblocks);
 extern BlockNumber mdnblocks(SMgrRelation reln, ForkNumber forknum);
 extern void mdtruncate(SMgrRelation reln, ForkNumber forknum,
 					   BlockNumber nblocks);
@@ -137,14 +140,32 @@ extern void mdpostckpt(void);
 
 extern void SetForwardFsyncRequests(void);
 extern void RememberFsyncRequest(RelFileNode rnode, ForkNumber forknum,
-					 BlockNumber segno);
+					 BlockNumber segno, bool is_ao_segno);
 extern void ForgetRelationFsyncRequests(RelFileNode rnode, ForkNumber forknum);
 extern void ForgetDatabaseFsyncRequests(Oid dbid);
+extern void DropRelationFiles(RelFileNodePendingDelete *delrels, int ndelrels, bool isRedo);
 
 /* smgrtype.c */
 extern Datum smgrout(PG_FUNCTION_ARGS);
 extern Datum smgrin(PG_FUNCTION_ARGS);
 extern Datum smgreq(PG_FUNCTION_ARGS);
 extern Datum smgrne(PG_FUNCTION_ARGS);
+
+/*
+ * Hook for plugins to collect statistics from storage functions
+ * For example, disk quota extension will use these hooks to
+ * detect active tables.
+ */
+typedef void (*file_create_hook_type)(RelFileNodeBackend rnode);
+extern PGDLLIMPORT file_create_hook_type file_create_hook;
+
+typedef void (*file_extend_hook_type)(RelFileNodeBackend rnode);
+extern PGDLLIMPORT file_extend_hook_type file_extend_hook;
+
+typedef void (*file_truncate_hook_type)(RelFileNodeBackend rnode);
+extern PGDLLIMPORT file_truncate_hook_type file_truncate_hook;
+
+typedef void (*file_unlink_hook_type)(RelFileNodeBackend rnode);
+extern PGDLLIMPORT file_unlink_hook_type file_unlink_hook;
 
 #endif   /* SMGR_H */

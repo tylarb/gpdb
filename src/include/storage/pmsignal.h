@@ -4,7 +4,7 @@
  *	  routines for signaling the postmaster from its child processes
  *
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/storage/pmsignal.h
@@ -54,6 +54,5 @@ extern void MarkPostmasterChildActive(void);
 extern void MarkPostmasterChildInactive(void);
 extern void MarkPostmasterChildWalSender(void);
 extern bool PostmasterIsAlive(void);
-extern bool ParentProcIsAlive(void);
 
 #endif   /* PMSIGNAL_H */

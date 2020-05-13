@@ -427,6 +427,24 @@ DROP FUNCTION foo();
 
 create temp table tt(f1 serial, data text);
 
+-- GPDB: The tests below which throw NOTICEs, throw them in indeterminate
+-- order, if the rows are hashed to different segments. Force the rows
+-- that have problem to be hashed to the same segment, using a custom hash
+-- function.
+CREATE OPERATOR FAMILY dummy_int_hash_ops USING hash;
+
+CREATE FUNCTION dummy_hashfunc(int) RETURNS int AS $$
+begin
+  return CASE WHEN $1 BETWEEN 7 AND 15 THEN 0 ELSE $1 END;
+end; $$ LANGUAGE plpgsql STRICT IMMUTABLE;
+
+CREATE OPERATOR CLASS dummy_int_hash_ops FOR TYPE int4
+  USING hash FAMILY dummy_int_hash_ops AS
+  OPERATOR 1 =,
+  FUNCTION 1 dummy_hashfunc(int);
+
+ALTER TABLE tt SET DISTRIBUTED BY (f1 dummy_int_hash_ops);
+
 create function insert_tt(text) returns int as
 $$ insert into tt(data) values($1) returning f1 $$
 language sql;
@@ -456,14 +474,6 @@ select * from tt;
 select insert_tt2('foolish','barrish') limit 1;
 select * from tt;
 
--- add two dummy tuples to make the following
--- cases' insert tuples are (13,14) which
--- will be on the same seg under current
--- jump consistent hash. This will make the
--- case not flaky.
-insert into tt(data) values ('nextisright');--11
-insert into tt(data) values ('previswrong');--12
-
 -- triggers will fire, too
 create function noticetrigger() returns trigger as $$
 begin
@@ -476,14 +486,6 @@ execute procedure noticetrigger();
 select insert_tt2('foolme','barme') limit 1;
 select * from tt;
 
--- add two dummy tuples to make the following
--- cases' insert tuples are (17,18) which
--- will be on the same seg under current
--- jump consistent hash. This will make the
--- case not flaky.
-insert into tt(data) values ('nextiswrong');--15
-insert into tt(data) values ('previsright');--16
-
 -- and rules work
 create temp table tt_log(f1 int, data text);
 
@@ -492,7 +494,6 @@ create rule insert_tt_rule as on insert to tt do also
 
 select insert_tt2('foollog','barlog') limit 1;
 select * from tt;
-
 -- note that nextval() gets executed a second time in the rule expansion,
 -- which is expected.
 select * from tt_log;
@@ -627,3 +628,64 @@ SELECT *,
         END)
 FROM
   (VALUES (1,''), (2,'0000000049404'), (3,'FROM 10000000876')) v(id, str);
+
+-- check whole-row-Var handling in nested lateral functions (bug #11703)
+
+create function extractq2(t int8_tbl) returns int8 as $$
+  select t.q2
+$$ language sql immutable;
+
+explain (verbose, costs off)
+select x from int8_tbl, extractq2(int8_tbl) f(x);
+
+select x from int8_tbl, extractq2(int8_tbl) f(x);
+
+create function extractq2_2(t int8_tbl) returns table(ret1 int8) as $$
+  select extractq2(t) offset 0
+$$ language sql immutable;
+
+explain (verbose, costs off)
+select x from int8_tbl, extractq2_2(int8_tbl) f(x);
+
+select x from int8_tbl, extractq2_2(int8_tbl) f(x);
+
+-- without the "offset 0", this function gets optimized quite differently
+
+create function extractq2_2_opt(t int8_tbl) returns table(ret1 int8) as $$
+  select extractq2(t)
+$$ language sql immutable;
+
+explain (verbose, costs off)
+select x from int8_tbl, extractq2_2_opt(int8_tbl) f(x);
+
+select x from int8_tbl, extractq2_2_opt(int8_tbl) f(x);
+
+-- gpdb: test append node in subquery_motionHazard_walker(). Without that
+-- change the select query below will panic.
+create function extractq2_append(t int8_tbl) returns table(ret1 int8) as $$
+  select extractq2(t) union all select extractq2(t)
+$$ language sql immutable;
+
+explain (verbose, costs off)
+select x from (select * from int8_tbl order by 1 limit 100) as int8_tbl, extractq2_append(int8_tbl) f(x);
+
+select x from (select * from int8_tbl order by 1 limit 100) as int8_tbl, extractq2_append(int8_tbl) f(x);
+
+create function extractq2_wapper(t int8_tbl) returns table(ret1 int8) as $$      
+  select (select extractq2(t))                                                  
+$$ language sql immutable;                                                      
+
+explain (verbose, costs off) select x from int8_tbl, extractq2_wapper(int8_tbl) f(x);
+
+select x from int8_tbl, extractq2_wapper(int8_tbl) f(x);
+
+-- check handling of nulls in SRF results (bug #7808)
+
+create type foo2 as (a integer, b text);
+
+select *, row_to_json(u) from unnest(array[(1,'foo')::foo2, null::foo2]) u;
+select *, row_to_json(u) from unnest(array[null::foo2, null::foo2]) u;
+select *, row_to_json(u) from unnest(array[null::foo2, (1,'foo')::foo2, null::foo2]) u;
+select *, row_to_json(u) from unnest(array[]::foo2[]) u;
+
+drop type foo2;

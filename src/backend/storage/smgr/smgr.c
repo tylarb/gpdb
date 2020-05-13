@@ -8,7 +8,7 @@
  *
  * Portions Copyright (c) 2006-2008, Greenplum inc
  * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -31,6 +31,16 @@
 #include "utils/faultinjector.h"
 #include "utils/hsearch.h"
 #include "utils/inval.h"
+
+/*
+ * Hook for plugins to collect statistics from storage functions
+ * For example, disk quota extension will use these hooks to
+ * detect active tables.
+ */
+file_create_hook_type file_create_hook = NULL;
+file_extend_hook_type file_extend_hook = NULL;
+file_truncate_hook_type file_truncate_hook = NULL;
+file_unlink_hook_type file_unlink_hook = NULL;
 
 /*
  * Each backend has a hashtable that stores all extant SMgrRelation objects.
@@ -94,9 +104,8 @@ smgropen(RelFileNode rnode, BackendId backend)
 		MemSet(&ctl, 0, sizeof(ctl));
 		ctl.keysize = sizeof(RelFileNodeBackend);
 		ctl.entrysize = sizeof(SMgrRelationData);
-		ctl.hash = tag_hash;
 		SMgrRelationHash = hash_create("smgr relation table", 400,
-									   &ctl, HASH_ELEM | HASH_FUNCTION);
+									   &ctl, HASH_ELEM | HASH_BLOBS);
 		first_unowned_reln = NULL;
 	}
 
@@ -343,6 +352,9 @@ smgrcreate(SMgrRelation reln, ForkNumber forknum, bool isRedo)
 							isRedo);
 
 	mdcreate(reln, forknum, isRedo);
+
+	if (file_create_hook)
+		(*file_create_hook)(reln->smgr_rnode);
 }
 
 /*
@@ -357,6 +369,8 @@ void
 smgrcreate_ao(RelFileNodeBackend rnode, int32 segmentFileNum, bool isRedo)
 {
 	mdcreate_ao(rnode, segmentFileNum, isRedo);
+	if (file_create_hook)
+		(*file_create_hook)(rnode);
 }
 
 /*
@@ -367,9 +381,6 @@ smgrcreate_ao(RelFileNodeBackend rnode, int32 segmentFileNum, bool isRedo)
  *
  *		If isRedo is true, it is okay for the underlying file(s) to be gone
  *		already.
- *
- *		This is equivalent to calling smgrdounlinkfork for each fork, but
- *		it's significantly quicker so should be preferred when possible.
  */
 void
 smgrdounlink(SMgrRelation reln, bool isRedo, char relstorage)
@@ -505,75 +516,11 @@ smgrdounlinkall(SMgrRelation *rels, int nrels, bool isRedo, char *relstorages)
 			mdunlink(rnodes[i], forknum, isRedo, relstorages[i]);
 	}
 
+	if (file_unlink_hook)
+		for (i = 0; i < nrels; i++)
+			(*file_unlink_hook)(rnodes[i]);
+
 	pfree(rnodes);
-}
-
-/*
- *	smgrdounlinkfork() -- Immediately unlink one fork of a relation.
- *
- *		The specified fork of the relation is removed from the store.  This
- *		should not be used during transactional operations, since it can't be
- *		undone.
- *
- *		If isRedo is true, it is okay for the underlying file to be gone
- *		already.
- */
-
-
-void
-smgrdounlinkfork(SMgrRelation reln, ForkNumber forknum, bool isRedo, char relstorage)
-{
-	/*
-	 * AO/CO tables have only MAIN_FORKNUM we should exit early to prevent
-	 * extra work.
-	 */
-	if (relstorage_is_ao(relstorage) &&
-		forknum != MAIN_FORKNUM)
-		return;
-
-
-	RelFileNodeBackend rnode = reln->smgr_rnode;
-
-	/* Close the fork */
-	mdclose(reln, forknum);
-
-	/*
-	 * Get rid of any remaining buffers for the relation.  bufmgr will just
-	 * drop them without bothering to write the contents.
-	 *
-	 * Apart from relstorage == RELSTORAGE_HEAP do any other RELSTOARGE type
-	 * expected to have buffers in shared memory ? Can check only for
-	 * RELSTORAGE_HEAP below.
-	 */
-	if ((relstorage != RELSTORAGE_AOROWS) &&
-		(relstorage != RELSTORAGE_AOCOLS))
-		DropRelFileNodeBuffers(rnode, forknum, 0);
-
-	/*
-	 * It'd be nice to tell the stats collector to forget it immediately, too.
-	 * But we can't because we don't know the OID (and in cases involving
-	 * relfilenode swaps, it's not always clear which table OID to forget,
-	 * anyway).
-	 */
-
-	/*
-	 * Send a shared-inval message to force other backends to close any
-	 * dangling smgr references they may have for this rel.  We should do this
-	 * before starting the actual unlinking, in case we fail partway through
-	 * that step.  Note that the sinval message will eventually come back to
-	 * this backend, too, and thereby provide a backstop that we closed our
-	 * own smgr rel.
-	 */
-	CacheInvalidateSmgr(rnode);
-
-	/*
-	 * Delete the physical file(s).
-	 *
-	 * Note: smgr_unlink must treat deletion failure as a WARNING, not an
-	 * ERROR, because we've already decided to commit or abort the current
-	 * xact.
-	 */
-	mdunlink(rnode, forknum, isRedo, relstorage);
 }
 
 /*
@@ -591,6 +538,8 @@ smgrextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 		   char *buffer, bool skipFsync)
 {
 	mdextend(reln, forknum, blocknum, buffer, skipFsync);
+	if (file_extend_hook)
+		(*file_extend_hook)(reln->smgr_rnode);
 }
 
 /*
@@ -639,6 +588,18 @@ smgrwrite(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 	mdwrite(reln, forknum, blocknum, buffer, skipFsync);
 }
 
+
+/*
+ *	smgrwriteback() -- Trigger kernel writeback for the supplied range of
+ *					   blocks.
+ */
+void
+smgrwriteback(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
+			  BlockNumber nblocks)
+{
+	mdwriteback(reln, forknum, blocknum, nblocks);
+}
+
 /*
  *	smgrnblocks() -- Calculate the number of blocks in the
  *					 supplied relation.
@@ -680,6 +641,9 @@ smgrtruncate(SMgrRelation reln, ForkNumber forknum, BlockNumber nblocks)
 	 * Do the truncation.
 	 */
 	mdtruncate(reln, forknum, nblocks);
+
+	if (file_truncate_hook)
+		(*file_truncate_hook)(reln->smgr_rnode);
 }
 
 /*
@@ -711,6 +675,7 @@ smgrimmedsync(SMgrRelation reln, ForkNumber forknum)
 	mdimmedsync(reln, forknum);
 }
 
+
 /*
  *	smgrpreckpt() -- Prepare for checkpoint.
  */
@@ -721,7 +686,7 @@ smgrpreckpt(void)
 }
 
 /*
- *     smgrsync() -- Sync files to disk during checkpoint.
+ *	smgrsync() -- Sync files to disk during checkpoint.
  */
 void
 smgrsync(void)

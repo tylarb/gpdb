@@ -4,7 +4,7 @@
  *	  prototypes for functions in backend/catalog/namespace.c
  *
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/catalog/namespace.h
@@ -33,8 +33,8 @@ typedef struct _FuncCandidateList
 	int			nvargs;			/* number of args to become variadic array */
 	int			ndargs;			/* number of defaulted args */
 	int		   *argnumbers;		/* args' positional indexes, if named call */
-	Oid			args[1];		/* arg types --- VARIABLE LENGTH ARRAY */
-}	*FuncCandidateList;	/* VARIABLE LENGTH STRUCT */
+	Oid			args[FLEXIBLE_ARRAY_MEMBER];	/* arg types */
+}	*FuncCandidateList;
 
 /*
  *	Structure for xxxOverrideSearchPath functions
@@ -119,8 +119,7 @@ extern bool TempNamespaceOidIsValid(void);  /* GPDB only:  used by cdbgang.c */
 extern void InitTempTableNamespace(void);
 
 extern Oid	LookupCreationNamespace(const char *nspname);
-extern void CheckSetNamespace(Oid oldNspOid, Oid nspOid, Oid classid,
-				  Oid objid);
+extern void CheckSetNamespace(Oid oldNspOid, Oid nspOid);
 extern Oid	QualifiedNameGetCreationNamespace(List *names, char **objname_p);
 extern RangeVar *makeRangeVarFromNameList(List *names);
 extern char *NameListToString(List *names);
@@ -128,11 +127,15 @@ extern char *NameListToQuotedString(List *names);
 
 extern bool isTempNamespace(Oid namespaceId);
 extern bool isTempToastNamespace(Oid namespaceId);
-extern bool isTempOrToastNamespace(Oid namespaceId);
+extern bool isTempOrTempToastNamespace(Oid namespaceId);
 extern bool isAnyTempNamespace(Oid namespaceId);
 extern bool isOtherTempNamespace(Oid namespaceId);
 extern int	GetTempNamespaceBackendId(Oid namespaceId);
 extern Oid	GetTempToastNamespace(void);
+extern void GetTempNamespaceState(Oid *tempNamespaceId,
+					  Oid *tempToastNamespaceId);
+extern void SetTempNamespaceState(Oid tempNamespaceId,
+					  Oid tempToastNamespaceId);
 extern void ResetTempTableNamespace(void);
 
 extern OverrideSearchPath *GetOverrideSearchPath(MemoryContext context);
@@ -147,7 +150,7 @@ extern Oid	FindDefaultConversionProc(int32 for_encoding, int32 to_encoding);
 
 /* initialization & transaction cleanup code */
 extern void InitializeSearchPath(void);
-extern void AtEOXact_Namespace(bool isCommit);
+extern void AtEOXact_Namespace(bool isCommit, bool parallel);
 extern void AtEOSubXact_Namespace(bool isCommit, SubTransactionId mySubid,
 					  SubTransactionId parentSubid);
 

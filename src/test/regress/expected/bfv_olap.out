@@ -209,7 +209,7 @@ CREATE TABLE r
     e DATE
 ) DISTRIBUTED BY (a,b);
 ALTER TABLE r ADD CONSTRAINT PKEY PRIMARY KEY (b);
-NOTICE:  updating distribution policy to match new primary key
+NOTICE:  updating distribution policy to match new PRIMARY KEY
 --TEST
 SELECT MAX(a) AS m FROM r GROUP BY b ORDER BY m;
  m 
@@ -513,6 +513,24 @@ GROUP BY ROLLUP( (sale.dt,sale.cn),(sale.pn),(sale.vn));
 (6 rows)
 
 --
+-- Another ROLLUP query, that hit a bug in setting up the planner-generated
+-- subquery's targetlist. (https://github.com/greenplum-db/gpdb/issues/6754)
+--
+SELECT sale.vn, rank() over (partition by sale.vn)
+FROM vendor, sale
+WHERE sale.vn=vendor.vn
+GROUP BY ROLLUP( sale.vn);
+ vn | rank 
+----+------
+    |    1
+ 10 |    1
+ 20 |    1
+ 30 |    1
+ 40 |    1
+ 50 |    1
+(6 rows)
+
+--
 -- Test window function with constant PARTITION BY
 --
 CREATE TABLE testtab (a int4);
@@ -550,6 +568,28 @@ GROUP BY ROLLUP((qty)) order by 1;
  1100
      
 (4 rows)
+
+--
+-- Test two-stage aggregate with grouping sets and a HAVING clause
+--
+-- persuade planner to choose a two-stage plan.
+set gp_motion_cost_per_row TO 1000;
+select cn, sum(qty) from sale group by rollup(cn,vn) having sum(qty)=1;
+ cn | sum 
+----+-----
+  1 |   1
+  1 |   1
+  1 |   1
+  2 |   1
+  3 |   1
+(5 rows)
+
+-- same, but the HAVING clause matches a rolled up row.
+select cn, sum(qty) from sale group by rollup(cn,vn) having sum(qty)=1144;
+ cn | sum  
+----+------
+    | 1144
+(1 row)
 
 -- CLEANUP
 -- start_ignore

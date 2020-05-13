@@ -72,7 +72,7 @@ SELECT relreplident FROM pg_class WHERE oid = 'test_replica_identity'::regclass;
 (1 row)
 
 ----
--- Make sure index cases succeeed
+-- Make sure index cases succeed
 ----
 -- succeed, primary key
 ALTER TABLE test_replica_identity REPLICA IDENTITY USING INDEX test_replica_identity_pkey;
@@ -101,7 +101,7 @@ Indexes:
     "test_replica_identity_keyab" btree (keya, keyb)
 Distributed by: (keya)
 
--- succeed, nondeferrable unique constraint over nonullable cols
+-- succeed, nondeferrable unique constraint over nonnullable cols
 ALTER TABLE test_replica_identity REPLICA IDENTITY USING INDEX test_replica_identity_unique_nondefer;
 -- succeed unique index over nonnullable cols
 ALTER TABLE test_replica_identity REPLICA IDENTITY USING INDEX test_replica_identity_keyab_key;

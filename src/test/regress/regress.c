@@ -1,11 +1,24 @@
-/*
+/*------------------------------------------------------------------------
+ *
+ * regress.c
+ *	 Code for various C-language functions defined as part of the
+ *	 regression tests.
+ *
+ * This code is released under the terms of the PostgreSQL License.
+ *
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1994, Regents of the University of California
+ *
  * src/test/regress/regress.c
+ *
+ *-------------------------------------------------------------------------
  */
 
 #include "postgres.h"
 
 #include <float.h>
 #include <math.h>
+#include <signal.h>
 
 #include "access/htup_details.h"
 #include "access/transam.h"
@@ -16,6 +29,7 @@
 #include "commands/trigger.h"
 #include "executor/executor.h"
 #include "executor/spi.h"
+#include "miscadmin.h"
 #include "port/atomics.h"
 #include "utils/builtins.h"
 #include "utils/geo_decls.h"
@@ -198,7 +212,6 @@ regress_lseg_construct(LSEG *lseg, Point *pt1, Point *pt2)
 	lseg->p[0].y = pt1->y;
 	lseg->p[1].x = pt2->x;
 	lseg->p[1].y = pt2->y;
-	lseg->m = point_sl(pt1, pt2);
 }
 
 PG_FUNCTION_INFO_V1(overpaid);
@@ -236,34 +249,33 @@ WIDGET *
 widget_in(char *str)
 {
 	char	   *p,
-			   *coord[NARGS],
-				buf2[1000];
+			   *coord[NARGS];
 	int			i;
 	WIDGET	   *result;
 
-	if (str == NULL)
-		return NULL;
 	for (i = 0, p = str; *p && i < NARGS && *p != RDELIM; p++)
-		if (*p == ',' || (*p == LDELIM && !i))
+	{
+		if (*p == DELIM || (*p == LDELIM && i == 0))
 			coord[i++] = p + 1;
-	if (i < NARGS - 1)
-		return NULL;
+	}
+
+	if (i < NARGS)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+				 errmsg("invalid input syntax for type widget: \"%s\"",
+						str)));
+
 	result = (WIDGET *) palloc(sizeof(WIDGET));
 	result->center.x = atof(coord[0]);
 	result->center.y = atof(coord[1]);
 	result->radius = atof(coord[2]);
 
-	snprintf(buf2, sizeof(buf2), "widget_in: read (%f, %f, %f)\n",
-			 result->center.x, result->center.y, result->radius);
 	return result;
 }
 
 char *
 widget_out(WIDGET *widget)
 {
-	if (widget == NULL)
-		return NULL;
-
 	return psprintf("(%g,%g,%g)",
 					widget->center.x, widget->center.y, widget->radius);
 }
@@ -350,7 +362,7 @@ funny_dup17(PG_FUNCTION_ARGS)
 			   *fieldval,
 			   *fieldtype;
 	char	   *when;
-	int			inserted;
+	uint64		inserted;
 	int			selected = 0;
 	int			ret;
 
@@ -431,7 +443,7 @@ funny_dup17(PG_FUNCTION_ARGS)
 																		))));
 	}
 
-	elog(DEBUG4, "funny_dup17 (fired %s) on level %3d: %d/%d tuples inserted/selected",
+	elog(DEBUG4, "funny_dup17 (fired %s) on level %3d: " UINT64_FORMAT "/%d tuples inserted/selected",
 		 when, *level, inserted, selected);
 
 	SPI_finish();
@@ -440,6 +452,22 @@ funny_dup17(PG_FUNCTION_ARGS)
 
 	if (*level == 0)
 		*xid = InvalidTransactionId;
+
+	return PointerGetDatum(tuple);
+}
+
+PG_FUNCTION_INFO_V1(trigger_return_old);
+
+Datum
+trigger_return_old(PG_FUNCTION_ARGS)
+{
+	TriggerData *trigdata = (TriggerData *) fcinfo->context;
+	HeapTuple	tuple;
+
+	if (!CALLED_AS_TRIGGER(fcinfo))
+		elog(ERROR, "trigger_return_old: not fired by trigger manager");
+
+	tuple = trigdata->tg_trigtuple;
 
 	return PointerGetDatum(tuple);
 }
@@ -535,16 +563,11 @@ ttdummy(PG_FUNCTION_ARGS)
 		if (isnull)
 			elog(ERROR, "ttdummy (%s): %s must be NOT NULL", relname, args[1]);
 
-		/*
-		 * GPDB: elog prints 'filename':'line number', which will make 'triggers'
-		 * test fail if the line number changes. To make the tests stable, use
-		 * ereport with an error code other than ERRCODE_INTERNAL_ERROR.
-		 */
 		if (oldon != newon || oldoff != newoff)
 			ereport(ERROR,
-					(errcode(ERRCODE_TRIGGERED_ACTION_EXCEPTION),
-					 errmsg("ttdummy (%s): you cannot change %s and/or %s columns "
-					 	 	"(use set_ttdummy)", relname, args[0], args[1])));
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("ttdummy (%s): you cannot change %s and/or %s columns (use set_ttdummy)",
+							relname, args[0], args[1])));
 
 		if (newoff != TTDUMMY_INFINITY)
 		{
@@ -831,6 +854,50 @@ make_tuple_indirect(PG_FUNCTION_ARGS)
 	 * function into a container type (record, array, etc) it should be OK.
 	 */
 	PG_RETURN_POINTER(newtup->t_data);
+}
+
+PG_FUNCTION_INFO_V1(regress_putenv);
+
+Datum
+regress_putenv(PG_FUNCTION_ARGS)
+{
+	MemoryContext oldcontext;
+	char	   *envbuf;
+
+	if (!superuser())
+		elog(ERROR, "must be superuser to change environment variables");
+
+	oldcontext = MemoryContextSwitchTo(TopMemoryContext);
+	envbuf = text_to_cstring((text *) PG_GETARG_POINTER(0));
+	MemoryContextSwitchTo(oldcontext);
+
+	if (putenv(envbuf) != 0)
+		elog(ERROR, "could not set environment variable: %m");
+
+	PG_RETURN_VOID();
+}
+
+/* Sleep until no process has a given PID. */
+PG_FUNCTION_INFO_V1(wait_pid);
+
+Datum
+wait_pid(PG_FUNCTION_ARGS)
+{
+	int			pid = PG_GETARG_INT32(0);
+
+	if (!superuser())
+		elog(ERROR, "must be superuser to check PID liveness");
+
+	while (kill(pid, 0) == 0)
+	{
+		CHECK_FOR_INTERRUPTS();
+		pg_usleep(50000);
+	}
+
+	if (errno != ESRCH)
+		elog(ERROR, "could not check PID %d liveness: %m", pid);
+
+	PG_RETURN_VOID();
 }
 
 #ifndef PG_HAVE_ATOMIC_FLAG_SIMULATION

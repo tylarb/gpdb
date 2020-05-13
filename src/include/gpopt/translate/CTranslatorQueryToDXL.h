@@ -17,9 +17,7 @@
 #ifndef GPDXL_CTranslatorQueryToDXL_H
 #define GPDXL_CTranslatorQueryToDXL_H
 
-#define GPDXL_CTE_ID_START 1
-#define GPDXL_COL_ID_START 1
-
+#include "gpopt/translate/CContextQueryToDXL.h"
 #include "gpopt/translate/CMappingVarColId.h"
 #include "gpopt/translate/CTranslatorScalarToDXL.h"
 #include "gpopt/translate/CTranslatorUtils.h"
@@ -50,7 +48,7 @@ namespace gpdxl
 
 	typedef CHashMapIter<INT, ULONG, gpos::HashValue<INT>, gpos::Equals<INT>,
 			CleanupDelete<INT>, CleanupDelete<ULONG> > IntUlongHashmapIter;
-	
+
 	//---------------------------------------------------------------------------
 	//	@class:
 	//		CTranslatorQueryToDXL
@@ -62,6 +60,8 @@ namespace gpdxl
 	//---------------------------------------------------------------------------
 	class CTranslatorQueryToDXL
 	{
+		friend class CTranslatorScalarToDXL;
+
 		// shorthand for functions for translating DXL nodes to GPDB expressions
 		typedef CDXLNode * (CTranslatorQueryToDXL::*DXLNodeToLogicalFunc)(const RangeTblEntry *rte, ULONG rti, ULONG current_query_level);
 
@@ -94,20 +94,17 @@ namespace gpdxl
 		};
 		
 		private:
+			// context for the whole query
+			CContextQueryToDXL *m_context;
+
 			// memory pool
-			IMemoryPool *m_mp;
+			CMemoryPool *m_mp;
 
 			// source system id
 			CSystemId m_sysid;
 
 			// meta data accessor
 			CMDAccessor *m_md_accessor;
-
-			// counter for generating unique column ids
-			CIdGenerator *m_colid_counter;
-
-			// counter for generating unique CTE ids
-			CIdGenerator *m_cte_id_counter;
 
 			// scalar translator used to convert scalar operation into DXL.
 			CTranslatorScalarToDXL *m_scalar_translator;
@@ -120,9 +117,6 @@ namespace gpdxl
 
 			// absolute level of query being translated
 			ULONG m_query_level;
-
-			// does the query have distributed tables
-			BOOL m_has_distributed_tables;
 
 			// top query is a DML
 			BOOL m_is_top_query_dml;
@@ -146,11 +140,9 @@ namespace gpdxl
 			// private constructor, called from the public factory function QueryToDXLInstance
 			CTranslatorQueryToDXL
 				(
-				IMemoryPool *mp,
+				CContextQueryToDXL *context,
 				CMDAccessor *md_accessor,
-				CIdGenerator *m_colid_counter,
-				CIdGenerator *cte_id_counter,
-				CMappingVarColId *var_colid_mapping,
+				const CMappingVarColId *var_colid_mapping,
 				Query *query,
 				ULONG query_level,
 				BOOL is_top_query_dml,
@@ -209,7 +201,7 @@ namespace gpdxl
 			// update window spec positions of LEAD/LAG functions
 			void UpdateLeadLagWinSpecPos(CDXLNode *project_list_dxlnode, CDXLWindowSpecArray *window_specs_dxlnode) const;
 
-			// manufucture window frame for lead/lag functions
+			// manufacture window frame for lead/lag functions
 			CDXLWindowFrame *CreateWindowFramForLeadLag(BOOL is_lead_func, CDXLNode *dxl_offset) const;
 
 			// translate the child of a set operation
@@ -344,6 +336,11 @@ namespace gpdxl
 				ULONG //current_query_level
 				);
 
+			void NoteDistributionPolicyOpclasses
+				(
+				const RangeTblEntry *rte
+				);
+
 			// generate a DXL node from column values, where each column value is
 			// either a datum or scalar expression represented as a project element.
 			CDXLNode *TranslateColumnValuesToDXL
@@ -440,9 +437,6 @@ namespace gpdxl
 			// of a DML statement
 			ULONG GetTupleOidColId();
 
-			// translate a grouping func expression
-			CDXLNode *TranslateGroupingFuncToDXL(const Expr *expr, CBitSet *bitset, UlongToUlongMap *grpcol_index_to_colid_mapping) const;
-
 			// construct a list of CTE producers from the query's CTE list
 			void ConstructCTEProducerList(List *cte_list, ULONG query_level);
 			
@@ -450,14 +444,14 @@ namespace gpdxl
 			void ConstructCTEAnchors(CDXLNodeArray *dxlnodes, CDXLNode **dxl_cte_anchor_top, CDXLNode **dxl_cte_anchor_bottom);
 			
 			// generate an array of new column ids of the given size
-			ULongPtrArray *GenerateColIds(IMemoryPool *mp, ULONG size) const;
+			ULongPtrArray *GenerateColIds(CMemoryPool *mp, ULONG size) const;
 
 			// extract an array of colids from the given column mapping
-			ULongPtrArray *ExtractColIds(IMemoryPool *mp, IntToUlongMap *attno_to_colid_mapping) const;
+			ULongPtrArray *ExtractColIds(CMemoryPool *mp, IntToUlongMap *attno_to_colid_mapping) const;
 			
 			// construct a new mapping based on the given one by replacing the colid in the "From" list
 			// with the colid at the same position in the "To" list
-			IntToUlongMap *RemapColIds(IMemoryPool *mp, IntToUlongMap *attno_to_colid_mapping, ULongPtrArray *from_list_colids, ULongPtrArray *to_list_colids) const;
+			IntToUlongMap *RemapColIds(CMemoryPool *mp, IntToUlongMap *attno_to_colid_mapping, ULongPtrArray *from_list_colids, ULongPtrArray *to_list_colids) const;
 
 			// true iff this query or one of its ancestors is a DML query
 			BOOL IsDMLQuery();
@@ -475,7 +469,13 @@ namespace gpdxl
 			// does query have distributed tables
 			BOOL HasDistributedTables() const
 			{
-				return m_has_distributed_tables;
+				return m_context->m_has_distributed_tables;
+			}
+
+			// does query have distributed tables
+			DistributionHashOpsKind GetDistributionHashOpsKind() const
+			{
+				return m_context->m_distribution_hashops;
 			}
 
 			// main translation routine for Query -> DXL tree
@@ -494,14 +494,9 @@ namespace gpdxl
 			static
 			CTranslatorQueryToDXL *QueryToDXLInstance
 				(
-				IMemoryPool *mp,
+				CMemoryPool *mp,
 				CMDAccessor *md_accessor,
-				CIdGenerator *m_colid_counter,
-				CIdGenerator *cte_id_counter,
-				CMappingVarColId *var_colid_mapping,
-				Query *query,
-				ULONG query_level,
-				HMUlCTEListEntry *query_level_to_cte_map = NULL // hash map between query level -> list of CTEs defined at that level
+				Query *query
 				);
 	};
 }

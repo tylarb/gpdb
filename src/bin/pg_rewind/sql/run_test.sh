@@ -20,6 +20,8 @@
 #  standby_following_master - runs after standby has been created and started
 #  after_promotion - runs after standby has been promoted, but old master is
 #                    still running
+#  before_master_restart_after_rewind - runs after pg_rewind executes and the
+#                    master has not been restarted
 #  after_rewind    - runs after pg_rewind and after restarting the rewound
 #                    old master
 #
@@ -33,11 +35,11 @@ initdb --data-checksums -N -A trust -D $TEST_MASTER >>$log_path 2>&1
 
 # Custom parameters for master's postgresql.conf
 cat >> $TEST_MASTER/postgresql.conf <<EOF
-checkpoint_segments = 50
 shared_buffers = 1MB
 max_connections = 50
 listen_addresses = '$LISTEN_ADDRESSES'
 port = $PORT_MASTER
+wal_keep_segments=5
 EOF
 
 # Accept replication connections on master
@@ -47,22 +49,30 @@ host replication all 127.0.0.1/32 trust
 host replication all ::1/128 trust
 EOF
 
+# We have to specify the master's dbid explicitly because initdb only creates an
+# empty file. gpconfigurenewseg is tasked with populating the master's dbid.
+cat >> $TEST_MASTER/internal.auto.conf <<EOF
+gp_dbid=${MASTER_DBID}
+EOF
+
 #### Now run the test-specific parts to initialize the master before setting
 echo "Master initialized."
-before_master
+declare -F before_master > /dev/null && before_master
 
 pg_ctl -w -D $TEST_MASTER start -o "$MASTER_PG_CTL_OPTIONS" >>$log_path 2>&1
 
 # up standby
 echo "Master running."
-before_standby
+declare -F before_standby > /dev/null && before_standby
 
 # Set up standby with necessary parameter
 rm -rf $TEST_STANDBY
 
 # Base backup is taken with xlog files included
-pg_basebackup -D $TEST_STANDBY -p $PORT_MASTER -x >>$log_path 2>&1
+pg_basebackup -D $TEST_STANDBY -p $PORT_MASTER -x --target-gp-dbid $STANDBY_DBID --verbose >>$log_path 2>&1
+
 echo "port = $PORT_STANDBY" >> $TEST_STANDBY/postgresql.conf
+echo "wal_keep_segments = 5" >> $TEST_STANDBY/postgresql.conf
 
 cat > $TEST_STANDBY/recovery.conf <<EOF
 primary_conninfo='port=$PORT_MASTER'
@@ -76,7 +86,7 @@ pg_ctl -w -D $TEST_STANDBY start -o "$STANDBY_PG_CTL_OPTIONS" >>$log_path 2>&1
 #### Now run the test-specific parts to run after standby has been started
 # up standby
 echo "Standby initialized and running."
-standby_following_master
+declare -F standby_following_master > /dev/null && standby_following_master
 
 # sleep a bit to make sure the standby has caught up.
 sleep 1
@@ -95,7 +105,7 @@ wait_until_standby_is_promoted >>$log_path 2>&1
 
 #### Now run the test-specific parts to run after promotion
 echo "Standby promoted."
-after_promotion
+declare -F after_promotion > /dev/null && after_promotion
 
 # For some tests, we want to stop the master after standby promotion
 if [ "$STOP_MASTER_BEFORE_PROMOTE" != "true" ]; then
@@ -154,12 +164,23 @@ standby_mode=on
 recovery_target_timeline='latest'
 EOF
 
+declare -F before_master_restart_after_rewind > /dev/null && before_master_restart_after_rewind
+
 # Restart the master to check that rewind went correctly
 pg_ctl -w -D $TEST_MASTER start -o "$MASTER_PG_CTL_OPTIONS" >>$log_path 2>&1
 
 #### Now run the test-specific parts to check the result
 echo "Old master restarted after rewind."
-after_rewind
+# Make sure master is able to connect to standby and reach streaming state.
+wait_until_standby_streaming_state
+PGOPTIONS=${PGOPTIONS_UTILITY} $STANDBY_PSQL -c "SELECT state FROM pg_stat_replication;"
+
+# Now promote master and run validation queries
+pg_ctl -w -D $TEST_MASTER promote >>$log_path 2>&1
+wait_until_master_is_promoted >>$log_path 2>&1
+echo "Master promoted."
+
+declare -F after_rewind > /dev/null && after_rewind
 
 # Stop remaining servers
 pg_ctl stop -D $TEST_MASTER -m fast -w >>$log_path 2>&1

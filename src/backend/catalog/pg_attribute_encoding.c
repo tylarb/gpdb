@@ -16,6 +16,8 @@
 #include "postgres.h"
 
 #include "access/genam.h"
+#include "access/heapam.h"
+#include "access/htup_details.h"
 #include "access/reloptions.h"
 #include "access/xact.h"
 #include "catalog/indexing.h"
@@ -228,7 +230,7 @@ AddDefaultRelationAttributeOptions(Relation rel, List *options)
 	if (!RelationIsAoCols(rel))
 		return;
 
- 	ce = form_default_storage_directive(options);
+	ce = form_default_storage_directive(options);
 	if (!ce)
 		ce = default_column_encoding_clause();
 

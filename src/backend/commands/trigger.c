@@ -3,7 +3,7 @@
  * trigger.c
  *	  PostgreSQL TRIGGERs support code.
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -23,6 +23,7 @@
 #include "catalog/indexing.h"
 #include "catalog/objectaccess.h"
 #include "catalog/pg_constraint.h"
+#include "catalog/pg_constraint_fn.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_trigger.h"
 #include "catalog/pg_type.h"
@@ -68,6 +69,15 @@ int			SessionReplicationRole = SESSION_REPLICATION_ROLE_ORIGIN;
 /* How many levels deep into trigger execution are we? */
 static int	MyTriggerDepth = 0;
 
+/*
+ * Note that similar macros also exist in executor/execMain.c.  There does not
+ * appear to be any good header to put them into, given the structures that
+ * they use, so we let them be duplicated.  Be sure to update all if one needs
+ * to be changed, however.
+ */
+#define GetUpdatedColumns(relinfo, estate) \
+	(rt_fetch((relinfo)->ri_RangeTableIndex, (estate)->es_range_table)->updatedCols)
+
 /* Local function prototypes */
 static void ConvertTriggerToFK(CreateTrigStmt *stmt, Oid funcoid);
 static void SetTriggerFlags(TriggerDesc *trigdesc, Trigger *trigger);
@@ -77,15 +87,24 @@ static HeapTuple GetTupleForTrigger(EState *estate,
 				   ItemPointer tid,
 				   LockTupleMode lockmode,
 				   TupleTableSlot **newSlot);
-
+static bool TriggerEnabled(EState *estate, ResultRelInfo *relinfo,
+			   Trigger *trigger, TriggerEvent event,
+			   Bitmapset *modifiedCols,
+			   HeapTuple oldtup, HeapTuple newtup);
+static HeapTuple ExecCallTriggerFunc(TriggerData *trigdata,
+					int tgindx,
+					FmgrInfo *finfo,
+					Instrumentation *instr,
+					MemoryContext per_tuple_context);
 static void AfterTriggerSaveEvent(EState *estate, ResultRelInfo *relinfo,
 					  int event, bool row_trigger,
 					  HeapTuple oldtup, HeapTuple newtup,
 					  List *recheckIndexes, Bitmapset *modifiedCols);
+static void AfterTriggerEnlargeQueryState(void);
 
 
 /*
- * Create a trigger.  Returns the OID of the created trigger.
+ * Create a trigger.  Returns the address of the created trigger.
  *
  * queryString is the source text of the CREATE TRIGGER command.
  * This must be supplied if a whenClause is specified, else it can be NULL.
@@ -114,10 +133,11 @@ static void AfterTriggerSaveEvent(EState *estate, ResultRelInfo *relinfo,
  * relation, as well as ACL_EXECUTE on the trigger function.  For internal
  * triggers the caller must apply any required permission checks.
  *
- * Note: can return InvalidOid if we decided to not create a trigger at all,
- * but a foreign-key constraint.  This is a kluge for backwards compatibility.
+ * Note: can return InvalidObjectAddress if we decided to not create a trigger
+ * at all, but a foreign-key constraint.  This is a kluge for backwards
+ * compatibility.
  */
-Oid
+ObjectAddress
 CreateTrigger(CreateTrigStmt *stmt, const char *queryString,
 			  Oid relOid, Oid refRelOid, Oid constraintOid, Oid indexOid,
 			  bool isInternal)
@@ -149,9 +169,9 @@ CreateTrigger(CreateTrigStmt *stmt, const char *queryString,
 				referenced;
 
 	if (OidIsValid(relOid))
-		rel = heap_open(relOid, AccessExclusiveLock);
+		rel = heap_open(relOid, ShareRowExclusiveLock);
 	else
-		rel = heap_openrv(stmt->relation, AccessExclusiveLock);
+		rel = heap_openrv(stmt->relation, ShareRowExclusiveLock);
 
 	/*
 	 * Triggers must be on tables or views, and there are additional
@@ -344,9 +364,7 @@ CreateTrigger(CreateTrigStmt *stmt, const char *queryString,
 		 * subselects in WHEN clauses; it would fail to examine the contents
 		 * of subselects.
 		 */
-		varList = pull_var_clause(whenClause,
-								  PVC_REJECT_AGGREGATES,
-								  PVC_REJECT_PLACEHOLDERS);
+		varList = pull_var_clause(whenClause, 0);
 		foreach(lc, varList)
 		{
 			Var		   *var = (Var *) lfirst(lc);
@@ -433,8 +451,8 @@ CreateTrigger(CreateTrigStmt *stmt, const char *queryString,
 		else
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
-					 errmsg("function %s must return type \"trigger\"",
-							NameListToString(stmt->funcname))));
+					 errmsg("function %s must return type %s",
+							NameListToString(stmt->funcname), "trigger")));
 	}
 
 	/* Check GPDB limitations */
@@ -469,7 +487,7 @@ CreateTrigger(CreateTrigStmt *stmt, const char *queryString,
 
 		ConvertTriggerToFK(stmt, funcoid);
 
-		return InvalidOid;
+		return InvalidObjectAddress;
 	}
 
 	/*
@@ -553,8 +571,8 @@ CreateTrigger(CreateTrigStmt *stmt, const char *queryString,
 	 * can skip this for internally generated triggers, since the name
 	 * modification above should be sufficient.
 	 *
-	 * NOTE that this is cool only because we have AccessExclusiveLock on the
-	 * relation, so the trigger set won't be changing underneath us.
+	 * NOTE that this is cool only because we have ShareRowExclusiveLock on
+	 * the relation, so the trigger set won't be changing underneath us.
 	 */
 	if (!isInternal)
 	{
@@ -842,7 +860,7 @@ CreateTrigger(CreateTrigStmt *stmt, const char *queryString,
 	/* Keep lock on target rel until end of xact */
 	heap_close(rel, NoLock);
 
-	return trigoid;
+	return myself;
 }
 
 
@@ -1292,7 +1310,7 @@ RangeVarCallbackForRenameTrigger(const RangeVar *rv, Oid relid, Oid oldrelid,
  *		modify tgname in trigger tuple
  *		update row in catalog
  */
-Oid
+ObjectAddress
 renametrig(RenameStmt *stmt)
 {
 	Oid			tgoid;
@@ -1302,6 +1320,7 @@ renametrig(RenameStmt *stmt)
 	SysScanDesc tgscan;
 	ScanKeyData key[2];
 	Oid			relid;
+	ObjectAddress address;
 
 	/*
 	 * Look up name, check permissions, and acquire lock (which we will NOT
@@ -1394,6 +1413,8 @@ renametrig(RenameStmt *stmt)
 						stmt->subname, RelationGetRelationName(targetrel))));
 	}
 
+	ObjectAddressSet(address, TriggerRelationId, tgoid);
+
 	systable_endscan(tgscan);
 
 	heap_close(tgrel, RowExclusiveLock);
@@ -1403,7 +1424,7 @@ renametrig(RenameStmt *stmt)
 	 */
 	relation_close(targetrel, NoLock);
 
-	return tgoid;
+	return address;
 }
 
 
@@ -1898,7 +1919,7 @@ equalTriggerDescs(TriggerDesc *trigdesc1, TriggerDesc *trigdesc2)
  *
  * Returns the tuple (or NULL) as returned by the function.
  */
-HeapTuple
+static HeapTuple
 ExecCallTriggerFunc(TriggerData *trigdata,
 					int tgindx,
 					FmgrInfo *finfo,
@@ -2403,7 +2424,7 @@ ExecBSUpdateTriggers(EState *estate, ResultRelInfo *relinfo)
 	TriggerDesc *trigdesc;
 	int			i;
 	TriggerData LocTriggerData;
-	Bitmapset  *modifiedCols;
+	Bitmapset  *updatedCols;
 
 	if (Gp_role == GP_ROLE_EXECUTE)
 	{
@@ -2418,7 +2439,7 @@ ExecBSUpdateTriggers(EState *estate, ResultRelInfo *relinfo)
 	if (!trigdesc->trig_update_before_statement)
 		return;
 
-	modifiedCols = GetModifiedColumns(relinfo, estate);
+	updatedCols = GetUpdatedColumns(relinfo, estate);
 
 	LocTriggerData.type = T_TriggerData;
 	LocTriggerData.tg_event = TRIGGER_EVENT_UPDATE |
@@ -2439,7 +2460,7 @@ ExecBSUpdateTriggers(EState *estate, ResultRelInfo *relinfo)
 								  TRIGGER_TYPE_UPDATE))
 			continue;
 		if (!TriggerEnabled(estate, relinfo, trigger, LocTriggerData.tg_event,
-							modifiedCols, NULL, NULL))
+							updatedCols, NULL, NULL))
 			continue;
 
 		LocTriggerData.tg_trigger = trigger;
@@ -2464,7 +2485,7 @@ ExecASUpdateTriggers(EState *estate, ResultRelInfo *relinfo)
 	if (trigdesc && trigdesc->trig_update_after_statement)
 		AfterTriggerSaveEvent(estate, relinfo, TRIGGER_EVENT_UPDATE,
 							  false, NULL, NULL, NIL,
-							  GetModifiedColumns(relinfo, estate));
+							  GetUpdatedColumns(relinfo, estate));
 }
 
 TupleTableSlot *
@@ -2482,22 +2503,11 @@ ExecBRUpdateTriggers(EState *estate, EPQState *epqstate,
 	HeapTuple	oldtuple;
 	TupleTableSlot *newSlot;
 	int			i;
-	Bitmapset  *modifiedCols;
-	Bitmapset  *keyCols;
+	Bitmapset  *updatedCols;
 	LockTupleMode lockmode;
 
-	/*
-	 * Compute lock mode to use.  If columns that are part of the key have not
-	 * been modified, then we can use a weaker lock, allowing for better
-	 * concurrency.
-	 */
-	modifiedCols = GetModifiedColumns(relinfo, estate);
-	keyCols = RelationGetIndexAttrBitmap(relinfo->ri_RelationDesc,
-										 INDEX_ATTR_BITMAP_KEY);
-	if (bms_overlap(keyCols, modifiedCols))
-		lockmode = LockTupleExclusive;
-	else
-		lockmode = LockTupleNoKeyExclusive;
+	/* Determine lock mode to use */
+	lockmode = ExecUpdateLockMode(estate, relinfo);
 
 	Assert(HeapTupleIsValid(fdw_trigtuple) ^ ItemPointerIsValid(tupleid));
 	if (fdw_trigtuple == NULL)
@@ -2538,6 +2548,7 @@ ExecBRUpdateTriggers(EState *estate, EPQState *epqstate,
 		TRIGGER_EVENT_ROW |
 		TRIGGER_EVENT_BEFORE;
 	LocTriggerData.tg_relation = relinfo->ri_RelationDesc;
+	updatedCols = GetUpdatedColumns(relinfo, estate);
 	for (i = 0; i < trigdesc->numtriggers; i++)
 	{
 		Trigger    *trigger = &trigdesc->triggers[i];
@@ -2548,7 +2559,7 @@ ExecBRUpdateTriggers(EState *estate, EPQState *epqstate,
 								  TRIGGER_TYPE_UPDATE))
 			continue;
 		if (!TriggerEnabled(estate, relinfo, trigger, LocTriggerData.tg_event,
-							modifiedCols, trigtuple, newtuple))
+							updatedCols, trigtuple, newtuple))
 			continue;
 
 		LocTriggerData.tg_trigtuple = trigtuple;
@@ -2570,7 +2581,7 @@ ExecBRUpdateTriggers(EState *estate, EPQState *epqstate,
 			return NULL;		/* "do nothing" */
 		}
 	}
-	if (trigtuple != fdw_trigtuple)
+	if (trigtuple != fdw_trigtuple && trigtuple != newtuple)
 		heap_freetuple(trigtuple);
 
 	if (newtuple != slottuple)
@@ -2618,7 +2629,7 @@ ExecARUpdateTriggers(EState *estate, ResultRelInfo *relinfo,
 
 		AfterTriggerSaveEvent(estate, relinfo, TRIGGER_EVENT_UPDATE,
 							  true, trigtuple, newtuple, recheckIndexes,
-							  GetModifiedColumns(relinfo, estate));
+							  GetUpdatedColumns(relinfo, estate));
 		if (trigtuple != fdw_trigtuple)
 			heap_freetuple(trigtuple);
 	}
@@ -2771,8 +2782,6 @@ GetTupleForTrigger(EState *estate,
 	/* these should be rejected when you try to create such triggers, but let's check */
 	if (RelationIsAppendOptimized(relation))
 		elog(ERROR, "UPDATE and DELETE triggers are not supported on append-only tables");
-	if (RelationIsExternal(relation))
-		elog(ERROR, "UPDATE and DELETE triggers are not supported on external tables");
 
 	Assert(RelationIsHeap(relation));
 
@@ -2793,7 +2802,7 @@ ltrmark:;
 		tuple.t_self = *tid;
 		test = heap_lock_tuple(relation, &tuple,
 							   estate->es_output_cid,
-							   lockmode, LockTupleWait,
+							   lockmode, LockWaitBlock,
 							   false, &buffer, &hufd);
 		switch (test)
 		{
@@ -2859,6 +2868,10 @@ ltrmark:;
 				 */
 				return NULL;
 
+			case HeapTupleInvisible:
+				elog(ERROR, "attempted to lock invisible tuple");
+				break;
+
 			default:
 				ReleaseBuffer(buffer);
 				elog(ERROR, "unrecognized heap_lock_tuple status: %u", test);
@@ -2903,7 +2916,7 @@ ltrmark:;
 /*
  * Is trigger enabled to fire?
  */
-bool
+static bool
 TriggerEnabled(EState *estate, ResultRelInfo *relinfo,
 			   Trigger *trigger, TriggerEvent event,
 			   Bitmapset *modifiedCols,
@@ -3084,7 +3097,7 @@ typedef struct SetConstraintStateData
 	bool		all_isdeferred;
 	int			numstates;		/* number of trigstates[] entries in use */
 	int			numalloc;		/* allocated size of trigstates[] */
-	SetConstraintTriggerData trigstates[1];		/* VARIABLE LENGTH ARRAY */
+	SetConstraintTriggerData trigstates[FLEXIBLE_ARRAY_MEMBER];
 } SetConstraintStateData;
 
 typedef SetConstraintStateData *SetConstraintState;
@@ -3289,9 +3302,7 @@ typedef struct AfterTriggersData
 	int			maxtransdepth;	/* allocated len of above arrays */
 } AfterTriggersData;
 
-typedef AfterTriggersData *AfterTriggers;
-
-static AfterTriggers afterTriggers;
+static AfterTriggersData afterTriggers;
 
 static void AfterTriggerExecute(AfterTriggerEvent event,
 					Relation rel, TriggerDesc *trigdesc,
@@ -3310,11 +3321,11 @@ static SetConstraintState SetConstraintStateAddItem(SetConstraintState state,
  * Gets the current query fdw tuplestore and initializes it if necessary
  */
 static Tuplestorestate *
-GetCurrentFDWTuplestore()
+GetCurrentFDWTuplestore(void)
 {
 	Tuplestorestate *ret;
 
-	ret = afterTriggers->fdw_tuplestores[afterTriggers->query_depth];
+	ret = afterTriggers.fdw_tuplestores[afterTriggers.query_depth];
 	if (ret == NULL)
 	{
 		MemoryContext oldcxt;
@@ -3341,7 +3352,7 @@ GetCurrentFDWTuplestore()
 		CurrentResourceOwner = saveResourceOwner;
 		MemoryContextSwitchTo(oldcxt);
 
-		afterTriggers->fdw_tuplestores[afterTriggers->query_depth] = ret;
+		afterTriggers.fdw_tuplestores[afterTriggers.query_depth] = ret;
 	}
 
 	return ret;
@@ -3357,7 +3368,7 @@ static bool
 afterTriggerCheckState(AfterTriggerShared evtshared)
 {
 	Oid			tgoid = evtshared->ats_tgoid;
-	SetConstraintState state = afterTriggers->state;
+	SetConstraintState state = afterTriggers.state;
 	int			i;
 
 	/*
@@ -3368,19 +3379,22 @@ afterTriggerCheckState(AfterTriggerShared evtshared)
 		return false;
 
 	/*
-	 * Check if SET CONSTRAINTS has been executed for this specific trigger.
+	 * If constraint state exists, SET CONSTRAINTS might have been executed
+	 * either for this trigger or for all triggers.
 	 */
-	for (i = 0; i < state->numstates; i++)
+	if (state != NULL)
 	{
-		if (state->trigstates[i].sct_tgoid == tgoid)
-			return state->trigstates[i].sct_tgisdeferred;
-	}
+		/* Check for SET CONSTRAINTS for this specific trigger. */
+		for (i = 0; i < state->numstates; i++)
+		{
+			if (state->trigstates[i].sct_tgoid == tgoid)
+				return state->trigstates[i].sct_tgisdeferred;
+		}
 
-	/*
-	 * Check if SET CONSTRAINTS ALL has been executed; if so use that.
-	 */
-	if (state->all_isset)
-		return state->all_isdeferred;
+		/* Check for SET CONSTRAINTS ALL. */
+		if (state->all_isset)
+			return state->all_isdeferred;
+	}
 
 	/*
 	 * Otherwise return the default state for the trigger.
@@ -3417,8 +3431,8 @@ afterTriggerAddEvent(AfterTriggerEventList *events,
 		Size		chunksize;
 
 		/* Create event context if we didn't already */
-		if (afterTriggers->event_cxt == NULL)
-			afterTriggers->event_cxt =
+		if (afterTriggers.event_cxt == NULL)
+			afterTriggers.event_cxt =
 				AllocSetContextCreate(TopTransactionContext,
 									  "AfterTriggerEvents",
 									  ALLOCSET_DEFAULT_MINSIZE,
@@ -3461,7 +3475,7 @@ afterTriggerAddEvent(AfterTriggerEventList *events,
 				chunksize /= 2; /* too many shared records */
 			chunksize = Min(chunksize, MAX_CHUNK_SIZE);
 		}
-		chunk = MemoryContextAlloc(afterTriggers->event_cxt, chunksize);
+		chunk = MemoryContextAlloc(afterTriggers.event_cxt, chunksize);
 		chunk->next = NULL;
 		chunk->freeptr = CHUNK_DATA_START(chunk);
 		chunk->endptr = chunk->endfree = (char *) chunk + chunksize;
@@ -3517,14 +3531,12 @@ static void
 afterTriggerFreeEventList(AfterTriggerEventList *events)
 {
 	AfterTriggerEventChunk *chunk;
-	AfterTriggerEventChunk *next_chunk;
 
-	for (chunk = events->head; chunk != NULL; chunk = next_chunk)
+	while ((chunk = events->head) != NULL)
 	{
-		next_chunk = chunk->next;
+		events->head = chunk->next;
 		pfree(chunk);
 	}
-	events->head = NULL;
 	events->tail = NULL;
 	events->tailfree = NULL;
 }
@@ -3566,6 +3578,23 @@ afterTriggerRestoreEventList(AfterTriggerEventList *events,
 		 * They might still be useful, anyway.
 		 */
 	}
+}
+
+/* ----------
+ * afterTriggerDeleteHeadEventChunk()
+ *
+ *	Remove the first chunk of events from the given event list.
+ * ----------
+ */
+static void
+afterTriggerDeleteHeadEventChunk(AfterTriggerEventList *events)
+{
+	AfterTriggerEventChunk *target = events->head;
+
+	Assert(target && target->next);
+
+	events->head = target->next;
+	pfree(target);
 }
 
 
@@ -3792,7 +3821,7 @@ afterTriggerMarkEvents(AfterTriggerEventList *events,
 				/*
 				 * Mark it as to be fired in this firing cycle.
 				 */
-				evtshared->ats_firing_id = afterTriggers->firing_counter;
+				evtshared->ats_firing_id = afterTriggers.firing_counter;
 				event->ate_flags |= AFTER_TRIGGER_IN_PROGRESS;
 				found = true;
 			}
@@ -3941,7 +3970,7 @@ afterTriggerInvokeEvents(AfterTriggerEventList *events,
 			/*
 			 * If it's last chunk, must sync event list's tailfree too.  Note
 			 * that delete_ok must NOT be passed as true if there could be
-			 * stacked AfterTriggerEventList values pointing at this event
+			 * additional AfterTriggerEventList values pointing at this event
 			 * list, since we'd fail to fix their copies of tailfree.
 			 */
 			if (chunk == events->tail)
@@ -3986,40 +4015,28 @@ afterTriggerInvokeEvents(AfterTriggerEventList *events,
 void
 AfterTriggerBeginXact(void)
 {
-	Assert(afterTriggers == NULL);
+	/*
+	 * Initialize after-trigger state structure to empty
+	 */
+	afterTriggers.firing_counter = (CommandId) 1;		/* mustn't be 0 */
+	afterTriggers.query_depth = -1;
 
 	/*
-	 * Build empty after-trigger state structure
+	 * Verify that there is no leftover state remaining.  If these assertions
+	 * trip, it means that AfterTriggerEndXact wasn't called or didn't clean
+	 * up properly.
 	 */
-	afterTriggers = (AfterTriggers)
-		MemoryContextAlloc(TopTransactionContext,
-						   sizeof(AfterTriggersData));
-
-	afterTriggers->firing_counter = (CommandId) 1;		/* mustn't be 0 */
-	afterTriggers->state = SetConstraintStateCreate(8);
-	afterTriggers->events.head = NULL;
-	afterTriggers->events.tail = NULL;
-	afterTriggers->events.tailfree = NULL;
-	afterTriggers->query_depth = -1;
-
-	/* We initialize the arrays to a reasonable size */
-	afterTriggers->query_stack = (AfterTriggerEventList *)
-		MemoryContextAlloc(TopTransactionContext,
-						   8 * sizeof(AfterTriggerEventList));
-	afterTriggers->fdw_tuplestores = (Tuplestorestate **)
-		MemoryContextAllocZero(TopTransactionContext,
-							   8 * sizeof(Tuplestorestate *));
-	afterTriggers->maxquerydepth = 8;
-
-	/* Context for events is created only when needed */
-	afterTriggers->event_cxt = NULL;
-
-	/* Subtransaction stack is empty until/unless needed */
-	afterTriggers->state_stack = NULL;
-	afterTriggers->events_stack = NULL;
-	afterTriggers->depth_stack = NULL;
-	afterTriggers->firing_stack = NULL;
-	afterTriggers->maxtransdepth = 0;
+	Assert(afterTriggers.state == NULL);
+	Assert(afterTriggers.query_stack == NULL);
+	Assert(afterTriggers.fdw_tuplestores == NULL);
+	Assert(afterTriggers.maxquerydepth == 0);
+	Assert(afterTriggers.event_cxt == NULL);
+	Assert(afterTriggers.events.head == NULL);
+	Assert(afterTriggers.state_stack == NULL);
+	Assert(afterTriggers.events_stack == NULL);
+	Assert(afterTriggers.depth_stack == NULL);
+	Assert(afterTriggers.firing_stack == NULL);
+	Assert(afterTriggers.maxtransdepth == 0);
 }
 
 
@@ -4027,48 +4044,15 @@ AfterTriggerBeginXact(void)
  * AfterTriggerBeginQuery()
  *
  *	Called just before we start processing a single query within a
- *	transaction (or subtransaction).  Set up to record AFTER trigger
- *	events queued by the query.  Note that it is allowed to have
- *	nested queries within a (sub)transaction.
+ *	transaction (or subtransaction).  Most of the real work gets deferred
+ *	until somebody actually tries to queue a trigger event.
  * ----------
  */
 void
 AfterTriggerBeginQuery(void)
 {
-	AfterTriggerEventList *events;
-
-	/* Must be inside a transaction */
-	Assert(afterTriggers != NULL);
-
 	/* Increase the query stack depth */
-	afterTriggers->query_depth++;
-
-	/*
-	 * Allocate more space in the query stack if needed.
-	 */
-	if (afterTriggers->query_depth >= afterTriggers->maxquerydepth)
-	{
-		/* repalloc will keep the stack in the same context */
-		int			old_alloc = afterTriggers->maxquerydepth;
-		int			new_alloc = old_alloc * 2;
-
-		afterTriggers->query_stack = (AfterTriggerEventList *)
-			repalloc(afterTriggers->query_stack,
-					 new_alloc * sizeof(AfterTriggerEventList));
-		afterTriggers->fdw_tuplestores = (Tuplestorestate **)
-			repalloc(afterTriggers->fdw_tuplestores,
-					 new_alloc * sizeof(Tuplestorestate *));
-		/* Clear newly-allocated slots for subsequent lazy initialization. */
-		memset(afterTriggers->fdw_tuplestores + old_alloc,
-			   0, (new_alloc - old_alloc) * sizeof(Tuplestorestate *));
-		afterTriggers->maxquerydepth = new_alloc;
-	}
-
-	/* Initialize this query's list to empty */
-	events = &afterTriggers->query_stack[afterTriggers->query_depth];
-	events->head = NULL;
-	events->tail = NULL;
-	events->tailfree = NULL;
+	afterTriggers.query_depth++;
 }
 
 
@@ -4090,11 +4074,18 @@ AfterTriggerEndQuery(EState *estate)
 	AfterTriggerEventList *events;
 	Tuplestorestate *fdw_tuplestore;
 
-	/* Must be inside a transaction */
-	Assert(afterTriggers != NULL);
-
 	/* Must be inside a query, too */
-	Assert(afterTriggers->query_depth >= 0);
+	Assert(afterTriggers.query_depth >= 0);
+
+	/*
+	 * If we never even got as far as initializing the event stack, there
+	 * certainly won't be any events, so exit quickly.
+	 */
+	if (afterTriggers.query_depth >= afterTriggers.maxquerydepth)
+	{
+		afterTriggers.query_depth--;
+		return;
+	}
 
 	/*
 	 * Process all immediate-mode triggers queued by the query, and move the
@@ -4111,38 +4102,60 @@ AfterTriggerEndQuery(EState *estate)
 	 * will instead fire any triggers in a dedicated query level.  Foreign key
 	 * enforcement triggers do add to the current query level, thanks to their
 	 * passing fire_triggers = false to SPI_execute_snapshot().  Other
-	 * C-language triggers might do likewise.  Be careful here: firing a
-	 * trigger could result in query_stack being repalloc'd, so we can't save
-	 * its address across afterTriggerInvokeEvents calls.
+	 * C-language triggers might do likewise.
 	 *
 	 * If we find no firable events, we don't have to increment
 	 * firing_counter.
 	 */
+	events = &afterTriggers.query_stack[afterTriggers.query_depth];
+
 	for (;;)
 	{
-		events = &afterTriggers->query_stack[afterTriggers->query_depth];
-		if (afterTriggerMarkEvents(events, &afterTriggers->events, true))
+		if (afterTriggerMarkEvents(events, &afterTriggers.events, true))
 		{
-			CommandId	firing_id = afterTriggers->firing_counter++;
+			CommandId	firing_id = afterTriggers.firing_counter++;
+			AfterTriggerEventChunk *oldtail = events->tail;
 
-			/* OK to delete the immediate events after processing them */
-			if (afterTriggerInvokeEvents(events, firing_id, estate, true))
+			if (afterTriggerInvokeEvents(events, firing_id, estate, false))
 				break;			/* all fired */
+
+			/*
+			 * Firing a trigger could result in query_stack being repalloc'd,
+			 * so we must recalculate ptr after each afterTriggerInvokeEvents
+			 * call.  Furthermore, it's unsafe to pass delete_ok = true here,
+			 * because that could cause afterTriggerInvokeEvents to try to
+			 * access *events after the stack has been repalloc'd.
+			 */
+			events = &afterTriggers.query_stack[afterTriggers.query_depth];
+
+			/*
+			 * We'll need to scan the events list again.  To reduce the cost
+			 * of doing so, get rid of completely-fired chunks.  We know that
+			 * all events were marked IN_PROGRESS or DONE at the conclusion of
+			 * afterTriggerMarkEvents, so any still-interesting events must
+			 * have been added after that, and so must be in the chunk that
+			 * was then the tail chunk, or in later chunks.  So, zap all
+			 * chunks before oldtail.  This is approximately the same set of
+			 * events we would have gotten rid of by passing delete_ok = true.
+			 */
+			Assert(oldtail != NULL);
+			while (events->head != oldtail)
+				afterTriggerDeleteHeadEventChunk(events);
 		}
 		else
 			break;
 	}
 
 	/* Release query-local storage for events, including tuplestore if any */
-	fdw_tuplestore = afterTriggers->fdw_tuplestores[afterTriggers->query_depth];
+	fdw_tuplestore = afterTriggers.fdw_tuplestores[afterTriggers.query_depth];
 	if (fdw_tuplestore)
 	{
 		tuplestore_end(fdw_tuplestore);
-		afterTriggers->fdw_tuplestores[afterTriggers->query_depth] = NULL;
+		afterTriggers.fdw_tuplestores[afterTriggers.query_depth] = NULL;
 	}
-	afterTriggerFreeEventList(&afterTriggers->query_stack[afterTriggers->query_depth]);
+	afterTriggerFreeEventList(&afterTriggers.query_stack[afterTriggers.query_depth]);
 
-	afterTriggers->query_depth--;
+	afterTriggers.query_depth--;
 }
 
 
@@ -4163,18 +4176,15 @@ AfterTriggerFireDeferred(void)
 	AfterTriggerEventList *events;
 	bool		snap_pushed = false;
 
-	/* Must be inside a transaction */
-	Assert(afterTriggers != NULL);
-
-	/* ... but not inside a query */
-	Assert(afterTriggers->query_depth == -1);
+	/* Must not be inside a query */
+	Assert(afterTriggers.query_depth == -1);
 
 	/*
 	 * If there are any triggers to fire, make sure we have set a snapshot for
 	 * them to use.  (Since PortalRunUtility doesn't set a snap for COMMIT, we
 	 * can't assume ActiveSnapshot is valid on entry.)
 	 */
-	events = &afterTriggers->events;
+	events = &afterTriggers.events;
 	if (events->head != NULL)
 	{
 		PushActiveSnapshot(GetTransactionSnapshot());
@@ -4187,7 +4197,7 @@ AfterTriggerFireDeferred(void)
 	 */
 	while (afterTriggerMarkEvents(events, NULL, false))
 	{
-		CommandId	firing_id = afterTriggers->firing_counter++;
+		CommandId	firing_id = afterTriggers.firing_counter++;
 
 		if (afterTriggerInvokeEvents(events, firing_id, NULL, true))
 			break;				/* all fired */
@@ -4220,7 +4230,7 @@ void
 AfterTriggerEndXact(bool isCommit)
 {
 	/*
-	 * Forget everything we know about AFTER triggers.
+	 * Forget the pending-events list.
 	 *
 	 * Since all the info is in TopTransactionContext or children thereof, we
 	 * don't really need to do anything to reclaim memory.  However, the
@@ -4228,10 +4238,39 @@ AfterTriggerEndXact(bool isCommit)
 	 * soon as possible --- especially if we are aborting because we ran out
 	 * of memory for the list!
 	 */
-	if (afterTriggers && afterTriggers->event_cxt)
-		MemoryContextDelete(afterTriggers->event_cxt);
+	if (afterTriggers.event_cxt)
+	{
+		MemoryContextDelete(afterTriggers.event_cxt);
+		afterTriggers.event_cxt = NULL;
+		afterTriggers.events.head = NULL;
+		afterTriggers.events.tail = NULL;
+		afterTriggers.events.tailfree = NULL;
+	}
 
-	afterTriggers = NULL;
+	/*
+	 * Forget any subtransaction state as well.  Since this can't be very
+	 * large, we let the eventual reset of TopTransactionContext free the
+	 * memory instead of doing it here.
+	 */
+	afterTriggers.state_stack = NULL;
+	afterTriggers.events_stack = NULL;
+	afterTriggers.depth_stack = NULL;
+	afterTriggers.firing_stack = NULL;
+	afterTriggers.maxtransdepth = 0;
+
+
+	/*
+	 * Forget the query stack and constraint-related state information.  As
+	 * with the subtransaction state information, we don't bother freeing the
+	 * memory here.
+	 */
+	afterTriggers.query_stack = NULL;
+	afterTriggers.fdw_tuplestores = NULL;
+	afterTriggers.maxquerydepth = 0;
+	afterTriggers.state = NULL;
+
+	/* No more afterTriggers manipulation until next transaction starts. */
+	afterTriggers.query_depth = -1;
 }
 
 /*
@@ -4245,56 +4284,49 @@ AfterTriggerBeginSubXact(void)
 	int			my_level = GetCurrentTransactionNestLevel();
 
 	/*
-	 * Ignore call if the transaction is in aborted state.  (Probably
-	 * shouldn't happen?)
-	 */
-	if (afterTriggers == NULL)
-		return;
-
-	/*
 	 * Allocate more space in the stacks if needed.  (Note: because the
 	 * minimum nest level of a subtransaction is 2, we waste the first couple
 	 * entries of each array; not worth the notational effort to avoid it.)
 	 */
-	while (my_level >= afterTriggers->maxtransdepth)
+	while (my_level >= afterTriggers.maxtransdepth)
 	{
-		if (afterTriggers->maxtransdepth == 0)
+		if (afterTriggers.maxtransdepth == 0)
 		{
 			MemoryContext old_cxt;
 
 			old_cxt = MemoryContextSwitchTo(TopTransactionContext);
 
 #define DEFTRIG_INITALLOC 8
-			afterTriggers->state_stack = (SetConstraintState *)
+			afterTriggers.state_stack = (SetConstraintState *)
 				palloc(DEFTRIG_INITALLOC * sizeof(SetConstraintState));
-			afterTriggers->events_stack = (AfterTriggerEventList *)
+			afterTriggers.events_stack = (AfterTriggerEventList *)
 				palloc(DEFTRIG_INITALLOC * sizeof(AfterTriggerEventList));
-			afterTriggers->depth_stack = (int *)
+			afterTriggers.depth_stack = (int *)
 				palloc(DEFTRIG_INITALLOC * sizeof(int));
-			afterTriggers->firing_stack = (CommandId *)
+			afterTriggers.firing_stack = (CommandId *)
 				palloc(DEFTRIG_INITALLOC * sizeof(CommandId));
-			afterTriggers->maxtransdepth = DEFTRIG_INITALLOC;
+			afterTriggers.maxtransdepth = DEFTRIG_INITALLOC;
 
 			MemoryContextSwitchTo(old_cxt);
 		}
 		else
 		{
 			/* repalloc will keep the stacks in the same context */
-			int			new_alloc = afterTriggers->maxtransdepth * 2;
+			int			new_alloc = afterTriggers.maxtransdepth * 2;
 
-			afterTriggers->state_stack = (SetConstraintState *)
-				repalloc(afterTriggers->state_stack,
+			afterTriggers.state_stack = (SetConstraintState *)
+				repalloc(afterTriggers.state_stack,
 						 new_alloc * sizeof(SetConstraintState));
-			afterTriggers->events_stack = (AfterTriggerEventList *)
-				repalloc(afterTriggers->events_stack,
+			afterTriggers.events_stack = (AfterTriggerEventList *)
+				repalloc(afterTriggers.events_stack,
 						 new_alloc * sizeof(AfterTriggerEventList));
-			afterTriggers->depth_stack = (int *)
-				repalloc(afterTriggers->depth_stack,
+			afterTriggers.depth_stack = (int *)
+				repalloc(afterTriggers.depth_stack,
 						 new_alloc * sizeof(int));
-			afterTriggers->firing_stack = (CommandId *)
-				repalloc(afterTriggers->firing_stack,
+			afterTriggers.firing_stack = (CommandId *)
+				repalloc(afterTriggers.firing_stack,
 						 new_alloc * sizeof(CommandId));
-			afterTriggers->maxtransdepth = new_alloc;
+			afterTriggers.maxtransdepth = new_alloc;
 		}
 	}
 
@@ -4303,10 +4335,10 @@ AfterTriggerBeginSubXact(void)
 	 * is not saved until/unless changed.  Likewise, we don't make a
 	 * per-subtransaction event context until needed.
 	 */
-	afterTriggers->state_stack[my_level] = NULL;
-	afterTriggers->events_stack[my_level] = afterTriggers->events;
-	afterTriggers->depth_stack[my_level] = afterTriggers->query_depth;
-	afterTriggers->firing_stack[my_level] = afterTriggers->firing_counter;
+	afterTriggers.state_stack[my_level] = NULL;
+	afterTriggers.events_stack[my_level] = afterTriggers.events;
+	afterTriggers.depth_stack[my_level] = afterTriggers.query_depth;
+	afterTriggers.firing_stack[my_level] = afterTriggers.firing_counter;
 }
 
 /*
@@ -4324,26 +4356,19 @@ AfterTriggerEndSubXact(bool isCommit)
 	CommandId	subxact_firing_id;
 
 	/*
-	 * Ignore call if the transaction is in aborted state.  (Probably
-	 * unneeded)
-	 */
-	if (afterTriggers == NULL)
-		return;
-
-	/*
 	 * Pop the prior state if needed.
 	 */
 	if (isCommit)
 	{
-		Assert(my_level < afterTriggers->maxtransdepth);
+		Assert(my_level < afterTriggers.maxtransdepth);
 		/* If we saved a prior state, we don't need it anymore */
-		state = afterTriggers->state_stack[my_level];
+		state = afterTriggers.state_stack[my_level];
 		if (state != NULL)
 			pfree(state);
 		/* this avoids double pfree if error later: */
-		afterTriggers->state_stack[my_level] = NULL;
-		Assert(afterTriggers->query_depth ==
-			   afterTriggers->depth_stack[my_level]);
+		afterTriggers.state_stack[my_level] = NULL;
+		Assert(afterTriggers.query_depth ==
+			   afterTriggers.depth_stack[my_level]);
 	}
 	else
 	{
@@ -4352,7 +4377,7 @@ AfterTriggerEndSubXact(bool isCommit)
 		 * AfterTriggerBeginSubXact, in which case we mustn't risk touching
 		 * stack levels that aren't there.
 		 */
-		if (my_level >= afterTriggers->maxtransdepth)
+		if (my_level >= afterTriggers.maxtransdepth)
 			return;
 
 		/*
@@ -4361,42 +4386,46 @@ AfterTriggerEndSubXact(bool isCommit)
 		 * subtransaction will not add events to query levels started in a
 		 * earlier transaction state.
 		 */
-		while (afterTriggers->query_depth > afterTriggers->depth_stack[my_level])
+		while (afterTriggers.query_depth > afterTriggers.depth_stack[my_level])
 		{
-			Tuplestorestate *ts;
-
-			ts = afterTriggers->fdw_tuplestores[afterTriggers->query_depth];
-			if (ts)
+			if (afterTriggers.query_depth < afterTriggers.maxquerydepth)
 			{
-				tuplestore_end(ts);
-				afterTriggers->fdw_tuplestores[afterTriggers->query_depth] = NULL;
+				Tuplestorestate *ts;
+
+				ts = afterTriggers.fdw_tuplestores[afterTriggers.query_depth];
+				if (ts)
+				{
+					tuplestore_end(ts);
+					afterTriggers.fdw_tuplestores[afterTriggers.query_depth] = NULL;
+				}
+
+				afterTriggerFreeEventList(&afterTriggers.query_stack[afterTriggers.query_depth]);
 			}
 
-			afterTriggerFreeEventList(&afterTriggers->query_stack[afterTriggers->query_depth]);
-			afterTriggers->query_depth--;
+			afterTriggers.query_depth--;
 		}
-		Assert(afterTriggers->query_depth ==
-			   afterTriggers->depth_stack[my_level]);
+		Assert(afterTriggers.query_depth ==
+			   afterTriggers.depth_stack[my_level]);
 
 		/*
 		 * Restore the global deferred-event list to its former length,
 		 * discarding any events queued by the subxact.
 		 */
-		afterTriggerRestoreEventList(&afterTriggers->events,
-									 &afterTriggers->events_stack[my_level]);
+		afterTriggerRestoreEventList(&afterTriggers.events,
+									 &afterTriggers.events_stack[my_level]);
 
 		/*
 		 * Restore the trigger state.  If the saved state is NULL, then this
 		 * subxact didn't save it, so it doesn't need restoring.
 		 */
-		state = afterTriggers->state_stack[my_level];
+		state = afterTriggers.state_stack[my_level];
 		if (state != NULL)
 		{
-			pfree(afterTriggers->state);
-			afterTriggers->state = state;
+			pfree(afterTriggers.state);
+			afterTriggers.state = state;
 		}
 		/* this avoids double pfree if error later: */
-		afterTriggers->state_stack[my_level] = NULL;
+		afterTriggers.state_stack[my_level] = NULL;
 
 		/*
 		 * Scan for any remaining deferred events that were marked DONE or IN
@@ -4406,8 +4435,8 @@ AfterTriggerEndSubXact(bool isCommit)
 		 * (This essentially assumes that the current subxact includes all
 		 * subxacts started after it.)
 		 */
-		subxact_firing_id = afterTriggers->firing_stack[my_level];
-		for_each_event_chunk(event, chunk, afterTriggers->events)
+		subxact_firing_id = afterTriggers.firing_stack[my_level];
+		for_each_event_chunk(event, chunk, afterTriggers.events)
 		{
 			AfterTriggerShared evtshared = GetTriggerSharedData(event);
 
@@ -4419,6 +4448,67 @@ AfterTriggerEndSubXact(bool isCommit)
 						~(AFTER_TRIGGER_DONE | AFTER_TRIGGER_IN_PROGRESS);
 			}
 		}
+	}
+}
+
+/* ----------
+ * AfterTriggerEnlargeQueryState()
+ *
+ *	Prepare the necessary state so that we can record AFTER trigger events
+ *	queued by a query.  It is allowed to have nested queries within a
+ *	(sub)transaction, so we need to have separate state for each query
+ *	nesting level.
+ * ----------
+ */
+static void
+AfterTriggerEnlargeQueryState(void)
+{
+	int			init_depth = afterTriggers.maxquerydepth;
+
+	Assert(afterTriggers.query_depth >= afterTriggers.maxquerydepth);
+
+	if (afterTriggers.maxquerydepth == 0)
+	{
+		int			new_alloc = Max(afterTriggers.query_depth + 1, 8);
+
+		afterTriggers.query_stack = (AfterTriggerEventList *)
+			MemoryContextAlloc(TopTransactionContext,
+							   new_alloc * sizeof(AfterTriggerEventList));
+		afterTriggers.fdw_tuplestores = (Tuplestorestate **)
+			MemoryContextAllocZero(TopTransactionContext,
+								   new_alloc * sizeof(Tuplestorestate *));
+		afterTriggers.maxquerydepth = new_alloc;
+	}
+	else
+	{
+		/* repalloc will keep the stack in the same context */
+		int			old_alloc = afterTriggers.maxquerydepth;
+		int			new_alloc = Max(afterTriggers.query_depth + 1,
+									old_alloc * 2);
+
+		afterTriggers.query_stack = (AfterTriggerEventList *)
+			repalloc(afterTriggers.query_stack,
+					 new_alloc * sizeof(AfterTriggerEventList));
+		afterTriggers.fdw_tuplestores = (Tuplestorestate **)
+			repalloc(afterTriggers.fdw_tuplestores,
+					 new_alloc * sizeof(Tuplestorestate *));
+		/* Clear newly-allocated slots for subsequent lazy initialization. */
+		memset(afterTriggers.fdw_tuplestores + old_alloc,
+			   0, (new_alloc - old_alloc) * sizeof(Tuplestorestate *));
+		afterTriggers.maxquerydepth = new_alloc;
+	}
+
+	/* Initialize new query lists to empty */
+	while (init_depth < afterTriggers.maxquerydepth)
+	{
+		AfterTriggerEventList *events;
+
+		events = &afterTriggers.query_stack[init_depth];
+		events->head = NULL;
+		events->tail = NULL;
+		events->tailfree = NULL;
+
+		++init_depth;
 	}
 }
 
@@ -4439,8 +4529,8 @@ SetConstraintStateCreate(int numalloc)
 	 */
 	state = (SetConstraintState)
 		MemoryContextAllocZero(TopTransactionContext,
-							   sizeof(SetConstraintStateData) +
-						   (numalloc - 1) *sizeof(SetConstraintTriggerData));
+							   offsetof(SetConstraintStateData, trigstates) +
+							   numalloc * sizeof(SetConstraintTriggerData));
 
 	state->numalloc = numalloc;
 
@@ -4481,8 +4571,8 @@ SetConstraintStateAddItem(SetConstraintState state,
 		newalloc = Max(newalloc, 8);	/* in case original has size 0 */
 		state = (SetConstraintState)
 			repalloc(state,
-					 sizeof(SetConstraintStateData) +
-					 (newalloc - 1) *sizeof(SetConstraintTriggerData));
+					 offsetof(SetConstraintStateData, trigstates) +
+					 newalloc * sizeof(SetConstraintTriggerData));
 		state->numalloc = newalloc;
 		Assert(state->numstates < state->numalloc);
 	}
@@ -4505,21 +4595,19 @@ AfterTriggerSetState(ConstraintsSetStmt *stmt)
 {
 	int			my_level = GetCurrentTransactionNestLevel();
 
-	/*
-	 * Ignore call if we aren't in a transaction.  (Shouldn't happen?)
-	 */
-	if (afterTriggers == NULL)
-		return;
+	/* If we haven't already done so, initialize our state. */
+	if (afterTriggers.state == NULL)
+		afterTriggers.state = SetConstraintStateCreate(8);
 
 	/*
 	 * If in a subtransaction, and we didn't save the current state already,
 	 * save it so it can be restored if the subtransaction aborts.
 	 */
 	if (my_level > 1 &&
-		afterTriggers->state_stack[my_level] == NULL)
+		afterTriggers.state_stack[my_level] == NULL)
 	{
-		afterTriggers->state_stack[my_level] =
-			SetConstraintStateCopy(afterTriggers->state);
+		afterTriggers.state_stack[my_level] =
+			SetConstraintStateCopy(afterTriggers.state);
 	}
 
 	/*
@@ -4530,13 +4618,13 @@ AfterTriggerSetState(ConstraintsSetStmt *stmt)
 		/*
 		 * Forget any previous SET CONSTRAINTS commands in this transaction.
 		 */
-		afterTriggers->state->numstates = 0;
+		afterTriggers.state->numstates = 0;
 
 		/*
 		 * Set the per-transaction ALL state to known.
 		 */
-		afterTriggers->state->all_isset = true;
-		afterTriggers->state->all_isdeferred = stmt->deferred;
+		afterTriggers.state->all_isset = true;
+		afterTriggers.state->all_isdeferred = stmt->deferred;
 	}
 	else
 	{
@@ -4710,7 +4798,7 @@ AfterTriggerSetState(ConstraintsSetStmt *stmt)
 		foreach(lc, tgoidlist)
 		{
 			Oid			tgoid = lfirst_oid(lc);
-			SetConstraintState state = afterTriggers->state;
+			SetConstraintState state = afterTriggers.state;
 			bool		found = false;
 			int			i;
 
@@ -4725,7 +4813,7 @@ AfterTriggerSetState(ConstraintsSetStmt *stmt)
 			}
 			if (!found)
 			{
-				afterTriggers->state =
+				afterTriggers.state =
 					SetConstraintStateAddItem(state, tgoid, stmt->deferred);
 			}
 		}
@@ -4744,12 +4832,12 @@ AfterTriggerSetState(ConstraintsSetStmt *stmt)
 	 */
 	if (!stmt->deferred)
 	{
-		AfterTriggerEventList *events = &afterTriggers->events;
+		AfterTriggerEventList *events = &afterTriggers.events;
 		bool		snapshot_set = false;
 
 		while (afterTriggerMarkEvents(events, NULL, true))
 		{
-			CommandId	firing_id = afterTriggers->firing_counter++;
+			CommandId	firing_id = afterTriggers.firing_counter++;
 
 			/*
 			 * Make sure a snapshot has been established in case trigger
@@ -4815,12 +4903,8 @@ AfterTriggerPendingOnRel(Oid relid)
 	AfterTriggerEventChunk *chunk;
 	int			depth;
 
-	/* No-op if we aren't in a transaction.  (Shouldn't happen?) */
-	if (afterTriggers == NULL)
-		return false;
-
 	/* Scan queued events */
-	for_each_event_chunk(event, chunk, afterTriggers->events)
+	for_each_event_chunk(event, chunk, afterTriggers.events)
 	{
 		AfterTriggerShared evtshared = GetTriggerSharedData(event);
 
@@ -4841,9 +4925,9 @@ AfterTriggerPendingOnRel(Oid relid)
 	 * if TRUNCATE/etc is executed by a function or trigger within an updating
 	 * query on the same relation, which is pretty perverse, but let's check.
 	 */
-	for (depth = 0; depth <= afterTriggers->query_depth; depth++)
+	for (depth = 0; depth <= afterTriggers.query_depth && depth < afterTriggers.maxquerydepth; depth++)
 	{
-		for_each_event_chunk(event, chunk, afterTriggers->query_stack[depth])
+		for_each_event_chunk(event, chunk, afterTriggers.query_stack[depth])
 		{
 			AfterTriggerShared evtshared = GetTriggerSharedData(event);
 
@@ -4887,18 +4971,20 @@ AfterTriggerSaveEvent(EState *estate, ResultRelInfo *relinfo,
 	Tuplestorestate *fdw_tuplestore = NULL;
 
 	/*
-	 * Check state.  We use normal tests not Asserts because it is possible to
+	 * Check state.  We use a normal test not Assert because it is possible to
 	 * reach here in the wrong state given misconfigured RI triggers, in
 	 * particular deferring a cascade action trigger.
 	 */
-	if (afterTriggers == NULL)
-		elog(ERROR, "AfterTriggerSaveEvent() called outside of transaction");
-	if (afterTriggers->query_depth < 0)
+	if (afterTriggers.query_depth < 0)
 		elog(ERROR, "AfterTriggerSaveEvent() called outside of query");
 
 	/* Don't fire statement-triggers in executor nodes. */
 	if (!row_trigger && Gp_role == GP_ROLE_EXECUTE)
 		return;
+
+	/* Be sure we have enough space to record events at this query depth. */
+	if (afterTriggers.query_depth >= afterTriggers.maxquerydepth)
+		AfterTriggerEnlargeQueryState();
 
 	/*
 	 * Validate the event code and collect the associated tuple CTIDs.
@@ -5063,7 +5149,7 @@ AfterTriggerSaveEvent(EState *estate, ResultRelInfo *relinfo,
 		new_shared.ats_relid = RelationGetRelid(rel);
 		new_shared.ats_firing_id = 0;
 
-		afterTriggerAddEvent(&afterTriggers->query_stack[afterTriggers->query_depth],
+		afterTriggerAddEvent(&afterTriggers.query_stack[afterTriggers.query_depth],
 							 &new_event, &new_shared);
 	}
 

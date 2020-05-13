@@ -259,21 +259,48 @@ INSERT INTO FLOAT8_TBL(f1) VALUES ('-1.2345678901234e-200');
 
 SELECT '' AS five, f1 FROM FLOAT8_TBL ORDER BY 2;
 
--- test if you can dump/restore subnormal (1e-323) values
--- using COPY
+-- test exact cases for trigonometric functions in degrees
+SET extra_float_digits = 3;
 
-CREATE TABLE FLOATS(a float8);
+SELECT x,
+       sind(x),
+       sind(x) IN (-1,-0.5,0,0.5,1) AS sind_exact
+FROM (VALUES (0), (30), (90), (150), (180),
+      (210), (270), (330), (360)) AS t(x);
 
-INSERT INTO FLOATS select 1e-307::float8 / 10^i FROM generate_series(1,16) i;
+SELECT x,
+       cosd(x),
+       cosd(x) IN (-1,-0.5,0,0.5,1) AS cosd_exact
+FROM (VALUES (0), (60), (90), (120), (180),
+      (240), (270), (300), (360)) AS t(x);
 
-SELECT * FROM FLOATS ORDER BY a;
+SELECT x,
+       tand(x),
+       tand(x) IN ('-Infinity'::float8,-1,0,
+                   1,'Infinity'::float8) AS tand_exact,
+       cotd(x),
+       cotd(x) IN ('-Infinity'::float8,-1,0,
+                   1,'Infinity'::float8) AS cotd_exact
+FROM (VALUES (0), (45), (90), (135), (180),
+      (225), (270), (315), (360)) AS t(x);
 
-SELECT float8in(float8out(a)) FROM FLOATS ORDER BY a;
+SELECT x,
+       asind(x),
+       asind(x) IN (-90,-30,0,30,90) AS asind_exact,
+       acosd(x),
+       acosd(x) IN (0,60,90,120,180) AS acosd_exact
+FROM (VALUES (-1), (-0.5), (0), (0.5), (1)) AS t(x);
 
-COPY FLOATS TO '/tmp/floats';
+SELECT x,
+       atand(x),
+       atand(x) IN (-90,-45,0,45,90) AS atand_exact
+FROM (VALUES ('-Infinity'::float8), (-1), (0), (1),
+      ('Infinity'::float8)) AS t(x);
 
-TRUNCATE FLOATS;
+SELECT x, y,
+       atan2d(y, x),
+       atan2d(y, x) IN (-90,0,90,180) AS atan2d_exact
+FROM (SELECT 10*cosd(a), 10*sind(a)
+      FROM generate_series(0, 360, 90) AS t(a)) AS t(x,y);
 
-COPY FLOATS FROM '/tmp/floats';
-
-SELECT * FROM FLOATS ORDER BY a;
+RESET extra_float_digits;

@@ -1,4 +1,3 @@
-
 /*-------------------------------------------------------------------------
  *
  * cdbgang_async.c
@@ -15,7 +14,6 @@
  */
 
 #include "postgres.h"
-#include <limits.h>
 
 #ifdef HAVE_POLL_H
 #include <poll.h>
@@ -31,9 +29,9 @@
 #include "cdb/cdbfts.h"
 #include "cdb/cdbgang.h"
 #include "cdb/cdbgang_async.h"
+#include "cdb/cdbtm.h"
 #include "cdb/cdbvars.h"
 #include "miscadmin.h"
-#include "utils/resowner.h"
 
 static int	getPollTimeout(const struct timeval *startTS);
 
@@ -57,6 +55,7 @@ cdbgang_createGang_async(List *segments, SegmentType segmentType)
 	int		i = 0;
 	int		size = 0;
 	bool	retry = false;
+	int		totalSegs = 0;
 
 	/*
 	 * true means connection status is confirmed, either established or in
@@ -75,6 +74,8 @@ cdbgang_createGang_async(List *segments, SegmentType segmentType)
 	/* allocate and initialize a gang structure */
 	newGangDefinition = buildGangDefinition(segments, segmentType);
 	CurrentGangCreating = newGangDefinition;
+	totalSegs = getgpsegmentCount();
+	Assert(totalSegs > 0);
 
 create_gang_retry:
 	Assert(newGangDefinition != NULL);
@@ -123,7 +124,8 @@ create_gang_retry:
 			ret = build_gpqeid_param(gpqeid, sizeof(gpqeid),
 									 segdbDesc->isWriter,
 									 segdbDesc->identifier,
-									 segdbDesc->segment_database_info->hostSegs);
+									 segdbDesc->segment_database_info->hostSegs,
+									 totalSegs * 2);
 
 			if (!ret)
 				ereport(ERROR,
@@ -210,6 +212,8 @@ create_gang_retry:
 						}
 						else
 						{
+							if (segment_failure_due_to_missing_writer(PQerrorMessage(segdbDesc->conn)))
+								markCurrentGxactWriterGangLost();
 							ereport(ERROR, (errcode(ERRCODE_GP_INTERCONNECTION_ERROR),
 											errmsg("failed to acquire resources on one or more segments"),
 											errdetail("%s (%s)", PQerrorMessage(segdbDesc->conn), segdbDesc->whoami)));
@@ -232,7 +236,7 @@ create_gang_retry:
 			if (nfds == 0)
 				break;
 
-			SIMPLE_FAULT_INJECTOR(CreateGangInProgress);
+			SIMPLE_FAULT_INJECTOR("create_gang_in_progress");
 
 			CHECK_FOR_INTERRUPTS();
 
@@ -308,7 +312,7 @@ create_gang_retry:
 	}
 	PG_END_TRY();
 
-	SIMPLE_FAULT_INJECTOR(GangCreated);
+	SIMPLE_FAULT_INJECTOR("gang_created");
 
 	if (retry)
 	{

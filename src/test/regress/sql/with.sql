@@ -3,7 +3,7 @@
 --
 
 --start_ignore
-set gp_cte_sharing = on;
+set gp_cte_sharing to on;
 --end_ignore
 
 -- Basic WITH
@@ -438,6 +438,7 @@ WITH RECURSIVE x(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM (SELECT * FROM x UNIO
 CREATE TEMPORARY TABLE u(x int primary key);
 WITH RECURSIVE x(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM (SELECT * from z UNION SELECT * FROM u)foo, x where foo.x = x.n)
 	SELECT * FROM x;
+DROP TABLE z;
 
 -- no non-recursive term
 WITH RECURSIVE x(n) AS (SELECT n FROM x)
@@ -778,14 +779,6 @@ SELECT * FROM t;
 
 SELECT * FROM y;
 
---start_ignore
--- GPDB_91_MERGE_FIXME: MPP does not allow > 1 writer gang for one session while the
--- case below (writable CTE introduced in pg 9.1) violates this. If we run the case we
--- will see error as below.
--- ERROR:  INSERT/UPDATE/DELETE must be executed by a writer segworker group: 2 0 (nodeModifyTable.c:1336)
--- Besides writable CTE might need additional effort, so ignoring all of the cases (
--- all are for writable CTE) since the first error introduces cascading errors.
-
 -- forward reference
 WITH RECURSIVE t AS (
 	INSERT INTO y
@@ -863,9 +856,67 @@ SELECT * FROM y;
 WITH t AS (
     UPDATE y SET a = a * 100 RETURNING *
 )
-SELECT * FROM t LIMIT 10;
+SELECT a BETWEEN 0 AND 4200 FROM t LIMIT 10;
 
 SELECT * FROM y;
+
+-- data-modifying WITH containing INSERT...ON CONFLICT DO UPDATE
+CREATE TABLE z AS SELECT i AS k, (i || ' v')::text v FROM generate_series(1, 16, 3) i DISTRIBUTED BY (k);
+ALTER TABLE z ADD UNIQUE (k);
+
+WITH t AS (
+    INSERT INTO z SELECT i, 'insert'
+    FROM generate_series(0, 16) i
+    ON CONFLICT (k) DO UPDATE SET v = z.v || ', now update'
+    RETURNING *
+)
+SELECT * FROM t JOIN y ON t.k = y.a ORDER BY a, k;
+
+-- Test EXCLUDED.* reference within CTE
+WITH aa AS (
+    INSERT INTO z VALUES(1, 5) ON CONFLICT (k) DO UPDATE SET v = EXCLUDED.v
+    WHERE z.k != EXCLUDED.k
+    RETURNING *
+)
+SELECT * FROM aa;
+
+-- New query/snapshot demonstrates side-effects of previous query.
+SELECT * FROM z ORDER BY k;
+
+--
+-- Ensure subqueries within the update clause work, even if they
+-- reference outside values
+--
+WITH aa AS (SELECT 1 a, 2 b)
+INSERT INTO z VALUES(1, 'insert')
+ON CONFLICT (k) DO UPDATE SET v = (SELECT b || ' update' FROM aa WHERE a = 1 LIMIT 1);
+WITH aa AS (SELECT 1 a, 2 b)
+INSERT INTO z VALUES(1, 'insert')
+ON CONFLICT (k) DO UPDATE SET v = ' update' WHERE z.k = (SELECT a FROM aa);
+WITH aa AS (SELECT 1 a, 2 b)
+INSERT INTO z VALUES(1, 'insert')
+ON CONFLICT (k) DO UPDATE SET v = (SELECT b || ' update' FROM aa WHERE a = 1 LIMIT 1);
+WITH aa AS (SELECT 'a' a, 'b' b UNION ALL SELECT 'a' a, 'b' b)
+INSERT INTO z VALUES(1, 'insert')
+ON CONFLICT (k) DO UPDATE SET v = (SELECT b || ' update' FROM aa WHERE a = 'a' LIMIT 1);
+WITH aa AS (SELECT 1 a, 2 b)
+INSERT INTO z VALUES(1, (SELECT b || ' insert' FROM aa WHERE a = 1 ))
+ON CONFLICT (k) DO UPDATE SET v = (SELECT b || ' update' FROM aa WHERE a = 1 LIMIT 1);
+
+-- Update a row more than once, in different parts of a wCTE. That is
+-- an allowed, presumably very rare, edge case, but since it was
+-- broken in the past, having a test seems worthwhile.
+WITH simpletup AS (
+  SELECT 2 k, 'Green' v),
+upsert_cte AS (
+  INSERT INTO z VALUES(2, 'Blue') ON CONFLICT (k) DO
+    UPDATE SET (k, v) = (SELECT k, v FROM simpletup WHERE simpletup.k = z.k)
+    RETURNING k, v)
+INSERT INTO z VALUES(2, 'Red') ON CONFLICT (k) DO
+UPDATE SET (k, v) = (SELECT k, v FROM upsert_cte WHERE upsert_cte.k = z.k)
+RETURNING k, v;
+
+DROP TABLE z;
 
 -- check that run to completion happens in proper ordering
 
@@ -893,6 +944,9 @@ SELECT 1;
 SELECT * FROM y;
 SELECT * FROM yy;
 
+-- start_ignore
+-- These tests actually seem to work, but they have unstable return order
+-- in an MPP environment so they are ignored until atmsort can handle this 
 -- triggers
 
 TRUNCATE TABLE y;
@@ -963,6 +1017,7 @@ SELECT * FROM y;
 
 DROP TRIGGER y_trig ON y;
 DROP FUNCTION y_trigger();
+-- end_ignore
 
 -- WITH attached to inherited UPDATE or DELETE
 
@@ -1029,5 +1084,7 @@ WITH t AS (
 VALUES(FALSE);
 DROP RULE y_rule ON y;
 
--- Match previous start_ignore with GPDB_91_MERGE_FIXME
---end_ignore
+-- check that parser lookahead for WITH doesn't cause any odd behavior
+create table foo (with baz);  -- fail, WITH is a reserved word
+create table foo (with ordinality);  -- fail, WITH is a reserved word
+with ordinality as (select 1 as x) select * from ordinality;

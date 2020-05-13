@@ -72,13 +72,6 @@ typedef struct CdbDispatchResult
 	int errcode;
 
 	/*
-	 * index of first entry in resultbuf
-	 * that represents an error; or -1.
-	 * Pass to cdbconn_getResult().
-	 */
-	int errindex;
-
-	/*
 	 * index of last entry in resultbuf
 	 * with resultStatus == PGRES_TUPLES_OK
 	 * or PGRES_COMMAND_OK (command ended
@@ -210,8 +203,7 @@ cdbdisp_appendMessageNonThread(CdbDispatchResult *dispatchResult,
 							   int errcode,
 							   const char *fmt,
 							   ...)
-/* This extension allows gcc to check the format string */
-__attribute__((format(printf, 3, 4)));
+pg_attribute_printf(3, 4);
 
 
 /*
@@ -278,9 +270,6 @@ cdbdisp_sumCmdTuples(CdbDispatchResults *results, int sliceIndex);
 void
 cdbdisp_sumRejectedRows(CdbDispatchResults *results);
 
-HTAB *
-cdbdisp_sumAoPartTupCount(PartitionNode *parts, CdbDispatchResults *results);
-
 /*
  * max of the lastOid values returned from the QEs
  */
@@ -320,9 +309,5 @@ cdbdisp_makeDispatchResults(struct CdbDispatcherState *ds,
 
 void
 cdbdisp_clearCdbPgResults(CdbPgResults* cdb_pgresults);
-
-extern struct HTAB *
-PQprocessAoTupCounts(struct PartitionNode *parts, struct HTAB *ht,
-					 void *aotupcounts, int naotupcounts);
 
 #endif   /* CDBDISPATCHRESULT_H */

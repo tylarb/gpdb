@@ -23,7 +23,7 @@
  * the result is validly encoded according to the destination encoding.
  *
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -750,7 +750,6 @@ perform_default_encoding_conversion(const char *src, int len,
 				  CStringGetDatum((char *) src),
 				  CStringGetDatum(result),
 				  Int32GetDatum(len));
-		
 	return result;
 }
 
@@ -1035,46 +1034,6 @@ cliplen(const char *str, int len, int limit)
 	return l;
 }
 
-#if defined(ENABLE_NLS) && defined(WIN32)
-static const struct codeset_map {
-	int	encoding;
-	const char *codeset;
-} codeset_map_array[] = {
-	{PG_UTF8, "UTF-8"},
-	{PG_LATIN1, "LATIN1"},
-	{PG_LATIN2, "LATIN2"},
-	{PG_LATIN3, "LATIN3"},
-	{PG_LATIN4, "LATIN4"},
-	{PG_ISO_8859_5, "ISO-8859-5"},
-	{PG_ISO_8859_6, "ISO_8859-6"},
-	{PG_ISO_8859_7, "ISO-8859-7"},
-	{PG_ISO_8859_8, "ISO-8859-8"},
-	{PG_LATIN5, "LATIN5"},
-	{PG_LATIN6, "LATIN6"},
-	{PG_LATIN7, "LATIN7"},
-	{PG_LATIN8, "LATIN8"},
-	{PG_LATIN9, "LATIN-9"},
-	{PG_LATIN10, "LATIN10"},
-	{PG_KOI8R, "KOI8-R"},
-	{PG_WIN1250, "CP1250"},
-	{PG_WIN1251, "CP1251"},
-	{PG_WIN1252, "CP1252"},
-	{PG_WIN1253, "CP1253"},
-	{PG_WIN1254, "CP1254"},
-	{PG_WIN1255, "CP1255"},
-	{PG_WIN1256, "CP1256"},
-	{PG_WIN1257, "CP1257"},
-	{PG_WIN1258, "CP1258"},
-	{PG_WIN866, "CP866"},
-	{PG_WIN874, "CP874"},
-	{PG_EUC_CN, "EUC-CN"},
-	{PG_EUC_JP, "EUC-JP"},
-	{PG_EUC_KR, "EUC-KR"},
-	{PG_EUC_TW, "EUC-TW"},
-	{PG_EUC_JIS_2004, "EUC-JP"}
-};
-#endif /* WIN32 */
-
 void
 SetDatabaseEncoding(int encoding)
 {
@@ -1219,8 +1178,10 @@ GetMessageEncoding(void)
 
 #ifdef WIN32
 /*
- * Result is palloc'ed null-terminated utf16 string. The character length
- * is also passed to utf16len if not null. Returns NULL iff failed.
+ * Convert from MessageEncoding to a palloc'ed, null-terminated utf16
+ * string. The character length is also passed to utf16len if not
+ * null. Returns NULL iff failed. Before MessageEncoding initialization, "str"
+ * should be ASCII-only; this will function as though MessageEncoding is UTF8.
  */
 WCHAR *
 pgwin32_message_to_UTF16(const char *str, int len, int *utf16len)
@@ -1233,7 +1194,8 @@ pgwin32_message_to_UTF16(const char *str, int len, int *utf16len)
 
 	/*
 	 * Use MultiByteToWideChar directly if there is a corresponding codepage,
-	 * or double conversion through UTF8 if not.
+	 * or double conversion through UTF8 if not.  Double conversion is needed,
+	 * for example, in an ENCODING=LATIN8, LC_CTYPE=C database.
 	 */
 	if (codepage != 0)
 	{
@@ -1245,12 +1207,21 @@ pgwin32_message_to_UTF16(const char *str, int len, int *utf16len)
 	{
 		char	   *utf8;
 
-		utf8 = (char *) pg_do_encoding_conversion((unsigned char *) str,
-												  len,
-												  GetMessageEncoding(),
-												  PG_UTF8);
-		if (utf8 != str)
-			len = strlen(utf8);
+		/*
+		 * XXX pg_do_encoding_conversion() requires a transaction.  In the
+		 * absence of one, hope for the input to be valid UTF8.
+		 */
+		if (IsTransactionState())
+		{
+			utf8 = (char *) pg_do_encoding_conversion((unsigned char *) str,
+													  len,
+													  GetMessageEncoding(),
+													  PG_UTF8);
+			if (utf8 != str)
+				len = strlen(utf8);
+		}
+		else
+			utf8 = (char *) str;
 
 		utf16 = (WCHAR *) palloc(sizeof(WCHAR) * (len + 1));
 		dstlen = MultiByteToWideChar(CP_UTF8, 0, utf8, len, utf16, len);

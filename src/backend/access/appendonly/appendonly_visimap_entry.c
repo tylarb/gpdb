@@ -621,20 +621,13 @@ AppendOnlyVisimapEntry_GetNextInvisible(
 											   AOTupleIdGet_rowNum(tupleId),
 											   &currentBitmapOffset);
 	}
-	currentBitmapOffset++;
 
-	offset = bms_first_from(visiMapEntry->bitmap,
-							currentBitmapOffset);
+	offset = bms_next_member(visiMapEntry->bitmap,
+							 currentBitmapOffset);
 	if (offset >= 0)
 	{
 		rowNum = visiMapEntry->firstRowNum + offset;
-		AOTupleIdInit_Init(tupleId);
-		AOTupleIdInit_segmentFileNum(
-									 tupleId,
-									 visiMapEntry->segmentFileNum);
-		AOTupleIdInit_rowNum(
-							 tupleId,
-							 rowNum);
+		AOTupleIdInit(tupleId, visiMapEntry->segmentFileNum, rowNum);
 		return true;
 	}
 	else

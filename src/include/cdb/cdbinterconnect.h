@@ -28,7 +28,7 @@
 #include "cdb/tupleremap.h"
 
 struct CdbProcess;                          /* #include "nodes/execnodes.h" */
-struct Slice;                               /* #include "nodes/execnodes.h" */
+struct ExecSlice;                           /* #include "nodes/execnodes.h" */
 struct SliceTable;                          /* #include "nodes/execnodes.h" */
 struct EState;                              /* #include "nodes/execnodes.h" */
 
@@ -242,7 +242,22 @@ struct MotionConn
 
 	int			tupleCount;
 
+	/*
+	 * false means 1) received a stop message and has handled it. 2) received
+	 * EOS message or sent out EOS message 3) received a QueryFinishPending
+	 * notify and has handled it.
+	 */
 	bool		stillActive;
+	/*
+	 * used both by motion sender and motion receiver
+	 *
+	 * sender: true means receiver don't need to consume tuples any more, sender
+	 * is also responsible to send stop message to its senders.
+	 *
+	 * receiver: true means have sent out a stop message to its senders. The stop
+	 * message might be lost, stopRequested can also tell sender that no more
+	 * data needed in the ack message.
+	 */
 	bool		stopRequested;
 
     MotionConnState state;
@@ -265,9 +280,6 @@ struct MotionConn
 	int			pkt_q_head;
 	int			pkt_q_tail;
 	uint8		**pkt_q;
-
-	/* Statistics info for this connection */
-	GpMonotonicTime ackWaitBeginTime;
 
 	uint64 stat_total_ack_time;
 	uint64 stat_count_acks;
@@ -302,10 +314,9 @@ typedef struct ChunkTransportStateEntry
 	int         motNodeId;
 	bool		valid;
 
-	/* Connection array: first the primaries, then the mirrors (if needed) */
+	/* Connection array */
     MotionConn *conns;
-	int			numConns;               /* all, including mirrors if present */
-    int         numPrimaryConns;        /* does not include mirrors */
+	int			numConns;
 
 	/*
 	 * used for receiving. to select() from a set of interesting MotionConns
@@ -320,13 +331,11 @@ typedef struct ChunkTransportStateEntry
 
     int         scanStart;
 
-    /* slice table entries */
-    struct Slice   *sendSlice;
-    struct Slice   *recvSlice;
+	/* slice table entries */
+	struct ExecSlice *sendSlice;
+	struct ExecSlice *recvSlice;
 
 	/* setup info */
-	int			outgoingPortRetryCount;
-
 	int			txfd;
 	int			txfd_family;
 	unsigned short txport;
@@ -372,18 +381,6 @@ typedef struct ChunkSorterEntry
 	 * Flag recording whether end-of-stream has been reported from the source.
 	 */
 	bool		end_of_stream;
-
-	/*
-	 * PER-(MOTION NODE & SENDER) STATISTICS
-	 *
-	 * These are utilized primarily in order
-	 * preserving motion nodes.
-	 */
-	/* Total tuples awaiting receive. */
-	uint32		stat_tuples_available;
-
-	/* High-water-mark of this value. */
-	uint32		stat_tuples_available_hwm;
 }	ChunkSorterEntry;
 
 /* This is the entry data-structure for a motion node. */
@@ -458,10 +455,6 @@ typedef struct MotionNodeEntry
 	uint64          stat_tuples_available;  /* Total tuples awaiting receive. */
 	uint64          stat_tuples_available_hwm;              /* High-water-mark of this
 		* value. */
-	uint64          sel_rd_wait;            /* Total time (usec) spent in select wait trying to read */
-	uint64          sel_wr_wait;            /* Total time spent (usec) in select wait trying to write */
-
-	uint64			memKB;	/* How much memory should this motion node use? */
 }       MotionNodeEntry;
 
 
@@ -484,15 +477,12 @@ typedef struct MotionLayerState
 	/*
 	 * MOTION NODE STATE - Initialized and used on per-statement basis.
 	 */
-
-#define MNE_INITIAL_COUNT (10)
 	int			mneCount;
 	MotionNodeEntry *mnEntries;
 
 	/*
 	 * GLOBAL MOTION-LAYER STATISTICS
 	 */
-
 	uint32		stat_total_chunks_sent; /* Tuple-chunks sent. */
 	uint32		stat_total_bytes_sent;	/* Bytes sent, including headers. */
 	uint32		stat_tuple_bytes_sent;	/* Bytes of pure tuple-data sent. */
@@ -515,6 +505,9 @@ typedef struct ChunkTransportState
 	bool		activated;
 
 	bool		aggressiveRetry;
+	
+	/* whether we've logged when network timeout happens */
+	bool		networkTimeoutIsLogged;
 
 	bool		teardownActive;
 	List		*incompleteConns;

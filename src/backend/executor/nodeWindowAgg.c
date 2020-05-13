@@ -23,7 +23,7 @@
  * aggregate function over all rows in the current row's window frame.
  *
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -445,17 +445,17 @@ call_transfunc(WindowAggState *winstate,
 	winstate->curaggcontext = NULL;
 
 	/*
-	 * Moving-aggregate transition functions must not return NULL, see
+	 * Moving-aggregate transition functions must not return null, see
 	 * advance_windowaggregate_base().
 	 */
 	if (fcinfo->isnull && OidIsValid(peraggstate->invtransfn_oid))
 		ereport(ERROR,
 				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
-		errmsg("moving-aggregate transition function must not return NULL")));
+		errmsg("moving-aggregate transition function must not return null")));
 
 	/*
 	 * We must track the number of rows included in transValue, since to
-	 * remove the last input, advance_windowaggregate_base() musn't call the
+	 * remove the last input, advance_windowaggregate_base() mustn't call the
 	 * inverse transition function, but simply reset transValue back to its
 	 * initial value.
 	 */
@@ -664,7 +664,7 @@ perform_distinct_windowaggregate(WindowAggState *winstate,
 
 	/* load the first tuple from spool */
 	if (tuplesort_getdatum(peraggstate->distinctSortState, true,
-						   &fcinfo->arg[1], &fcinfo->argnull[1]))
+						   &fcinfo->arg[1], &fcinfo->argnull[1], NULL))
 	{
 		call_transfunc(winstate, perfuncstate, peraggstate, fcinfo);
 		prevDatum = fcinfo->arg[1];
@@ -672,7 +672,7 @@ perform_distinct_windowaggregate(WindowAggState *winstate,
 
 		/* continue loading more tuples */
 		while (tuplesort_getdatum(peraggstate->distinctSortState, true,
-								  &fcinfo->arg[1], &fcinfo->argnull[1]))
+								  &fcinfo->arg[1], &fcinfo->argnull[1], NULL))
 		{
 			int		cmp;
 
@@ -786,7 +786,7 @@ finalize_windowaggregate(WindowAggState *winstate,
 	 * If result is pass-by-ref, make sure it is in the right context.
 	 */
 	if (!peraggstate->resulttypeByVal && !*isnull &&
-		!MemoryContextContainsGenericAllocation(CurrentMemoryContext,
+		!MemoryContextContains(CurrentMemoryContext,
 							   DatumGetPointer(*result)))
 		*result = datumCopy(*result,
 							peraggstate->resulttypeByVal,
@@ -1255,13 +1255,11 @@ eval_windowfunction(WindowAggState *winstate, WindowStatePerFunc perfuncstate,
 	 */
 	// GPDB_84_MERGE_FIXME: In upstream, we know that the allocation
 	// was palloc in some memory context, but in GPDB, that is not true.
-	// So we have to use MemoryContextContainsGenericAllocation instead of
-	// plain MemoryContextContains(). This is not actually 100% safe, there is
-	// a small chance MemoryContextContainsGenericAllocation() incorrectly
-	// says that the chunk is in the context, which could lead to a crash.
-	// nodeAgg.c has the same problem.
+	// This is not actually 100% safe, there is a small chance
+	// MemoryContextContains() incorrectly says that the chunk is in the context,
+	// which could lead to a crash. nodeAgg.c has the same problem.
 	if (!perfuncstate->resulttypeByVal && !fcinfo.isnull &&
-		!MemoryContextContainsGenericAllocation(CurrentMemoryContext,
+		!MemoryContextContains(CurrentMemoryContext,
 							   DatumGetPointer(*result))
 		)
 		*result = datumCopy(*result,
@@ -1980,8 +1978,7 @@ ExecWindowAgg(WindowAggState *winstate)
 	 * output tuple (because there is a function-returning-set in the
 	 * projection expressions).  If so, try to project another one.
 	 */
-#if 0
-	if (winstate->ss.ps.ps_TupFromTlist)
+	if (winstate->ps_TupFromTlist)
 	{
 		TupleTableSlot *result;
 		ExprDoneCond isDone;
@@ -1990,9 +1987,8 @@ ExecWindowAgg(WindowAggState *winstate)
 		if (isDone == ExprMultipleResult)
 			return result;
 		/* Done with that source tuple... */
-		winstate->ss.ps.ps_TupFromTlist = false;
+		winstate->ps_TupFromTlist = false;
 	}
-#endif
 
 restart:
 	if (winstate->buffer == NULL)
@@ -2107,10 +2103,8 @@ restart:
 		goto restart;
 	}
 
-#if 0
-	winstate->ss.ps.ps_TupFromTlist =
+	winstate->ps_TupFromTlist =
 		(isDone == ExprMultipleResult);
-#endif
 
 	return result;
 }
@@ -2226,9 +2220,7 @@ ExecInitWindowAgg(WindowAgg *node, EState *estate, int eflags)
 	ExecAssignResultTypeFromTL(&winstate->ss.ps);
 	ExecAssignProjectionInfo(&winstate->ss.ps, NULL);
 
-#if 0
-	winstate->ss.ps.ps_TupFromTlist = false;
-#endif
+	winstate->ps_TupFromTlist = false;
 
 	/* Set up data for comparing tuples */
 	if (node->partNumCols > 0)
@@ -2605,13 +2597,12 @@ ExecEndWindowAgg(WindowAggState *node)
 void
 ExecReScanWindowAgg(WindowAggState *node)
 {
+	PlanState  *outerPlan = outerPlanState(node);
 	ExprContext *econtext = node->ss.ps.ps_ExprContext;
 
 	node->all_done = false;
 
-#if 0
-	node->ss.ps.ps_TupFromTlist = false;
-#endif
+	node->ps_TupFromTlist = false;
 	node->all_first = true;
 
 	/* release tuplestore et al */
@@ -2632,14 +2623,15 @@ ExecReScanWindowAgg(WindowAggState *node)
 	 * if chgParam of subnode is not null then plan will be re-scanned by
 	 * first ExecProcNode.
 	 */
-	if (node->ss.ps.lefttree->chgParam == NULL)
-		ExecReScan(node->ss.ps.lefttree);
+	if (outerPlan->chgParam == NULL)
+		ExecReScan(outerPlan);
 }
 
 void
-ExecEagerFreeWindowAgg(WindowAggState *node)
+ExecSquelchWindowAgg(WindowAggState *node)
 {
-	// TODO FIXME
+	// TODO: do some eager freeing here?
+	ExecSquelchNode(outerPlanState(node));
 }
 
 /*
@@ -2773,22 +2765,16 @@ initialize_peragg(WindowAggState *winstate, WindowFunc *wfunc,
 											   numArguments);
 
 	/* build expression trees using actual argument & result types */
-	build_aggregate_fnexprs(inputTypes,
-							numArguments,
-							0,	/* no ordered-set window functions yet */
-							peraggstate->numFinalArgs,
-							false,		/* no variadic window functions yet */
-							aggtranstype,
-							wfunc->wintype,
-							wfunc->inputcollid,
-							transfn_oid,
-							invtransfn_oid,
-							finalfn_oid,
-							InvalidOid,             /* prelim */
-							&transfnexpr,
-							&invtransfnexpr,
-							&finalfnexpr,
-							NULL);
+	build_aggregate_transfn_expr(inputTypes,
+								 numArguments,
+								 0,		/* no ordered-set window functions yet */
+								 false, /* no variadic window functions yet */
+								 wfunc->wintype,
+								 wfunc->inputcollid,
+								 transfn_oid,
+								 invtransfn_oid,
+								 &transfnexpr,
+								 &invtransfnexpr);
 
 	/* set up infrastructure for calling the transfn(s) and finalfn */
 	fmgr_info(transfn_oid, &peraggstate->transfn);
@@ -2802,6 +2788,13 @@ initialize_peragg(WindowAggState *winstate, WindowFunc *wfunc,
 
 	if (OidIsValid(finalfn_oid))
 	{
+		build_aggregate_finalfn_expr(inputTypes,
+									 peraggstate->numFinalArgs,
+									 aggtranstype,
+									 wfunc->wintype,
+									 wfunc->inputcollid,
+									 finalfn_oid,
+									 &finalfnexpr);
 		fmgr_info(finalfn_oid, &peraggstate->finalfn);
 		fmgr_info_set_expr((Node *) finalfnexpr, &peraggstate->finalfn);
 	}

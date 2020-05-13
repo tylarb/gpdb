@@ -5,7 +5,7 @@
  *	  externs for functions used by frontend postgres applications.
  *
  * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/interfaces/libpq/libpq-fe.h
@@ -111,6 +111,13 @@ typedef enum
 	PQERRORS_VERBOSE			/* all the facts, ma'am */
 } PGVerbosity;
 
+typedef enum
+{
+	PQSHOW_CONTEXT_NEVER,		/* never show CONTEXT field */
+	PQSHOW_CONTEXT_ERRORS,		/* show CONTEXT for errors only (default) */
+	PQSHOW_CONTEXT_ALWAYS		/* always show CONTEXT field */
+} PGContextVisibility;
+
 /*
  * PGPing - The ordering of this enum should not be altered because the
  * values are exposed externally via pg_isready.
@@ -122,7 +129,15 @@ typedef enum
 	PQPING_REJECT,				/* server is alive but rejecting connections */
 	PQPING_NO_RESPONSE,			/* could not establish connection */
 	PQPING_NO_ATTEMPT,			/* connection not attempted (bad params) */
-	PQPING_MIRROR_READY         /* mirror completed startup sequence */
+
+	/*
+	 * GPDB-specific additions, starting at 64 to avoid collisions with
+	 * upstream. (This is only somewhat arbitrary; values above 255 would
+	 * increase the size of the PGPing type, but values above 125 would also
+	 * conflict with Bash-specific signal codes. We take roughly half of what's
+	 * left.)
+	 */
+	PQPING_MIRROR_READY = 64,	/* mirror completed startup sequence */
 } PGPing;
 
 /* PGconn encapsulates a connection to the backend.
@@ -238,24 +253,6 @@ typedef struct pgresAttDesc
 	int			atttypmod;		/* type-specific modifier info */
 } PGresAttDesc;
 
-/* Greenplum specific struct */
-typedef struct
-{
-	Oid aorelid;
-#ifdef HAVE_INT64
-	int64 tupcount;
-#else
-#ifdef HAVE_LONG_INT_64
-	long int tupcount;
-#else
-	long long int tupcount;
-#endif
-#endif
-} PQaoRelTupCount;
-
-struct PartitionNode;
-struct HTAB;
-
 /* ----------------
  * Exported functions of libpq
  * ----------------
@@ -328,7 +325,6 @@ extern char *PQdb(const PGconn *conn);
 extern char *PQuser(const PGconn *conn);
 extern char *PQpass(const PGconn *conn);
 extern char *PQhost(const PGconn *conn);
-extern char *PQhostaddr(const PGconn *conn);
 extern char *PQport(const PGconn *conn);
 extern char *PQtty(const PGconn *conn);
 extern char *PQoptions(const PGconn *conn);
@@ -346,6 +342,12 @@ extern int	PQconnectionUsedPassword(const PGconn *conn);
 extern int	PQclientEncoding(const PGconn *conn);
 extern int	PQsetClientEncoding(PGconn *conn, const char *encoding);
 
+/* SSL information functions */
+extern int	PQsslInUse(PGconn *conn);
+extern void *PQsslStruct(PGconn *conn, const char *struct_name);
+extern const char *PQsslAttribute(PGconn *conn, const char *attribute_name);
+extern const char *const * PQsslAttributeNames(PGconn *conn);
+
 /* Get the OpenSSL structure associated with a connection. Returns NULL for
  * unencrypted connections or if any other TLS library is in use. */
 extern void *PQgetssl(PGconn *conn);
@@ -358,6 +360,10 @@ extern void PQinitOpenSSL(int do_ssl, int do_crypto);
 
 /* Set verbosity for PQerrorMessage and PQresultErrorMessage */
 extern PGVerbosity PQsetErrorVerbosity(PGconn *conn, PGVerbosity verbosity);
+
+/* Set CONTEXT visibility for PQerrorMessage and PQresultErrorMessage */
+extern PGContextVisibility PQsetErrorContextVisibility(PGconn *conn,
+							PGContextVisibility show_context);
 
 /* Enable/disable tracing */
 extern void PQtrace(PGconn *conn, FILE *debug_port);
@@ -474,6 +480,9 @@ extern PGresult *PQfn(PGconn *conn,
 extern ExecStatusType PQresultStatus(const PGresult *res);
 extern char *PQresStatus(ExecStatusType status);
 extern char *PQresultErrorMessage(const PGresult *res);
+extern char *PQresultVerboseErrorMessage(const PGresult *res,
+							PGVerbosity verbosity,
+							PGContextVisibility show_context);
 extern char *PQresultErrorField(const PGresult *res, int fieldcode);
 extern int	PQntuples(const PGresult *res);
 extern int	PQnfields(const PGresult *res);

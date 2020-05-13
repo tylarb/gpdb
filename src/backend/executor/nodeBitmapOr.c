@@ -3,7 +3,7 @@
  * nodeBitmapOr.c
  *	  routines to handle BitmapOr nodes.
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -207,8 +207,6 @@ ExecEndBitmapOr(BitmapOrState *node)
 		if (bitmapplans[i])
 			ExecEndNode(bitmapplans[i]);
 	}
-
-	EndPlanStateGpmonPkt(&node->ps);
 }
 
 void

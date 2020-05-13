@@ -3,7 +3,7 @@
  * tsgistidx.c
  *	  GiST support functions for tsvector_ops
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  *
  *
  * IDENTIFICATION
@@ -17,6 +17,7 @@
 #include "access/gist.h"
 #include "access/tuptoaster.h"
 #include "tsearch/ts_utils.h"
+#include "utils/pg_crc.h"
 
 
 #define SIGLENINT  31			/* >121 => key will toast, so it will not work
@@ -50,7 +51,7 @@ typedef struct
 {
 	int32		vl_len_;		/* varlena header (do not touch directly!) */
 	int32		flag;
-	char		data[1];
+	char		data[FLEXIBLE_ARRAY_MEMBER];
 } SignTSVector;
 
 #define ARRKEY		0x01
@@ -297,7 +298,7 @@ typedef struct
  * is there value 'val' in array or not ?
  */
 static bool
-checkcondition_arr(void *checkval, QueryOperand *val)
+checkcondition_arr(void *checkval, QueryOperand *val, ExecPhraseData *data)
 {
 	int32	   *StopLow = ((CHKVAL *) checkval)->arrb;
 	int32	   *StopHigh = ((CHKVAL *) checkval)->arre;
@@ -306,7 +307,7 @@ checkcondition_arr(void *checkval, QueryOperand *val)
 	/* Loop invariant: StopLow <= val < StopHigh */
 
 	/*
-	 * we are not able to find a a prefix by hash value
+	 * we are not able to find a prefix by hash value
 	 */
 	if (val->prefix)
 		return true;
@@ -326,10 +327,10 @@ checkcondition_arr(void *checkval, QueryOperand *val)
 }
 
 static bool
-checkcondition_bit(void *checkval, QueryOperand *val)
+checkcondition_bit(void *checkval, QueryOperand *val, ExecPhraseData *data)
 {
 	/*
-	 * we are not able to find a a prefix in signature tree
+	 * we are not able to find a prefix in signature tree
 	 */
 	if (val->prefix)
 		return true;
@@ -360,7 +361,8 @@ gtsvector_consistent(PG_FUNCTION_ARGS)
 
 		PG_RETURN_BOOL(TS_execute(
 								  GETQUERY(query),
-								  (void *) GETSIGN(key), false,
+								  (void *) GETSIGN(key),
+								  TS_EXEC_PHRASE_AS_AND,
 								  checkcondition_bit
 								  ));
 	}
@@ -372,7 +374,8 @@ gtsvector_consistent(PG_FUNCTION_ARGS)
 		chkval.arre = chkval.arrb + ARRNELEM(key);
 		PG_RETURN_BOOL(TS_execute(
 								  GETQUERY(query),
-								  (void *) &chkval, true,
+								  (void *) &chkval,
+								  TS_EXEC_PHRASE_AS_AND | TS_EXEC_CALC_NOT,
 								  checkcondition_arr
 								  ));
 	}
@@ -803,4 +806,17 @@ gtsvector_picksplit(PG_FUNCTION_ARGS)
 	v->spl_rdatum = PointerGetDatum(datum_r);
 
 	PG_RETURN_POINTER(v);
+}
+
+/*
+ * Formerly, gtsvector_consistent was declared in pg_proc.h with arguments
+ * that did not match the documented conventions for GiST support functions.
+ * We fixed that, but we still need a pg_proc entry with the old signature
+ * to support reloading pre-9.6 contrib/tsearch2 opclass declarations.
+ * This compatibility function should go away eventually.
+ */
+Datum
+gtsvector_consistent_oldsig(PG_FUNCTION_ARGS)
+{
+	return gtsvector_consistent(fcinfo);
 }

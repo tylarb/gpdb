@@ -2,13 +2,13 @@
 #
 # Makefile for src/bin/pg_rewind
 #
-# Portions Copyright (c) 2013-2015, PostgreSQL Global Development Group
+# Portions Copyright (c) 2013-2016, PostgreSQL Global Development Group
 #
 # src/bin/pg_rewind/Makefile
 #
 #-------------------------------------------------------------------------
 
-PGFILEDESC = "pg_rewind - repurpose an old master server as standby"
+PGFILEDESC = "pg_rewind - synchronize a data directory with another one forked from"
 PGAPPICON = win32
 
 subdir = src/bin/pg_rewind
@@ -24,10 +24,14 @@ OBJS	= pg_rewind.o parsexlog.o xlogreader.o datapagemap.o timeline.o \
 	fetch.o file_ops.o copy_fetch.o libpq_fetch.o filemap.o logging.o compat.o \
 	$(WIN32RES)
 
-EXTRA_CLEAN = xlogreader.c compact.c
+EXTRA_CLEAN = xlogreader.c compat.c
 
-REGRESS = basictest extrafiles databases pg_xlog_symlink unclean_shutdown simple_no_rewind_required
-REGRESS_OPTS=--use-existing --launcher=./launcher
+REGRESS = basictest extrafiles databases pg_xlog_symlink unclean_shutdown \
+	simple_no_rewind_required ao_rewind bitmaptest \
+	tablespaces_objects_created_before_promotion \
+	tablespaces_objects_created_after_promotion \
+	tablespaces_objects_removed_after_promotion
+REGRESS_OPTS=--init-file=./regress_init_file --use-existing --launcher=./launcher
 
 all: pg_rewind
 
@@ -38,7 +42,7 @@ xlogreader.c: % : $(top_srcdir)/src/backend/access/transam/%
 	rm -f $@ && $(LN_S) $< .
 
 # compat.c is symlinked from the PostgreSQL sources.
-compat.c: % : $(top_srcdir)/contrib/pg_xlogdump/%
+compat.c: % : $(top_srcdir)/src/bin/pg_xlogdump/%
 	rm -f $@ && $(LN_S) $< .
 
 install: all installdirs
@@ -52,7 +56,7 @@ uninstall:
 
 clean distclean maintainer-clean:
 	rm -f pg_rewind$(X) $(OBJS) xlogreader.c
-	rm -rf tmp_check
+	rm -rf tmp_check_local tmp_check_remote
 
 # GPDB_95_MERGE_FIXME: 9.4 version of tests were used instead of 9.5 since 9.5
 # once have dependency on common TAP framework functions which are not yet

@@ -5,7 +5,7 @@
  *
  * Portions Copyright (c) 2005-2008, Greenplum inc
  * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -39,8 +39,8 @@ static void pass_down_bound(LimitState *node, PlanState *child_node);
  *		filtering on the stream of tuples returned by a subplan.
  * ----------------------------------------------------------------
  */
-TupleTableSlot *				/* return: a tuple or NULL */
-ExecLimit(LimitState *node)
+static TupleTableSlot *				/* return: a tuple or NULL */
+ExecLimit_guts(LimitState *node)
 {
 	ScanDirection direction;
 	TupleTableSlot *slot;
@@ -83,14 +83,6 @@ ExecLimit(LimitState *node)
 			if (node->count <= 0 && !node->noCount)
 			{
 				node->lstate = LIMIT_EMPTY;
-
-				/*
-				 * CDB: We'll read no more from outer subtree. To keep our
-				 * sibling QEs from being starved, tell source QEs not to clog
-				 * up the pipeline with our never-to-be-consumed data.
-				 */
-				ExecSquelchNode(outerPlan);
-
 				return NULL;
 			}
 
@@ -126,7 +118,6 @@ ExecLimit(LimitState *node)
 			 * The subplan is known to return no tuples (or not more than
 			 * OFFSET tuples, in general).  So we return no tuples.
 			 */
-			ExecSquelchNode(outerPlan); /* CDB */
 			return NULL;
 
 		case LIMIT_INWINDOW:
@@ -142,7 +133,6 @@ ExecLimit(LimitState *node)
 					node->position - node->offset >= node->count)
 				{
 					node->lstate = LIMIT_WINDOWEND;
-					ExecSquelchNode(outerPlan); /* CDB */
 					return NULL;
 				}
 
@@ -167,7 +157,6 @@ ExecLimit(LimitState *node)
 				if (node->position <= node->offset + 1)
 				{
 					node->lstate = LIMIT_WINDOWSTART;
-					ExecSquelchNode(outerPlan); /* CDB */
 					return NULL;
 				}
 
@@ -235,6 +224,27 @@ ExecLimit(LimitState *node)
 	Assert(!TupIsNull(slot));
 
 	return slot;
+}
+
+TupleTableSlot *
+ExecLimit(LimitState *node)
+{
+	TupleTableSlot *result;
+
+	result = ExecLimit_guts(node);
+
+	if (TupIsNull(result) && ScanDirectionIsForward(node->ps.state->es_direction) &&
+		!node->expect_rescan)
+	{
+		/*
+		 * CDB: We'll read no more from inner subtree. To keep our sibling
+		 * QEs from being starved, tell source QEs not to clog up the
+		 * pipeline with our never-to-be-consumed data.
+		 */
+		ExecSquelchNode((PlanState *) node);
+	}
+
+	return result;
 }
 
 /*
@@ -435,6 +445,8 @@ ExecInitLimit(Limit *node, EState *estate, int eflags)
 	ExecAssignResultTypeFromTL(&limitstate->ps);
 	limitstate->ps.ps_ProjInfo = NULL;
 
+	limitstate->expect_rescan = ((eflags & EXEC_FLAG_REWIND) != 0);
+
 	return limitstate;
 }
 
@@ -450,8 +462,6 @@ ExecEndLimit(LimitState *node)
 {
 	ExecFreeExprContext(&node->ps);
 	ExecEndNode(outerPlanState(node));
-
-	EndPlanStateGpmonPkt(&node->ps);
 }
 
 

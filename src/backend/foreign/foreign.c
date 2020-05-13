@@ -3,7 +3,7 @@
  * foreign.c
  *		  support for foreign-data wrappers, servers and user mappings.
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *		  src/backend/foreign/foreign.c
@@ -18,6 +18,7 @@
 #include "catalog/pg_foreign_server.h"
 #include "catalog/pg_foreign_table.h"
 #include "catalog/pg_user_mapping.h"
+#include "commands/defrem.h"
 #include "foreign/fdwapi.h"
 #include "foreign/foreign.h"
 #include "lib/stringinfo.h"
@@ -31,6 +32,45 @@
 extern Datum pg_options_to_table(PG_FUNCTION_ARGS);
 extern Datum postgresql_fdw_validator(PG_FUNCTION_ARGS);
 
+/* Get and separate out the mpp_execute option. */
+char
+SeparateOutMppExecute(List **options)
+{
+	ListCell *lc = NULL;
+	ListCell *prev = NULL;
+	char *mpp_execute = NULL;
+	char exec_location = FTEXECLOCATION_NOT_DEFINED;
+
+	foreach(lc, *options)
+	{
+		DefElem    *def = (DefElem *) lfirst(lc);
+
+		if (strcmp(def->defname, "mpp_execute") == 0)
+		{
+			mpp_execute = defGetString(def);
+
+			if (pg_strcasecmp(mpp_execute, "any") == 0)
+				exec_location = FTEXECLOCATION_ANY;
+			else if (pg_strcasecmp(mpp_execute, "master") == 0)
+				exec_location = FTEXECLOCATION_MASTER;
+			else if (pg_strcasecmp(mpp_execute, "all segments") == 0)
+				exec_location = FTEXECLOCATION_ALL_SEGMENTS;
+			else
+			{
+				ereport(ERROR,
+						(errcode(ERRCODE_SYNTAX_ERROR),
+						 errmsg("\"%s\" is not a valid mpp_execute value",
+								mpp_execute)));
+			}
+
+			*options = list_delete_cell(*options, lc, prev);
+			break;
+		}
+		prev = lc;
+	}
+
+	return exec_location;
+}
 
 /*
  * GetForeignDataWrapper -	look up the foreign-data wrapper by OID.
@@ -67,6 +107,10 @@ GetForeignDataWrapper(Oid fdwid)
 		fdw->options = NIL;
 	else
 		fdw->options = untransformRelOptions(datum);
+
+	fdw->exec_location = SeparateOutMppExecute(&fdw->options);
+	if (fdw->exec_location == FTEXECLOCATION_NOT_DEFINED)
+		fdw->exec_location = FTEXECLOCATION_MASTER;
 
 	ReleaseSysCache(tp);
 
@@ -120,14 +164,14 @@ GetForeignServer(Oid serverid)
 							tp,
 							Anum_pg_foreign_server_srvtype,
 							&isnull);
-	server->servertype = isnull ? NULL : pstrdup(TextDatumGetCString(datum));
+	server->servertype = isnull ? NULL : TextDatumGetCString(datum);
 
 	/* Extract server version */
 	datum = SysCacheGetAttr(FOREIGNSERVEROID,
 							tp,
 							Anum_pg_foreign_server_srvversion,
 							&isnull);
-	server->serverversion = isnull ? NULL : pstrdup(TextDatumGetCString(datum));
+	server->serverversion = isnull ? NULL : TextDatumGetCString(datum);
 
 	/* Extract the srvoptions */
 	datum = SysCacheGetAttr(FOREIGNSERVEROID,
@@ -138,6 +182,13 @@ GetForeignServer(Oid serverid)
 		server->options = NIL;
 	else
 		server->options = untransformRelOptions(datum);
+
+	server->exec_location = SeparateOutMppExecute(&server->options);
+	if (server->exec_location == FTEXECLOCATION_NOT_DEFINED)
+	{
+		ForeignDataWrapper *fdw = GetForeignDataWrapper(server->fdwid);
+		server->exec_location = fdw->exec_location;
+	}
 
 	ReleaseSysCache(tp);
 
@@ -193,6 +244,7 @@ GetUserMapping(Oid userid, Oid serverid)
 						MappingUserName(userid))));
 
 	um = (UserMapping *) palloc(sizeof(UserMapping));
+	um->umid = HeapTupleGetOid(tp);
 	um->userid = userid;
 	um->serverid = serverid;
 
@@ -243,11 +295,40 @@ GetForeignTable(Oid relid)
 	else
 		ft->options = untransformRelOptions(datum);
 
+	ft->exec_location = SeparateOutMppExecute(&ft->options);
+	if (ft->exec_location == FTEXECLOCATION_NOT_DEFINED)
+	{
+		ForeignServer *server = GetForeignServer(ft->serverid);
+		ft->exec_location = server->exec_location;
+	}
+
 	ReleaseSysCache(tp);
 
 	return ft;
 }
 
+/*
+ * Is the given table a GPDB external table, rather than a normal foreign
+ * table?
+ */
+bool
+rel_is_external_table(Oid relid)
+{
+	Form_pg_foreign_table tableform;
+	HeapTuple	tp;
+	bool		result;
+
+	tp = SearchSysCache1(FOREIGNTABLEREL, ObjectIdGetDatum(relid));
+	if (!HeapTupleIsValid(tp))
+		return false;
+	tableform = (Form_pg_foreign_table) GETSTRUCT(tp);
+
+	result = (tableform->ftserver == PG_EXTTABLE_SERVER_OID);
+
+	ReleaseSysCache(tp);
+
+	return result;
+}
 
 /*
  * GetForeignColumnOptions - Get attfdwoptions of given relation/attnum
@@ -304,27 +385,39 @@ GetFdwRoutine(Oid fdwhandler)
 
 
 /*
- * GetFdwRoutineByRelId - look up the handler of the foreign-data wrapper
- * for the given foreign table, and retrieve its FdwRoutine struct.
+ * GetForeignServerIdByRelId - look up the foreign server
+ * for the given foreign table, and return its OID.
  */
-FdwRoutine *
-GetFdwRoutineByRelId(Oid relid)
+Oid
+GetForeignServerIdByRelId(Oid relid)
 {
 	HeapTuple	tp;
-	Form_pg_foreign_data_wrapper fdwform;
-	Form_pg_foreign_server serverform;
 	Form_pg_foreign_table tableform;
 	Oid			serverid;
-	Oid			fdwid;
-	Oid			fdwhandler;
 
-	/* Get server OID for the foreign table. */
 	tp = SearchSysCache1(FOREIGNTABLEREL, ObjectIdGetDatum(relid));
 	if (!HeapTupleIsValid(tp))
 		elog(ERROR, "cache lookup failed for foreign table %u", relid);
 	tableform = (Form_pg_foreign_table) GETSTRUCT(tp);
 	serverid = tableform->ftserver;
 	ReleaseSysCache(tp);
+
+	return serverid;
+}
+
+
+/*
+ * GetFdwRoutineByServerId - look up the handler of the foreign-data wrapper
+ * for the given foreign server, and retrieve its FdwRoutine struct.
+ */
+FdwRoutine *
+GetFdwRoutineByServerId(Oid serverid)
+{
+	HeapTuple	tp;
+	Form_pg_foreign_data_wrapper fdwform;
+	Form_pg_foreign_server serverform;
+	Oid			fdwid;
+	Oid			fdwhandler;
 
 	/* Get foreign-data wrapper OID for the server. */
 	tp = SearchSysCache1(FOREIGNSERVEROID, ObjectIdGetDatum(serverid));
@@ -352,6 +445,23 @@ GetFdwRoutineByRelId(Oid relid)
 
 	/* And finally, call the handler function. */
 	return GetFdwRoutine(fdwhandler);
+}
+
+
+/*
+ * GetFdwRoutineByRelId - look up the handler of the foreign-data wrapper
+ * for the given foreign table, and retrieve its FdwRoutine struct.
+ */
+FdwRoutine *
+GetFdwRoutineByRelId(Oid relid)
+{
+	Oid			serverid;
+
+	/* Get server OID for the foreign table. */
+	serverid = GetForeignServerIdByRelId(relid);
+
+	/* Now retrieve server's FdwRoutine struct. */
+	return GetFdwRoutineByServerId(serverid);
 }
 
 /*
@@ -396,6 +506,47 @@ GetFdwRoutineForRelation(Relation relation, bool makecopy)
 
 	/* Only a short-lived reference is needed, so just hand back cached copy */
 	return relation->rd_fdwroutine;
+}
+
+
+/*
+ * IsImportableForeignTable - filter table names for IMPORT FOREIGN SCHEMA
+ *
+ * Returns TRUE if given table name should be imported according to the
+ * statement's import filter options.
+ */
+bool
+IsImportableForeignTable(const char *tablename,
+						 ImportForeignSchemaStmt *stmt)
+{
+	ListCell   *lc;
+
+	switch (stmt->list_type)
+	{
+		case FDW_IMPORT_SCHEMA_ALL:
+			return true;
+
+		case FDW_IMPORT_SCHEMA_LIMIT_TO:
+			foreach(lc, stmt->table_list)
+			{
+				RangeVar   *rv = (RangeVar *) lfirst(lc);
+
+				if (strcmp(tablename, rv->relname) == 0)
+					return true;
+			}
+			return false;
+
+		case FDW_IMPORT_SCHEMA_EXCEPT:
+			foreach(lc, stmt->table_list)
+			{
+				RangeVar   *rv = (RangeVar *) lfirst(lc);
+
+				if (strcmp(tablename, rv->relname) == 0)
+					return false;
+			}
+			return true;
+	}
+	return false;				/* shouldn't get here */
 }
 
 
@@ -604,7 +755,7 @@ get_foreign_data_wrapper_oid(const char *fdwname, bool missing_ok)
 
 
 /*
- * get_foreign_server_oid - given a FDW name, look up the OID
+ * get_foreign_server_oid - given a server name, look up the OID
  *
  * If missing_ok is false, throw an error if name not found.  If true, just
  * return InvalidOid.
@@ -620,4 +771,115 @@ get_foreign_server_oid(const char *servername, bool missing_ok)
 				(errcode(ERRCODE_UNDEFINED_OBJECT),
 				 errmsg("server \"%s\" does not exist", servername)));
 	return oid;
+}
+
+/*
+ * Get a copy of an existing local path for a given join relation.
+ *
+ * This function is usually helpful to obtain an alternate local path for EPQ
+ * checks.
+ *
+ * Right now, this function only supports unparameterized foreign joins, so we
+ * only search for unparameterized path in the given list of paths. Since we
+ * are searching for a path which can be used to construct an alternative local
+ * plan for a foreign join, we look for only MergeJoin, HashJoin or NestLoop
+ * paths.
+ *
+ * If the inner or outer subpath of the chosen path is a ForeignScan, we
+ * replace it with its outer subpath.  For this reason, and also because the
+ * planner might free the original path later, the path returned by this
+ * function is a shallow copy of the original.  There's no need to copy
+ * the substructure, so we don't.
+ *
+ * Since the plan created using this path will presumably only be used to
+ * execute EPQ checks, efficiency of the path is not a concern. But since the
+ * path list in RelOptInfo is anyway sorted by total cost we are likely to
+ * choose the most efficient path, which is all for the best.
+ */
+extern Path *
+GetExistingLocalJoinPath(RelOptInfo *joinrel)
+{
+	ListCell   *lc;
+
+	Assert(joinrel->reloptkind == RELOPT_JOINREL);
+
+	foreach(lc, joinrel->pathlist)
+	{
+		Path	   *path = (Path *) lfirst(lc);
+		JoinPath   *joinpath = NULL;
+
+		/* Skip parameterised paths. */
+		if (path->param_info != NULL)
+			continue;
+
+		switch (path->pathtype)
+		{
+			case T_HashJoin:
+				{
+					HashPath   *hash_path = makeNode(HashPath);
+
+					memcpy(hash_path, path, sizeof(HashPath));
+					joinpath = (JoinPath *) hash_path;
+				}
+				break;
+
+			case T_NestLoop:
+				{
+					NestPath   *nest_path = makeNode(NestPath);
+
+					memcpy(nest_path, path, sizeof(NestPath));
+					joinpath = (JoinPath *) nest_path;
+				}
+				break;
+
+			case T_MergeJoin:
+				{
+					MergePath  *merge_path = makeNode(MergePath);
+
+					memcpy(merge_path, path, sizeof(MergePath));
+					joinpath = (JoinPath *) merge_path;
+				}
+				break;
+
+			default:
+
+				/*
+				 * Just skip anything else. We don't know if corresponding
+				 * plan would build the output row from whole-row references
+				 * of base relations and execute the EPQ checks.
+				 */
+				break;
+		}
+
+		/* This path isn't good for us, check next. */
+		if (!joinpath)
+			continue;
+
+		/*
+		 * If either inner or outer path is a ForeignPath corresponding to a
+		 * pushed down join, replace it with the fdw_outerpath, so that we
+		 * maintain path for EPQ checks built entirely of local join
+		 * strategies.
+		 */
+		if (IsA(joinpath->outerjoinpath, ForeignPath))
+		{
+			ForeignPath *foreign_path;
+
+			foreign_path = (ForeignPath *) joinpath->outerjoinpath;
+			if (foreign_path->path.parent->reloptkind == RELOPT_JOINREL)
+				joinpath->outerjoinpath = foreign_path->fdw_outerpath;
+		}
+
+		if (IsA(joinpath->innerjoinpath, ForeignPath))
+		{
+			ForeignPath *foreign_path;
+
+			foreign_path = (ForeignPath *) joinpath->innerjoinpath;
+			if (foreign_path->path.parent->reloptkind == RELOPT_JOINREL)
+				joinpath->innerjoinpath = foreign_path->fdw_outerpath;
+		}
+
+		return (Path *) joinpath;
+	}
+	return NULL;
 }

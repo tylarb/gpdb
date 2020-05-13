@@ -2,7 +2,7 @@
  *
  * filemap.h
  *
- * Copyright (c) 2013-2015, PostgreSQL Global Development Group
+ * Copyright (c) 2013-2016, PostgreSQL Global Development Group
  *-------------------------------------------------------------------------
  */
 #ifndef FILEMAP_H
@@ -35,6 +35,7 @@ typedef enum
 typedef enum
 {
 	FILE_TYPE_REGULAR,
+	FILE_TYPE_FIFO,
 	FILE_TYPE_DIRECTORY,
 	FILE_TYPE_SYMLINK
 } file_type_t;
@@ -55,6 +56,7 @@ typedef struct file_entry_t
 
 	/* for a symlink */
 	char	   *link_target;
+	bool 		is_gp_tablespace;
 
 	struct file_entry_t *next;
 } file_entry_t;
@@ -100,6 +102,7 @@ extern void process_target_file(const char *path, file_type_t type,
 					size_t newsize, const char *link_target);
 extern void process_block_change(ForkNumber forknum, RelFileNode rnode,
 					 BlockNumber blkno);
+extern void process_aofile_change(RelFileNode rnode, int segno, int64 offset);
 extern void filemap_finalize(void);
 
 #endif   /* FILEMAP_H */

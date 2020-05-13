@@ -5,7 +5,7 @@
  *
  * Portions Copyright (c) 2005-2010, Greenplum inc
  * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -31,12 +31,14 @@
  */
 #include "postgres.h"
 
+#include "access/aomd.h"
 #include "access/htup_details.h"
 #include "access/multixact.h"
 #include "access/sysattr.h"
 #include "access/transam.h"
 #include "access/reloptions.h"
 #include "access/xact.h"
+#include "access/xlog.h"
 #include "catalog/binary_upgrade.h"
 #include "catalog/catalog.h"
 #include "catalog/dependency.h"
@@ -53,6 +55,7 @@
 #include "catalog/pg_auth_members.h"
 #include "catalog/pg_collation.h"
 #include "catalog/pg_constraint.h"
+#include "catalog/pg_constraint_fn.h"
 #include "catalog/pg_database.h"
 #include "catalog/pg_exttable.h"
 #include "catalog/pg_foreign_table.h"
@@ -87,16 +90,19 @@
 #include "utils/memutils.h"             /* CDB: GetMemoryChunkContext */
 #include "utils/relcache.h"
 #include "utils/rel.h"
+#include "utils/ruleutils.h"
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
 #include "utils/tqual.h"
 #include "utils/timestamp.h"
 
+#include "catalog/aocatalog.h"
 #include "cdb/cdbpartition.h"
 #include "cdb/cdbsreh.h"
 #include "cdb/cdbvars.h"
 
 #include "utils/guc.h"
+
 
 static void MetaTrackAddUpdInternal(Oid			classid,
 									Oid			objoid,
@@ -108,22 +114,22 @@ static void MetaTrackAddUpdInternal(Oid			classid,
 
 
 
-/* Potentially set by contrib/pg_upgrade_support functions */
+/* Potentially set by pg_upgrade_support functions */
 Oid			binary_upgrade_next_heap_pg_class_oid = InvalidOid;
 Oid			binary_upgrade_next_toast_pg_class_oid = InvalidOid;
 
 static void AddNewRelationTuple(Relation pg_class_desc,
-								Relation new_rel_desc,
-								Oid new_rel_oid,
-								Oid new_type_oid,
-								Oid reloftype,
-								Oid relowner,
-								char relkind,
-								char relstorage,
-								Datum relacl,
-								Datum reloptions,
-								bool is_part_parent);
-static Oid AddNewRelationType(const char *typeName,
+					Relation new_rel_desc,
+					Oid new_rel_oid,
+					Oid new_type_oid,
+					Oid reloftype,
+					Oid relowner,
+					char relkind,
+					char relstorage,
+					Datum relacl,
+					Datum reloptions,
+					bool is_part_parent);
+static ObjectAddress AddNewRelationType(const char *typeName,
 				   Oid typeNamespace,
 				   Oid new_rel_oid,
 				   char new_rel_kind,
@@ -131,18 +137,20 @@ static Oid AddNewRelationType(const char *typeName,
 				   Oid new_row_type,
 				   Oid new_array_type);
 static void RelationRemoveInheritance(Oid relid);
-static void StoreRelCheck(Relation rel, char *ccname, Node *expr,
+static Oid StoreRelCheck(Relation rel, char *ccname, Node *expr,
 			  bool is_validated, bool is_local, int inhcount,
 			  bool is_no_inherit, bool is_internal);
 static void StoreConstraints(Relation rel, List *cooked_constraints,
 				 bool is_internal);
 static bool MergeWithExistingConstraint(Relation rel, char *ccname, Node *expr,
 							bool allow_merge, bool is_local,
+							bool is_initially_valid,
 							bool is_no_inherit);
 static Node *cookConstraint(ParseState *pstate,
 			   Node *raw_constraint,
 			   char *relname);
 static List *insert_ordered_unique_oid(List *list, Oid datum);
+
 
 /* ----------------------------------------------------------------
  *				XXX UGLY HARD CODED BADNESS FOLLOWS XXX
@@ -285,7 +293,6 @@ heap_create(const char *relname,
 			Oid relid,
 			Oid relfilenode,
 			TupleDesc tupDesc,
-			Oid relam,
 			char relkind,
 			char relpersistence,
 			char relstorage,
@@ -346,10 +353,7 @@ heap_create(const char *relname,
 			reltablespace = InvalidOid;
 			break;
 		default:
-			if(relstorage_is_external(relstorage))
-				create_storage = false;
-			else
-				create_storage = true;
+			create_storage = true;
 			break;
 	}
 
@@ -361,7 +365,7 @@ heap_create(const char *relname,
 	if (OidIsValid(relfilenode))
 		create_storage = false;
 	else
-		relfilenode = relid;
+		relfilenode = InvalidOid;
 
 	/*
 	 * Never allow a pg_class entry to explicitly specify the database's
@@ -1134,6 +1138,8 @@ InsertPgClassTuple(Relation pg_class_desc,
 	values[Anum_pg_class_relhaspkey - 1] = BoolGetDatum(rd_rel->relhaspkey);
 	values[Anum_pg_class_relhasrules - 1] = BoolGetDatum(rd_rel->relhasrules);
 	values[Anum_pg_class_relhastriggers - 1] = BoolGetDatum(rd_rel->relhastriggers);
+	values[Anum_pg_class_relrowsecurity - 1] = BoolGetDatum(rd_rel->relrowsecurity);
+	values[Anum_pg_class_relforcerowsecurity - 1] = BoolGetDatum(rd_rel->relforcerowsecurity);
 	values[Anum_pg_class_relhassubclass - 1] = BoolGetDatum(rd_rel->relhassubclass);
 	values[Anum_pg_class_relispopulated - 1] = BoolGetDatum(rd_rel->relispopulated);
 	values[Anum_pg_class_relreplident - 1] = CharGetDatum(rd_rel->relreplident);
@@ -1204,14 +1210,6 @@ AddNewRelationTuple(Relation pg_class_desc,
 			/* The relation is real, but as yet empty */
 			new_rel_reltup->relpages = 0;
 			new_rel_reltup->reltuples = 0;
-
-			/* estimated stats for external tables */
-			/* NOTE: look at cdb_estimate_rel_size() if changing these values */
-			if(relstorage_is_external(relstorage))
-			{
-				new_rel_reltup->relpages = 1000;
-				new_rel_reltup->reltuples = 1000000;
-			}
 			new_rel_reltup->relallvisible = 0;
 			break;
 		case RELKIND_SEQUENCE:
@@ -1280,7 +1278,7 @@ AddNewRelationTuple(Relation pg_class_desc,
  *		define a composite type corresponding to the new relation
  * --------------------------------
  */
-static Oid
+static ObjectAddress
 AddNewRelationType(const char *typeName,
 				   Oid typeNamespace,
 				   Oid new_rel_oid,
@@ -1349,7 +1347,13 @@ AddNewRelationType(const char *typeName,
  *	use_user_acl: TRUE if should look for user-defined default permissions;
  *		if FALSE, relacl is always set NULL
  *	allow_system_table_mods: TRUE to allow creation in system namespaces
+ *	is_internal: is this a system-generated catalog?
+ *  valid_opts: Validate the reloptions or not?
  *  is_part_child: TRUE if relation is a child partition
+ *  is_part_parent: TRUE if relation is a parent partition
+ *
+ * Output parameters:
+ *	typaddress: if not null, gets the object address of the new pg_type entry
  *
  * Returns the OID of the new relation
  * --------------------------------
@@ -1364,7 +1368,6 @@ heap_create_with_catalog(const char *relname,
 						 Oid ownerid,
 						 TupleDesc tupdesc,
 						 List *cooked_constraints,
-						 Oid relam,
 						 char relkind,
 						 char relpersistence,
 						 char relstorage,
@@ -1378,6 +1381,7 @@ heap_create_with_catalog(const char *relname,
 						 bool use_user_acl,
 						 bool allow_system_table_mods,
 						 bool is_internal,
+						 ObjectAddress *typaddress,
 						 bool valid_opts,
 						 bool is_part_child,
 						 bool is_part_parent)
@@ -1388,6 +1392,7 @@ heap_create_with_catalog(const char *relname,
 	Oid			existing_relid;
 	Oid			old_type_oid;
 	Oid			new_type_oid;
+	ObjectAddress new_type_addr;
 	Oid			new_array_oid = InvalidOid;
 	bool		appendOnlyRel;
 	StdRdOptions *stdRdOptions;
@@ -1405,7 +1410,7 @@ heap_create_with_catalog(const char *relname,
 	 * Was "appendonly" specified in the relopts? If yes, fix our relstorage.
 	 * Also, check for override (debug) GUCs.
 	 */
-	if (relkind == RELKIND_RELATION)
+	if (relkind == RELKIND_RELATION || relkind == RELKIND_MATVIEW)
 	{
 		stdRdOptions = (StdRdOptions*) heap_reloptions(
 			relkind, reloptions, !valid_opts);
@@ -1428,7 +1433,10 @@ heap_create_with_catalog(const char *relname,
 		}
 	}
 	else
+	{
 		appendOnlyRel = false;
+		stdRdOptions = NULL;
+	}
 
 	/*
 	 * MPP-8058: disallow OIDS on column-oriented tables.
@@ -1496,8 +1504,10 @@ heap_create_with_catalog(const char *relname,
 
 	/*
 	 * Determine the relation's initial permissions.
+	 * If rel is partition child, leave it NULL here, Because CopyRelationAcls()
+	 * will copy relacl from parent later.
 	 */
-	if (use_user_acl)
+	if (use_user_acl && !is_part_child)
 	{
 		switch (relkind)
 		{
@@ -1531,7 +1541,6 @@ heap_create_with_catalog(const char *relname,
 							   relid,
 							   InvalidOid,
 							   tupdesc,
-							   relam,
 							   relkind,
 							   relpersistence,
 							   relstorage,
@@ -1598,13 +1607,16 @@ heap_create_with_catalog(const char *relname,
 	 * creating the same type name in parallel but hadn't committed yet when
 	 * we checked for a duplicate name above.
 	 */
-	new_type_oid = AddNewRelationType(relname,
-									  relnamespace,
-									  relid,
-									  relkind,
-									  ownerid,
-									  reltypeid,
-									  new_array_oid);
+	new_type_addr = AddNewRelationType(relname,
+									   relnamespace,
+									   relid,
+									   relkind,
+									   ownerid,
+									   reltypeid,
+									   new_array_oid);
+	new_type_oid = new_type_addr.objectId;
+	if (typaddress)
+		*typaddress = new_type_addr;
 
 	/*
 	 * Now make the array type if wanted.
@@ -1784,7 +1796,8 @@ heap_create_with_catalog(const char *relname,
 	{
 		MemoryContext oldcontext;
 
-		Assert(relkind == RELKIND_RELATION || relkind == RELKIND_MATVIEW);
+		Assert(relkind == RELKIND_RELATION || relkind == RELKIND_MATVIEW ||
+			   relkind == RELKIND_FOREIGN_TABLE);
 
 		oldcontext = MemoryContextSwitchTo(GetMemoryChunkContext(new_rel_desc));
 		new_rel_desc->rd_cdbpolicy = GpPolicyCopy(policy);
@@ -1800,7 +1813,6 @@ heap_create_with_catalog(const char *relname,
 		switch (relkind)
 		{
 			case RELKIND_RELATION:
-				// GPDB_93_MERGE_FIXME: What about MATVIEW?
 				break;
 			case RELKIND_INDEX:
 				subtyp = "INDEX";
@@ -1810,6 +1822,9 @@ heap_create_with_catalog(const char *relname,
 				break;
 			case RELKIND_VIEW:
 				subtyp = "VIEW";
+				break;
+			case RELKIND_MATVIEW:
+				subtyp = "MATVIEW";
 				break;
 			default:
 				doIt = false;
@@ -1858,7 +1873,7 @@ heap_create_with_catalog(const char *relname,
 	if (relpersistence == RELPERSISTENCE_UNLOGGED)
 	{
 		Assert(relkind == RELKIND_RELATION || relkind == RELKIND_MATVIEW ||
-			   relkind == RELKIND_TOASTVALUE);
+			   relkind == RELKIND_TOASTVALUE || IsAppendonlyMetadataRelkind(relkind));
 		heap_create_init_fork(new_rel_desc);
 	}
 
@@ -1874,18 +1889,19 @@ heap_create_with_catalog(const char *relname,
 
 /*
  * Set up an init fork for an unlogged table so that it can be correctly
- * reinitialized on restart.  Since we're going to do an immediate sync, we
- * only need to xlog this if archiving or streaming is enabled.  And the
- * immediate sync is required, because otherwise there's no guarantee that
- * this will hit the disk before the next checkpoint moves the redo pointer.
+ * reinitialized on restart.  An immediate sync is required even if the
+ * page has been logged, because the write did not go through
+ * shared_buffers and therefore a concurrent checkpoint may have moved
+ * the redo pointer past our xlog record.  Recovery may as well remove it
+ * while replaying, for example, XLOG_DBASE_CREATE or XLOG_TBLSPC_CREATE
+ * record. Therefore, logging is necessary even if wal_level=minimal.
  */
 void
 heap_create_init_fork(Relation rel)
 {
 	RelationOpenSmgr(rel);
 	smgrcreate(rel->rd_smgr, INIT_FORKNUM, false);
-	if (XLogIsNeeded())
-		log_smgrcreate(&rel->rd_smgr->smgr_rnode.node, INIT_FORKNUM);
+	log_smgrcreate(&rel->rd_smgr->smgr_rnode.node, INIT_FORKNUM);
 	smgrimmedsync(rel->rd_smgr, INIT_FORKNUM);
 }
 
@@ -2343,7 +2359,7 @@ heap_drop_with_catalog(Oid relid)
 	relkind = rel->rd_rel->relkind;
 
 	is_appendonly_rel = RelationIsAppendOptimized(rel);
-	is_external_rel = RelationIsExternal(rel);
+	is_external_rel = rel_is_external_table(relid);
 
 	/*
 	 * There can no longer be anyone *else* touching the relation, but we
@@ -2385,8 +2401,7 @@ heap_drop_with_catalog(Oid relid)
 	 */
 	if (relkind != RELKIND_VIEW &&
 		relkind != RELKIND_COMPOSITE_TYPE &&
-		relkind != RELKIND_FOREIGN_TABLE &&
-		!RelationIsExternal(rel))
+		relkind != RELKIND_FOREIGN_TABLE)
 	{
 		RelationDropStorage(rel);
 	}
@@ -2461,13 +2476,13 @@ heap_drop_with_catalog(Oid relid)
 	/*
 	 * Remove distribution policy, if any.
  	 */
-	if (relkind == RELKIND_RELATION)
+	if (relkind == RELKIND_RELATION || relkind == RELKIND_MATVIEW || relkind == RELKIND_FOREIGN_TABLE)
 		GpPolicyRemove(relid);
 
 	/*
 	 * Attribute encoding
 	 */
-	if (relkind == RELKIND_RELATION)
+	if (relkind == RELKIND_RELATION || relkind == RELKIND_MATVIEW)
 		RemoveAttributeEncodingsByRelid(relid);
 
 	/* MPP-6929: metadata tracking */
@@ -2479,8 +2494,10 @@ heap_drop_with_catalog(Oid relid)
 
 /*
  * Store a default expression for column attnum of relation rel.
+ *
+ * Returns the OID of the new pg_attrdef tuple.
  */
-void
+Oid
 StoreAttrDefault(Relation rel, AttrNumber attnum,
 				 Node *expr, bool is_internal)
 {
@@ -2585,6 +2602,8 @@ StoreAttrDefault(Relation rel, AttrNumber attnum,
 	 */
 	InvokeObjectPostCreateHookArg(AttrDefaultRelationId,
 								  RelationGetRelid(rel), attnum, is_internal);
+
+	return attrdefOid;
 }
 
 /*
@@ -2592,8 +2611,10 @@ StoreAttrDefault(Relation rel, AttrNumber attnum,
  *
  * Caller is responsible for updating the count of constraints
  * in the pg_class entry for the relation.
+ *
+ * The OID of the new constraint is returned.
  */
-static void
+static Oid
 StoreRelCheck(Relation rel, char *ccname, Node *expr,
 			  bool is_validated, bool is_local, int inhcount,
 			  bool is_no_inherit, bool is_internal)
@@ -2603,6 +2624,7 @@ StoreRelCheck(Relation rel, char *ccname, Node *expr,
 	List	   *varList;
 	int			keycount;
 	int16	   *attNos;
+	Oid			constrOid;
 
 	/*
 	 * Flatten expression to string form for storage.
@@ -2624,9 +2646,7 @@ StoreRelCheck(Relation rel, char *ccname, Node *expr,
 	 * in check constraints; it would fail to examine the contents of
 	 * subselects.
 	 */
-	varList = pull_var_clause(expr,
-							  PVC_REJECT_AGGREGATES,
-							  PVC_REJECT_PLACEHOLDERS);
+	varList = pull_var_clause(expr, 0);
 	keycount = list_length(varList);
 
 	if (keycount > 0)
@@ -2654,41 +2674,46 @@ StoreRelCheck(Relation rel, char *ccname, Node *expr,
 	/*
 	 * Create the Check Constraint
 	 */
-	CreateConstraintEntry(ccname,		/* Constraint Name */
-						  RelationGetNamespace(rel),	/* namespace */
-						  CONSTRAINT_CHECK,		/* Constraint Type */
-						  false,	/* Is Deferrable */
-						  false,	/* Is Deferred */
-						  is_validated,
-						  RelationGetRelid(rel),		/* relation */
-						  attNos,		/* attrs in the constraint */
-						  keycount,		/* # attrs in the constraint */
-						  InvalidOid,	/* not a domain constraint */
-						  InvalidOid,	/* no associated index */
-						  InvalidOid,	/* Foreign key fields */
-						  NULL,
-						  NULL,
-						  NULL,
-						  NULL,
-						  0,
-						  ' ',
-						  ' ',
-						  ' ',
-						  NULL, /* not an exclusion constraint */
-						  expr, /* Tree form of check constraint */
-						  ccbin,	/* Binary form of check constraint */
-						  ccsrc,	/* Source form of check constraint */
-						  is_local,		/* conislocal */
-						  inhcount,		/* coninhcount */
-						  is_no_inherit,		/* connoinherit */
-						  is_internal); /* internally constructed? */
+	constrOid =
+		CreateConstraintEntry(ccname,	/* Constraint Name */
+							  RelationGetNamespace(rel),		/* namespace */
+							  CONSTRAINT_CHECK, /* Constraint Type */
+							  false,	/* Is Deferrable */
+							  false,	/* Is Deferred */
+							  is_validated,
+							  RelationGetRelid(rel),	/* relation */
+							  attNos,	/* attrs in the constraint */
+							  keycount, /* # attrs in the constraint */
+							  InvalidOid,		/* not a domain constraint */
+							  InvalidOid,		/* no associated index */
+							  InvalidOid,		/* Foreign key fields */
+							  NULL,
+							  NULL,
+							  NULL,
+							  NULL,
+							  0,
+							  ' ',
+							  ' ',
+							  ' ',
+							  NULL,		/* not an exclusion constraint */
+							  expr,		/* Tree form of check constraint */
+							  ccbin,	/* Binary form of check constraint */
+							  ccsrc,	/* Source form of check constraint */
+							  is_local, /* conislocal */
+							  inhcount, /* coninhcount */
+							  is_no_inherit,	/* connoinherit */
+							  is_internal);		/* internally constructed? */
 
 	pfree(ccbin);
 	pfree(ccsrc);
+
+	return constrOid;
 }
 
 /*
  * Store defaults and constraints (passed as a list of CookedConstraint).
+ *
+ * Each CookedConstraint struct is modified to store the new catalog tuple OID.
  *
  * NOTE: only pre-cooked expressions will be passed this way, which is to
  * say expressions inherited from an existing relation.  Newly parsed
@@ -2701,7 +2726,7 @@ StoreConstraints(Relation rel, List *cooked_constraints, bool is_internal)
 	int			numchecks = 0;
 	ListCell   *lc;
 
-	if (!cooked_constraints)
+	if (cooked_constraints == NIL)
 		return;					/* nothing to do */
 
 	/*
@@ -2718,12 +2743,15 @@ StoreConstraints(Relation rel, List *cooked_constraints, bool is_internal)
 		switch (con->contype)
 		{
 			case CONSTR_DEFAULT:
-				StoreAttrDefault(rel, con->attnum, con->expr, is_internal);
+				con->conoid = StoreAttrDefault(rel, con->attnum, con->expr,
+											   is_internal);
 				break;
 			case CONSTR_CHECK:
-				StoreRelCheck(rel, con->name, con->expr, !con->skip_validation,
-							  con->is_local, con->inhcount,
-							  con->is_no_inherit, is_internal);
+				con->conoid =
+					StoreRelCheck(rel, con->name, con->expr,
+								  !con->skip_validation, con->is_local,
+								  con->inhcount, con->is_no_inherit,
+								  is_internal);
 				numchecks++;
 				break;
 			default:
@@ -2811,6 +2839,7 @@ AddRelationNewConstraints(Relation rel,
 	{
 		RawColumnDefault *colDef = (RawColumnDefault *) lfirst(cell);
 		Form_pg_attribute atp = rel->rd_att->attrs[colDef->attnum - 1];
+		Oid			defOid;
 
 		expr = cookDefault(pstate, colDef->raw_default,
 						   atp->atttypid, atp->atttypmod,
@@ -2831,10 +2860,11 @@ AddRelationNewConstraints(Relation rel,
 			(IsA(expr, Const) &&((Const *) expr)->constisnull))
 			continue;
 
-		StoreAttrDefault(rel, colDef->attnum, expr, is_internal);
+		defOid = StoreAttrDefault(rel, colDef->attnum, expr, is_internal);
 
 		cooked = (CookedConstraint *) palloc(sizeof(CookedConstraint));
 		cooked->contype = CONSTR_DEFAULT;
+		cooked->conoid = defOid;
 		cooked->name = NULL;
 		cooked->attnum = colDef->attnum;
 		cooked->expr = expr;
@@ -2854,6 +2884,7 @@ AddRelationNewConstraints(Relation rel,
 	{
 		Constraint *cdef = (Constraint *) lfirst(cell);
 		char	   *ccname;
+		Oid			constrOid;
 
 		if (cdef->contype != CONSTR_CHECK)
 			continue;
@@ -2910,6 +2941,7 @@ AddRelationNewConstraints(Relation rel,
 			 */
 			if (MergeWithExistingConstraint(rel, ccname, expr,
 											allow_merge, is_local,
+											cdef->initially_valid,
 											cdef->is_no_inherit))
 				continue;
 		}
@@ -2930,9 +2962,7 @@ AddRelationNewConstraints(Relation rel,
 			List	   *vars;
 			char	   *colname;
 
-			vars = pull_var_clause(expr,
-								   PVC_REJECT_AGGREGATES,
-								   PVC_REJECT_PLACEHOLDERS);
+			vars = pull_var_clause(expr, 0);
 
 			/* eliminate duplicates */
 			vars = list_union(NIL, vars);
@@ -2956,13 +2986,15 @@ AddRelationNewConstraints(Relation rel,
 		/*
 		 * OK, store it.
 		 */
-		StoreRelCheck(rel, ccname, expr, !cdef->skip_validation, is_local,
-					  is_local ? 0 : 1, cdef->is_no_inherit, is_internal);
+		constrOid =
+			StoreRelCheck(rel, ccname, expr, cdef->initially_valid, is_local,
+						  is_local ? 0 : 1, cdef->is_no_inherit, is_internal);
 
 		numchecks++;
 
 		cooked = (CookedConstraint *) palloc(sizeof(CookedConstraint));
 		cooked->contype = CONSTR_CHECK;
+		cooked->conoid = constrOid;
 		cooked->name = ccname;
 		cooked->attnum = 0;
 		cooked->expr = expr;
@@ -3001,6 +3033,7 @@ AddRelationNewConstraints(Relation rel,
 static bool
 MergeWithExistingConstraint(Relation rel, char *ccname, Node *expr,
 							bool allow_merge, bool is_local,
+							bool is_initially_valid,
 							bool is_no_inherit)
 {
 	bool		found;
@@ -3048,21 +3081,57 @@ MergeWithExistingConstraint(Relation rel, char *ccname, Node *expr,
 				if (equal(expr, stringToNode(TextDatumGetCString(val))))
 					found = true;
 			}
+
+			/*
+			 * If the existing constraint is purely inherited (no local
+			 * definition) then interpret addition of a local constraint as a
+			 * legal merge.  This allows ALTER ADD CONSTRAINT on parent and
+			 * child tables to be given in either order with same end state.
+			 */
+			if (is_local && !con->conislocal)
+				allow_merge = true;
+
 			if (!found || !allow_merge)
 				ereport(ERROR,
 						(errcode(ERRCODE_DUPLICATE_OBJECT),
 				errmsg("constraint \"%s\" for relation \"%s\" already exists",
 					   ccname, RelationGetRelationName(rel))));
 
-			tup = heap_copytuple(tup);
-			con = (Form_pg_constraint) GETSTRUCT(tup);
-
-			/* If the constraint is "no inherit" then cannot merge */
+			/* If the child constraint is "no inherit" then cannot merge */
 			if (con->connoinherit)
 				ereport(ERROR,
 						(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
 						 errmsg("constraint \"%s\" conflicts with non-inherited constraint on relation \"%s\"",
 								ccname, RelationGetRelationName(rel))));
+
+			/*
+			 * Must not change an existing inherited constraint to "no
+			 * inherit" status.  That's because inherited constraints should
+			 * be able to propagate to lower-level children.
+			 */
+			if (con->coninhcount > 0 && is_no_inherit)
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
+						 errmsg("constraint \"%s\" conflicts with inherited constraint on relation \"%s\"",
+								ccname, RelationGetRelationName(rel))));
+
+			/*
+			 * If the child constraint is "not valid" then cannot merge with a
+			 * valid parent constraint
+			 */
+			if (is_initially_valid && !con->convalidated)
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
+						 errmsg("constraint \"%s\" conflicts with NOT VALID constraint on relation \"%s\"",
+								ccname, RelationGetRelationName(rel))));
+
+			/* OK to update the tuple */
+			ereport(NOTICE,
+			   (errmsg("merging constraint \"%s\" with inherited definition",
+					   ccname)));
+
+			tup = heap_copytuple(tup);
+			con = (Form_pg_constraint) GETSTRUCT(tup);
 
 			if (is_local)
 				con->conislocal = true;
@@ -3073,10 +3142,6 @@ MergeWithExistingConstraint(Relation rel, char *ccname, Node *expr,
 				Assert(is_local);
 				con->connoinherit = true;
 			}
-			/* OK to update the tuple */
-			ereport(NOTICE,
-			   (errmsg("merging constraint \"%s\" with inherited definition",
-					   ccname)));
 			simple_heap_update(conDesc, &tup->t_self, tup);
 			CatalogUpdateIndexes(conDesc, tup);
 			break;
@@ -3381,6 +3446,11 @@ heap_truncate(List *relids)
 	}
 }
 
+/*
+ *	 heap_truncate_one_relid
+ *
+ *	 This routine deletes all data within the specified relation.
+ */
 static void
 heap_truncate_one_relid(Oid relid)
 {
@@ -3429,7 +3499,13 @@ heap_truncate_one_rel(Relation rel)
 	Oid			toastrelid;
 
 	/* Truncate the actual file (and discard buffers) */
-	RelationTruncate(rel, 0);
+	if (RelationIsAppendOptimized(rel))
+	{
+		ao_truncate_one_rel(rel);
+		ao_aux_tables_truncate(rel);
+	}
+	else
+		RelationTruncate(rel, 0);
 
 	/* If the relation has indexes, truncate the indexes too */
 	RelationTruncateIndexes(rel);
@@ -3445,8 +3521,6 @@ heap_truncate_one_rel(Relation rel)
 		/* keep the lock... */
 		heap_close(toastrel, NoLock);
 	}
-
-	ao_aux_tables_truncate(rel);
 }
 
 /*
@@ -3654,8 +3728,7 @@ should_have_valid_relfrozenxid(char relkind, char relstorage,
 	switch (relkind)
 	{
 		case RELKIND_RELATION:
-			if (relstorage == RELSTORAGE_EXTERNAL ||
-				relstorage == RELSTORAGE_FOREIGN  ||
+			if (relstorage == RELSTORAGE_FOREIGN  ||
 				relstorage == RELSTORAGE_VIRTUAL ||
 				relstorage == RELSTORAGE_AOROWS ||
 				relstorage == RELSTORAGE_AOCOLS)

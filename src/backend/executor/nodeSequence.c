@@ -128,8 +128,6 @@ ExecEndSequence(SequenceState *node)
 		Assert(node->subplans[no] != NULL);
 		ExecEndNode(node->subplans[no]);
 	}
-
-	EndPlanStateGpmonPkt(&node->ps);
 }
 
 void
@@ -156,4 +154,11 @@ ExecReScanSequence(SequenceState *node)
 	}
 
 	node->initState = true;
+}
+
+void
+ExecSquelchSequence(SequenceState *node)
+{
+	for (int i = 0; i < node->numSubplans; i++)
+		ExecSquelchNode(node->subplans[i]);
 }

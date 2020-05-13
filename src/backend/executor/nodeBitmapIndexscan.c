@@ -5,7 +5,7 @@
  *
  * Portions Copyright (c) 2007-2008, Greenplum inc
  * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -177,7 +177,7 @@ ExecReScanBitmapIndexScan(BitmapIndexScanState *node)
 	{
 		ereport(ERROR,
 				(errcode(ERRCODE_INTERNAL_ERROR),
-				 errmsg("the returning bitmap in nodeBitmapIndexScan is invalid.")));
+				 errmsg("the returning bitmap in nodeBitmapIndexScan is invalid")));
 	}
 
 	if (NULL != node->biss_result)
@@ -221,8 +221,6 @@ ExecEndBitmapIndexScan(BitmapIndexScanState *node)
 
 	tbm_generic_free(node->biss_result);
 	node->biss_result = NULL;
-
-	EndPlanStateGpmonPkt(&node->ss.ps);
 }
 
 /* ----------------------------------------------------------------

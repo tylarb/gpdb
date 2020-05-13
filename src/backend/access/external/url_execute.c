@@ -228,12 +228,6 @@ make_command(const char *cmd, extvar_t *ev)
 	make_export("GP_SEGMENT_COUNT", ev->GP_SEGMENT_COUNT, &buf);
 	make_export("GP_QUERY_STRING", ev->GP_QUERY_STRING, &buf);
 
-	/* hadoop env var */
-	make_export("GP_HADOOP_CONN_JARDIR", ev->GP_HADOOP_CONN_JARDIR, &buf);
-	make_export("GP_HADOOP_CONN_VERSION", ev->GP_HADOOP_CONN_VERSION, &buf);
-	if (strlen(ev->GP_HADOOP_HOME) > 0)
-		make_export("HADOOP_HOME",    ev->GP_HADOOP_HOME,    &buf);
-
 	appendStringInfoString(&buf, cmd);
 
 	return buf.data;
@@ -296,8 +290,6 @@ url_execute_fopen(char *url, bool forwrite, extvar_t *ev, CopyState pstate)
 	if (file->handle->pid == -1)
 	{
 		errno = save_errno;
-		pfree(file->common.url);
-		pfree(file);
 		ereport(ERROR,
 				(errcode(ERRCODE_EXTERNAL_ROUTINE_EXCEPTION),
 						errmsg("cannot start external table command: %m"),

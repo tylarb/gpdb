@@ -3,7 +3,7 @@
  * nbtutils.c
  *	  Utility code for Postgres btree implementation.
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -509,7 +509,7 @@ _bt_compare_array_elements(const void *a, const void *b, void *arg)
 											  cxt->collation,
 											  da, db));
 	if (cxt->reverse)
-		compare = -compare;
+		INVERT_COMPARE_RESULT(compare);
 	return compare;
 }
 
@@ -1285,12 +1285,9 @@ _bt_fix_scankey_strategy(ScanKey skey, int16 *indoption)
  *
  * Depending on the operator type, the key may be required for both scan
  * directions or just one.  Also, if the key is a row comparison header,
- * we have to mark the appropriate subsidiary ScanKeys as required.  In
- * such cases, the first subsidiary key is required, but subsequent ones
- * are required only as long as they correspond to successive index columns
- * and match the leading column as to sort direction.
- * Otherwise the row comparison ordering is different from the index ordering
- * and so we can't stop the scan on the basis of those lower-order columns.
+ * we have to mark its first subsidiary ScanKey as required.  (Subsequent
+ * subsidiary ScanKeys are normally for lower-order columns, and thus
+ * cannot be required, since they're after the first non-equality scankey.)
  *
  * Note: when we set required-key flag bits in a subsidiary scankey, we are
  * scribbling on a data structure belonging to the index AM's caller, not on
@@ -1328,24 +1325,12 @@ _bt_mark_scankey_required(ScanKey skey)
 	if (skey->sk_flags & SK_ROW_HEADER)
 	{
 		ScanKey		subkey = (ScanKey) DatumGetPointer(skey->sk_argument);
-		AttrNumber	attno = skey->sk_attno;
 
-		/* First subkey should be same as the header says */
-		Assert(subkey->sk_attno == attno);
-
-		for (;;)
-		{
-			Assert(subkey->sk_flags & SK_ROW_MEMBER);
-			if (subkey->sk_attno != attno)
-				break;			/* non-adjacent key, so not required */
-			if (subkey->sk_strategy != skey->sk_strategy)
-				break;			/* wrong direction, so not required */
-			subkey->sk_flags |= addflags;
-			if (subkey->sk_flags & SK_ROW_END)
-				break;
-			subkey++;
-			attno++;
-		}
+		/* First subkey should be same column/operator as the header */
+		Assert(subkey->sk_flags & SK_ROW_MEMBER);
+		Assert(subkey->sk_attno == skey->sk_attno);
+		Assert(subkey->sk_strategy == skey->sk_strategy);
+		subkey->sk_flags |= addflags;
 	}
 }
 
@@ -1653,7 +1638,7 @@ _bt_check_rowcompare(ScanKey skey, IndexTuple tuple, TupleDesc tupdesc,
 													subkey->sk_argument));
 
 		if (subkey->sk_flags & SK_BT_DESC)
-			cmpresult = -cmpresult;
+			INVERT_COMPARE_RESULT(cmpresult);
 
 		/* Done comparing if unequal, else advance to next column */
 		if (cmpresult != 0)
@@ -1714,27 +1699,35 @@ _bt_check_rowcompare(ScanKey skey, IndexTuple tuple, TupleDesc tupdesc,
  * _bt_killitems - set LP_DEAD state for items an indexscan caller has
  * told us were killed
  *
- * scan->so contains information about the current page and killed tuples
- * thereon (generally, this should only be called if so->numKilled > 0).
+ * scan->opaque, referenced locally through so, contains information about the
+ * current page and killed tuples thereon (generally, this should only be
+ * called if so->numKilled > 0).
  *
- * The caller must have pin on so->currPos.buf, but may or may not have
- * read-lock, as indicated by haveLock.  Note that we assume read-lock
- * is sufficient for setting LP_DEAD status (which is only a hint).
+ * The caller does not have a lock on the page and may or may not have the
+ * page pinned in a buffer.  Note that read-lock is sufficient for setting
+ * LP_DEAD status (which is only a hint).
  *
  * We match items by heap TID before assuming they are the right ones to
  * delete.  We cope with cases where items have moved right due to insertions.
  * If an item has moved off the current page due to a split, we'll fail to
  * find it and do nothing (this is not an error case --- we assume the item
- * will eventually get marked in a future indexscan).  Note that because we
- * hold pin on the target page continuously from initially reading the items
- * until applying this function, VACUUM cannot have deleted any items from
- * the page, and so there is no need to search left from the recorded offset.
- * (This observation also guarantees that the item is still the right one
- * to delete, which might otherwise be questionable since heap TIDs can get
- * recycled.)
+ * will eventually get marked in a future indexscan).
+ *
+ * Note that if we hold a pin on the target page continuously from initially
+ * reading the items until applying this function, VACUUM cannot have deleted
+ * any items from the page, and so there is no need to search left from the
+ * recorded offset.  (This observation also guarantees that the item is still
+ * the right one to delete, which might otherwise be questionable since heap
+ * TIDs can get recycled.)	This holds true even if the page has been modified
+ * by inserts and page splits, so there is no need to consult the LSN.
+ *
+ * If the pin was released after reading the page, then we re-read it.  If it
+ * has been modified since we read it (as determined by the LSN), we dare not
+ * flag any entries because it is possible that the old entry was vacuumed
+ * away and the TID was re-used by a completely different heap tuple.
  */
 void
-_bt_killitems(IndexScanDesc scan, bool haveLock)
+_bt_killitems(IndexScanDesc scan)
 {
 	BTScanOpaque so = (BTScanOpaque) scan->opaque;
 	Page		page;
@@ -1742,19 +1735,56 @@ _bt_killitems(IndexScanDesc scan, bool haveLock)
 	OffsetNumber minoff;
 	OffsetNumber maxoff;
 	int			i;
+	int			numKilled = so->numKilled;
 	bool		killedsomething = false;
 
-	Assert(BufferIsValid(so->currPos.buf));
+	Assert(BTScanPosIsValid(so->currPos));
 
-	if (!haveLock)
+	/*
+	 * Always reset the scan state, so we don't look for same items on other
+	 * pages.
+	 */
+	so->numKilled = 0;
+
+	if (BTScanPosIsPinned(so->currPos))
+	{
+		/*
+		 * We have held the pin on this page since we read the index tuples,
+		 * so all we need to do is lock it.  The pin will have prevented
+		 * re-use of any TID on the page, so there is no need to check the
+		 * LSN.
+		 */
 		LockBuffer(so->currPos.buf, BT_READ);
 
-	page = BufferGetPage(so->currPos.buf);
+		page = BufferGetPage(so->currPos.buf);
+	}
+	else
+	{
+		Buffer		buf;
+
+		/* Attempt to re-read the buffer, getting pin and lock. */
+		buf = _bt_getbuf(scan->indexRelation, so->currPos.currPage, BT_READ);
+
+		/* It might not exist anymore; in which case we can't hint it. */
+		if (!BufferIsValid(buf))
+			return;
+
+		page = BufferGetPage(buf);
+		if (PageGetLSN(page) == so->currPos.lsn)
+			so->currPos.buf = buf;
+		else
+		{
+			/* Modified while not pinned means hinting is not safe. */
+			_bt_relbuf(scan->indexRelation, buf);
+			return;
+		}
+	}
+
 	opaque = (BTPageOpaque) PageGetSpecialPointer(page);
 	minoff = P_FIRSTDATAKEY(opaque);
 	maxoff = PageGetMaxOffsetNumber(page);
 
-	for (i = 0; i < so->numKilled; i++)
+	for (i = 0; i < numKilled; i++)
 	{
 		int			itemIndex = so->killedItems[i];
 		BTScanPosItem *kitem = &so->currPos.items[itemIndex];
@@ -1792,14 +1822,7 @@ _bt_killitems(IndexScanDesc scan, bool haveLock)
 		MarkBufferDirtyHint(so->currPos.buf, true);
 	}
 
-	if (!haveLock)
-		LockBuffer(so->currPos.buf, BUFFER_LOCK_UNLOCK);
-
-	/*
-	 * Always reset the scan state, so we don't look for same items on other
-	 * pages.
-	 */
-	so->numKilled = 0;
+	LockBuffer(so->currPos.buf, BUFFER_LOCK_UNLOCK);
 }
 
 
@@ -1829,7 +1852,7 @@ typedef struct BTVacInfo
 	BTCycleId	cycle_ctr;		/* cycle ID most recently assigned */
 	int			num_vacuums;	/* number of currently active VACUUMs */
 	int			max_vacuums;	/* allocated length of vacuums[] array */
-	BTOneVacInfo vacuums[1];	/* VARIABLE LENGTH ARRAY */
+	BTOneVacInfo vacuums[FLEXIBLE_ARRAY_MEMBER];
 } BTVacInfo;
 
 static BTVacInfo *btvacinfo;
@@ -1964,7 +1987,7 @@ _bt_end_vacuum(Relation rel)
  * _bt_end_vacuum wrapped as an on_shmem_exit callback function
  */
 void
-_bt_end_vacuum_callback(int code __attribute__((unused)), Datum arg)
+_bt_end_vacuum_callback(int code pg_attribute_unused(), Datum arg)
 {
 	_bt_end_vacuum((Relation) DatumGetPointer(arg));
 }
@@ -1977,7 +2000,7 @@ BTreeShmemSize(void)
 {
 	Size		size;
 
-	size = offsetof(BTVacInfo, vacuums[0]);
+	size = offsetof(BTVacInfo, vacuums);
 	size = add_size(size, mul_size(MaxBackends, sizeof(BTOneVacInfo)));
 	return size;
 }
@@ -2013,15 +2036,34 @@ BTreeShmemInit(void)
 		Assert(found);
 }
 
-Datum
-btoptions(PG_FUNCTION_ARGS)
+bytea *
+btoptions(Datum reloptions, bool validate)
 {
-	Datum		reloptions = PG_GETARG_DATUM(0);
-	bool		validate = PG_GETARG_BOOL(1);
-	bytea	   *result;
+	return default_reloptions(reloptions, validate, RELOPT_KIND_BTREE);
+}
 
-	result = default_reloptions(reloptions, validate, RELOPT_KIND_BTREE);
-	if (result)
-		PG_RETURN_BYTEA_P(result);
-	PG_RETURN_NULL();
+/*
+ *	btproperty() -- Check boolean properties of indexes.
+ *
+ * This is optional, but handling AMPROP_RETURNABLE here saves opening the rel
+ * to call btcanreturn.
+ */
+bool
+btproperty(Oid index_oid, int attno,
+		   IndexAMProperty prop, const char *propname,
+		   bool *res, bool *isnull)
+{
+	switch (prop)
+	{
+		case AMPROP_RETURNABLE:
+			/* answer only for columns, not AM or whole index */
+			if (attno == 0)
+				return false;
+			/* otherwise, btree can always return data */
+			*res = true;
+			return true;
+
+		default:
+			return false;		/* punt to generic code */
+	}
 }

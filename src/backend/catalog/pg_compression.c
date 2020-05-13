@@ -14,7 +14,10 @@
  */
 
 #include "postgres.h"
-#include "fmgr.h"
+
+#ifdef HAVE_LIBZ
+#include <zlib.h>
+#endif
 
 #include "access/genam.h"
 #include "access/reloptions.h"
@@ -26,6 +29,7 @@
 #include "catalog/dependency.h"
 #include "cdb/cdbappendonlyam.h"
 #include "cdb/cdbappendonlystoragelayer.h"
+#include "fmgr.h"
 #include "nodes/makefuncs.h"
 #include "parser/parse_type.h"
 #include "storage/gp_compress.h"
@@ -44,6 +48,7 @@ char *storage_directive_names[] = {"compresstype", "compresslevel",
 								   "blocksize", NULL};
 
 
+#ifdef HAVE_LIBZ
 /* Internal state for zlib */
 typedef struct zlib_state
 {
@@ -65,6 +70,7 @@ typedef struct zlib_state
 						  uLong sourceLen);
 
 } zlib_state;
+#endif
 
 static NameData
 comptype_to_name(char *comptype)
@@ -220,6 +226,7 @@ callCompressionValidator(PGFunction func, char *comptype, int32 complevel,
 	(void)DirectFunctionCall1(func, PointerGetDatum(&sa));
 }
 
+#ifdef HAVE_LIBZ
 Datum
 zlib_constructor(PG_FUNCTION_ARGS)
 {
@@ -358,6 +365,7 @@ zlib_decompress(PG_FUNCTION_ARGS)
 				 * convergence' for data corruption :-).
 				 */
 				elog(ERROR, "zlib encountered data in an unexpected format");
+				break;
 
 			default:
 				/* shouldn't get here */
@@ -374,6 +382,42 @@ zlib_validator(PG_FUNCTION_ARGS)
 {
 	PG_RETURN_VOID();
 }
+#else
+Datum
+zlib_constructor(PG_FUNCTION_ARGS)
+{
+	elog(ERROR, "libz compression is not supported in this build of Greenplum");
+	PG_RETURN_VOID();
+}
+
+Datum
+zlib_destructor(PG_FUNCTION_ARGS)
+{
+	elog(ERROR, "libz compression is not supported in this build of Greenplum");
+	PG_RETURN_VOID();
+}
+
+Datum
+zlib_compress(PG_FUNCTION_ARGS)
+{
+	elog(ERROR, "libz compression is not supported in this build of Greenplum");
+	PG_RETURN_VOID();
+}
+
+Datum
+zlib_decompress(PG_FUNCTION_ARGS)
+{
+	elog(ERROR, "libz compression is not supported in this build of Greenplum");
+	PG_RETURN_VOID();
+}
+
+Datum
+zlib_validator(PG_FUNCTION_ARGS)
+{
+	elog(ERROR, "libz compression is not supported in this build of Greenplum");
+	PG_RETURN_VOID();
+}
+#endif
 
 Datum
 rle_type_constructor(PG_FUNCTION_ARGS)
@@ -452,9 +496,6 @@ dummy_compression_validator(PG_FUNCTION_ARGS)
 bool
 compresstype_is_valid(char *comptype)
 {
-	bool found = false;
-	int i;
-
 	/*
 	 * Hard-coding compresstypes is bad, agreed.  But there isn't a
 	 * better way in sight at this point.  Lookup into pg_compression
@@ -466,14 +507,25 @@ compresstype_is_valid(char *comptype)
 	 * Whenever the list of supported compresstypes is changed, this
 	 * must change!
 	 */
-	static const char *const valid_comptypes[] =
-			{"quicklz", "zlib", "rle_type", "none", "zstd"};
-	for (i = 0; !found && i < ARRAY_SIZE(valid_comptypes); ++i)
+	static const char *const valid_comptypes[] = {
+#ifdef HAVE_LIBQUICKLZ
+			"quicklz",
+#endif
+#ifdef HAVE_LIBZ
+			"zlib",
+#endif
+#ifdef HAVE_LIBZSTD
+			"zstd",
+#endif
+			"rle_type", "none"};
+
+	for (int i = 0; i < ARRAY_SIZE(valid_comptypes); ++i)
 	{
 		if (pg_strcasecmp(valid_comptypes[i], comptype) == 0)
-			found = true;
+			return true;
 	}
-	return found;
+
+	return false;
 }
 
 /*

@@ -4,7 +4,7 @@
  *	  This file contains routines to support creation of toast tables
  *
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -22,6 +22,7 @@
 #include "catalog/index.h"
 #include "catalog/namespace.h"
 #include "catalog/oid_dispatch.h"
+#include "catalog/pg_am.h"
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_opclass.h"
 #include "catalog/pg_type.h"
@@ -34,7 +35,7 @@
 #include "utils/rel.h"
 #include "utils/syscache.h"
 
-/* Potentially set by contrib/pg_upgrade_support functions */
+/* Potentially set by pg_upgrade_support functions */
 Oid			binary_upgrade_next_toast_pg_type_oid = InvalidOid;
 
 static void CheckAndCreateToastTable(Oid relOid, Datum reloptions,
@@ -190,6 +191,21 @@ create_toast_table(Relation rel, Oid toastOid, Oid toastIndexOid,
 				toastobject;
 
 	/*
+	 * Toast table is shared if and only if its parent is.
+	 *
+	 * We cannot allow toasting a shared relation after initdb (because
+	 * there's no way to mark it toasted in other databases' pg_class).
+	 */
+	shared_relation = rel->rd_rel->relisshared;
+	if (shared_relation && !IsBootstrapProcessingMode())
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("shared tables cannot be toasted after initdb")));
+
+	/* It's mapped if and only if its parent is, too */
+	mapped_relation = RelationIsMapped(rel);
+
+	/*
 	 * Is it already toasted?
 	 */
 	if (rel->rd_rel->reltoastrelid != InvalidOid)
@@ -200,6 +216,7 @@ create_toast_table(Relation rel, Oid toastOid, Oid toastIndexOid,
 	 */
 	if (!IsBinaryUpgrade)
 	{
+		/* Normal mode, normal check */
 		if (!needs_toast_table(rel))
 			return false;
 	}
@@ -236,36 +253,6 @@ create_toast_table(Relation rel, Oid toastOid, Oid toastIndexOid,
 		 *	return false;
 		 */
 	}
-
-	/*
-	 * Toast table is shared if and only if its parent is.
-	 *
-	 * We cannot allow toasting a shared relation after initdb (because
-	 * there's no way to mark it toasted in other databases' pg_class).
-	 */
-	shared_relation = rel->rd_rel->relisshared;
-	if (shared_relation && !IsBootstrapProcessingMode())
-		ereport(ERROR,
-				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				 errmsg("shared tables cannot be toasted after initdb")));
-
-	/* It's mapped if and only if its parent is, too */
-	mapped_relation = RelationIsMapped(rel);
-
-	/*
-	 * Is it already toasted?
-	 */
-	if (rel->rd_rel->reltoastrelid != InvalidOid)
-		return false;
-
-	/*
-	 * Check to see whether the table actually needs a TOAST table.
-	 *
-	 * If an update-in-place toast relfilenode is specified, force toast file
-	 * creation even if it seems not to need one.
-	 */
-	if (!needs_toast_table(rel) && !IsBinaryUpgrade)
-		return false;
 
 	/*
 	 * If requested check lockmode is sufficient. This is a cross check in
@@ -310,12 +297,16 @@ create_toast_table(Relation rel, Oid toastOid, Oid toastIndexOid,
 	 * Toast tables for regular relations go in pg_toast; those for temp
 	 * relations go into the per-backend temp-toast-table namespace.
 	 */
-	if (isTempOrToastNamespace(rel->rd_rel->relnamespace))
+	if (isTempOrTempToastNamespace(rel->rd_rel->relnamespace))
 		namespaceid = GetTempToastNamespace();
 	else
 		namespaceid = PG_TOAST_NAMESPACE;
 
-	/* Use binary-upgrade override for pg_type.oid */
+	/*
+	 * Use binary-upgrade override for pg_type.oid, if supplied.  We might be
+	 * in the post-schema-restore phase where we are doing ALTER TABLE to
+	 * create TOAST tables that didn't exist in the old cluster.
+	 */
 	if (IsBinaryUpgrade)
 	{
 		toastOid = GetPreassignedOidForRelation(namespaceid, toast_relname);
@@ -333,7 +324,6 @@ create_toast_table(Relation rel, Oid toastOid, Oid toastIndexOid,
 										   rel->rd_rel->relowner,
 										   tupdesc,
 										   NIL,
-										   /* relam */ InvalidOid,
 										   RELKIND_TOASTVALUE,
 										   rel->rd_rel->relpersistence,
 										   RELSTORAGE_HEAP,
@@ -347,6 +337,7 @@ create_toast_table(Relation rel, Oid toastOid, Oid toastIndexOid,
 										   false,
 										   true,
 										   true,
+										   NULL,
 										   /* valid_opts */ false,
 										   /* is_part_child */ false,
 										   is_part_parent);
@@ -399,13 +390,15 @@ create_toast_table(Relation rel, Oid toastOid, Oid toastIndexOid,
 		toastIndexOid = GetPreassignedOidForRelation(namespaceid, toast_idxname);
 
 	toast_idxid = index_create(toast_rel, toast_idxname, toastIndexOid, InvalidOid,
+				 InvalidOid, InvalidOid,
 				 indexInfo,
 				 list_make2("chunk_id", "chunk_seq"),
 				 BTREE_AM_OID,
 				 rel->rd_rel->reltablespace,
 				 collationObjectId, classObjectId, coloptions, (Datum) 0,
 				 true, false, false, false,
-				 true, false, false, true, NULL);
+				 true, false, false, true, false, NULL);
+
 	heap_close(toast_rel, NoLock);
 
 	/*
@@ -489,9 +482,6 @@ needs_toast_table(Relation rel)
 	int32		tuple_length;
 	int			i;
 
-	if(RelationIsExternal(rel))
-		return false;
-	
 	tupdesc = rel->rd_att;
 	att = tupdesc->attrs;
 
@@ -522,7 +512,7 @@ needs_toast_table(Relation rel)
 		return false;			/* nothing to toast? */
 	if (maxlength_unknown)
 		return true;			/* any unlimited-length attrs? */
-	tuple_length = MAXALIGN(offsetof(HeapTupleHeaderData, t_bits) +
+	tuple_length = MAXALIGN(SizeofHeapTupleHeader +
 							BITMAPLEN(tupdesc->natts)) +
 		MAXALIGN(data_length);
 	return (tuple_length > TOAST_TUPLE_THRESHOLD);

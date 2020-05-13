@@ -16,7 +16,8 @@
  * if it has one.  When (and if) the next demand for a cached plan occurs,
  * parse analysis and rewrite is repeated to build a new valid query tree,
  * and then planning is performed as normal.  We also force re-analysis and
- * re-planning if the active search_path is different from the previous time.
+ * re-planning if the active search_path is different from the previous time
+ * or, if RLS is involved, if the user changes or the RLS environment changes.
  *
  * Note that if the sinval was a result of user DDL actions, parse analysis
  * could throw an error, for example if a column referenced by the query is
@@ -37,7 +38,7 @@
  * be infrequent enough that more-detailed tracking is not worth the effort.
  *
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -53,6 +54,7 @@
 #include "catalog/namespace.h"
 #include "executor/executor.h"
 #include "executor/spi.h"
+#include "miscadmin.h"
 #include "nodes/nodeFuncs.h"
 #include "optimizer/cost.h"
 #include "optimizer/planmain.h"
@@ -65,9 +67,11 @@
 #include "utils/inval.h"
 #include "utils/memutils.h"
 #include "utils/resowner_private.h"
+#include "utils/rls.h"
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
 
+#include "cdb/cdbutil.h"
 
 /*
  * We must skip "overhead" operations that involve database access when the
@@ -98,13 +102,14 @@ static void AcquireExecutorLocks(List *stmt_list, bool acquire);
 static void AcquirePlannerLocks(List *stmt_list, bool acquire);
 static void ScanQueryForLocks(Query *parsetree, bool acquire);
 static bool ScanQueryWalker(Node *node, bool *acquire);
-static bool plan_list_is_transient(List *stmt_list);
 static bool plan_list_is_oneoff(List *stmt_list);
 static TupleDesc PlanCacheComputeResultDesc(List *stmt_list);
 static void PlanCacheRelCallback(Datum arg, Oid relid);
 static void PlanCacheFuncCallback(Datum arg, int cacheid, uint32 hashvalue);
 static void PlanCacheSysCallback(Datum arg, int cacheid, uint32 hashvalue);
 
+/* GUC parameter */
+int	plan_cache_mode;
 
 /*
  * InitPlanCache: initialize module during InitPostgres.
@@ -119,6 +124,8 @@ InitPlanCache(void)
 	CacheRegisterSyscacheCallback(NAMESPACEOID, PlanCacheSysCallback, (Datum) 0);
 	CacheRegisterSyscacheCallback(OPEROID, PlanCacheSysCallback, (Datum) 0);
 	CacheRegisterSyscacheCallback(AMOPOPID, PlanCacheSysCallback, (Datum) 0);
+	CacheRegisterSyscacheCallback(FOREIGNSERVEROID, PlanCacheSysCallback, (Datum) 0);
+	CacheRegisterSyscacheCallback(FOREIGNDATAWRAPPEROID, PlanCacheSysCallback, (Datum) 0);
 }
 
 /*
@@ -195,6 +202,9 @@ CreateCachedPlan(Node *raw_parse_tree,
 	plansource->invalItems = NIL;
 	plansource->search_path = NULL;
 	plansource->query_context = NULL;
+	plansource->rewriteRoleId = InvalidOid;
+	plansource->rewriteRowSecurity = false;
+	plansource->dependsOnRLS = false;
 	plansource->gplan = NULL;
 	plansource->is_oneshot = false;
 	plansource->is_complete = false;
@@ -225,7 +235,7 @@ CreateCachedPlan(Node *raw_parse_tree,
  * invalidation, so plan use must be completed in the current transaction,
  * and DDL that might invalidate the querytree_list must be avoided as well.
  *
- * raw_parse_tree: output of raw_parser()
+ * raw_parse_tree: output of raw_parser(), or NULL if empty query
  * query_string: original query text
  * commandTag: compile-time-constant tag for query, or NULL if empty query
  */
@@ -260,6 +270,9 @@ CreateOneShotCachedPlan(Node *raw_parse_tree,
 	plansource->invalItems = NIL;
 	plansource->search_path = NULL;
 	plansource->query_context = NULL;
+	plansource->rewriteRoleId = InvalidOid;
+	plansource->rewriteRowSecurity = false;
+	plansource->dependsOnRLS = false;
 	plansource->gplan = NULL;
 	plansource->is_oneshot = true;
 	plansource->is_complete = false;
@@ -376,7 +389,12 @@ CompleteCachedPlan(CachedPlanSource *plansource,
 		 */
 		extract_query_dependencies((Node *) querytree_list,
 								   &plansource->relationOids,
-								   &plansource->invalItems);
+								   &plansource->invalItems,
+								   &plansource->dependsOnRLS);
+
+		/* Update RLS info as well. */
+		plansource->rewriteRoleId = GetUserId();
+		plansource->rewriteRowSecurity = row_security;
 
 		/*
 		 * Also save the current search_path in the query_context.  (This
@@ -591,6 +609,15 @@ RevalidateCachedQuery(CachedPlanSource *plansource, IntoClause *intoClause)
 	}
 
 	/*
+	 * If the query rewrite phase had a possible RLS dependency, we must redo
+	 * it if either the role or the row_security setting has changed.
+	 */
+	if (plansource->is_valid && plansource->dependsOnRLS &&
+		(plansource->rewriteRoleId != GetUserId() ||
+		 plansource->rewriteRowSecurity != row_security))
+		plansource->is_valid = false;
+
+	/*
 	 * If the query is currently valid, acquire locks on the referenced
 	 * objects; then check again.  We need to do it this way to cover the race
 	 * condition that an invalidation message arrives before we get the locks.
@@ -661,13 +688,12 @@ RevalidateCachedQuery(CachedPlanSource *plansource, IntoClause *intoClause)
 		snapshot_set = true;
 	}
 
-	rawtree = copyObject(plansource->raw_parse_tree);
-
 	/*
 	 * Run parse analysis and rule rewriting.  The parser tends to scribble on
 	 * its input, so we must copy the raw parse tree to prevent corruption of
 	 * the cache.
 	 */
+	rawtree = copyObject(plansource->raw_parse_tree);
 	if (rawtree == NULL)
 		tlist = NIL;
 	else if (plansource->parserSetup != NULL)
@@ -686,7 +712,7 @@ RevalidateCachedQuery(CachedPlanSource *plansource, IntoClause *intoClause)
 	{
 		Assert(list_length(tlist) == 1);
 		Query *query = (Query *) linitial(tlist);
-		query->isCTAS = true;
+		query->parentStmtType = PARENTSTMTTYPE_CTAS;
 	}
 
 	/* Release snapshot if we got one */
@@ -716,7 +742,11 @@ RevalidateCachedQuery(CachedPlanSource *plansource, IntoClause *intoClause)
 		if (plansource->fixed_result)
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("cached plan must not change result type")));
+					 errmsg("cached plan must not change result type"),
+					 errdetail("resultDesc is%s NULL. plansource->resulDesc is%s NULL.",
+							   resultDesc ? " not":"",
+							   plansource->resultDesc ? " not":"")));
+
 		oldcxt = MemoryContextSwitchTo(plansource->context);
 		if (resultDesc)
 			resultDesc = CreateTupleDescCopy(resultDesc);
@@ -746,7 +776,12 @@ RevalidateCachedQuery(CachedPlanSource *plansource, IntoClause *intoClause)
 	 */
 	extract_query_dependencies((Node *) qlist,
 							   &plansource->relationOids,
-							   &plansource->invalItems);
+							   &plansource->invalItems,
+							   &plansource->dependsOnRLS);
+
+	/* Update RLS info as well. */
+	plansource->rewriteRoleId = GetUserId();
+	plansource->rewriteRowSecurity = row_security;
 
 	/*
 	 * Also save the current search_path in the query_context.  (This should
@@ -802,6 +837,13 @@ CheckCachedPlan(CachedPlanSource *plansource)
 	Assert(plan->magic == CACHEDPLAN_MAGIC);
 	/* Generic plans are never one-shot */
 	Assert(!plan->is_oneshot);
+
+	/*
+	 * If plan isn't valid for current role, we can't use it.
+	 */
+	if (plan->is_valid && plan->dependsOnRole &&
+		plan->planRoleId != GetUserId())
+		plan->is_valid = false;
 
 	/*
 	 * If it appears valid, acquire locks and recheck; this is much the same
@@ -875,8 +917,10 @@ BuildCachedPlan(CachedPlanSource *plansource, List *qlist,
 	List	   *plist;
 	bool		snapshot_set;
 	bool		spi_pushed;
+	bool		is_transient;
 	MemoryContext plan_context;
 	MemoryContext oldcxt = CurrentMemoryContext;
+	ListCell   *lc;
 
 	/*
 	 * Normally the querytree should be valid already, but if it's not,
@@ -973,6 +1017,26 @@ BuildCachedPlan(CachedPlanSource *plansource, List *qlist,
 	plan->stmt_list = plist;
 
 	/*
+	 * CachedPlan is dependent on role either if RLS affected the rewrite
+	 * phase or if a role dependency was injected during planning.  And it's
+	 * transient if any plan is marked so.
+	 */
+	plan->planRoleId = GetUserId();
+	plan->dependsOnRole = plansource->dependsOnRLS;
+	is_transient = false;
+	foreach(lc, plist)
+	{
+		PlannedStmt *plannedstmt = (PlannedStmt *) lfirst(lc);
+
+		if (!IsA(plannedstmt, PlannedStmt))
+			continue;			/* Ignore utility statements */
+
+		if (plannedstmt->transientPlan)
+			is_transient = true;
+		if (plannedstmt->dependsOnRole)
+			plan->dependsOnRole = true;
+	}
+	/*
 	 * In GPDB, the planner is more aggressive, and e.g. eagerly evaluates
 	 * stable functions in the planner already. Such plans are marked as
 	 * 'one-off', and mustn't be reused. Likewise, plans for CTAS are not
@@ -982,7 +1046,7 @@ BuildCachedPlan(CachedPlanSource *plansource, List *qlist,
 	{
 		plan->saved_xmin = BootstrapTransactionId;
 	}
-	else if (plan_list_is_transient(plist))
+	else if (is_transient)
 	{
 		Assert(TransactionIdIsNormal(TransactionXmin));
 		plan->saved_xmin = TransactionXmin;
@@ -1027,6 +1091,12 @@ choose_custom_plan(CachedPlanSource *plansource, ParamListInfo boundParams, Into
 	/* ... nor for transaction control statements */
 	if (IsTransactionStmtPlan(plansource))
 		return false;
+
+	/* Let settings force the decision */
+	if (plan_cache_mode == PLAN_CACHE_MODE_FORCE_GENERIC_PLAN)
+		return false;
+	if (plan_cache_mode == PLAN_CACHE_MODE_FORCE_CUSTOM_PLAN)
+		return true;
 
 	/* See if caller wants to force the decision */
 	if (plansource->cursor_options & CURSOR_OPT_GENERIC_PLAN)
@@ -1105,6 +1175,59 @@ cached_plan_cost(CachedPlan *plan, bool include_planner)
 
 			result += 1000.0 * cpu_operator_cost * (nrelations + 1);
 		}
+
+		/*
+		 * For generic plan, no params will be passed to planner, so the
+		 * planner usually cannot generate a direct dispatch plan.
+		 * Unfortunately, direct dispatch cost vs. full gang dispatch cost is
+		 * not included in plan's total cost. But this cost is significant.
+		 * If a query could leverage direct dispatch, dispatching it to full
+		 * gangs will result in unneccessary QEs. Even if the QEs will find
+		 * no rows matching search criteria, these QEs still need to go
+		 * through volcano model, do two phase commit and write xlog for
+		 * Prepare etc, which not only consumes CPU but also IO to disk.
+		 *
+		 * So using a direct dispatch plan, when it's possible, matters. To
+		 * nudge the decision to that direction, we add some cost to plans
+		 * that don't use direct dispatch. Since non direct dispatch
+		 * introduces additional IO, we use seq_page_cost as base unit to
+		 * measure non direct dispatch cost. The number of unneccessary QEs
+		 * also measures the amount of this cost. Considering clusters with
+		 * 100 segments vs. 10 segments, the non-direct dispatch cost of the
+		 * 100 segments cluster is definitely higher than 10 segments cluster.
+		 * We don't have a good cost model for this, so somewhat arbitrarily,
+		 * add 10 * seq_page_cost to the cost, for every segment that is
+		 * involved in the execution.
+		 *
+		 * Actually, we're not very accurate in counting the number of
+		 * segments; we use the highest number of segments involved in any
+		 * particular slice. But if a plan e.g. has two slices, and both are
+		 * directly dispatched to a single segment, we conder the number of
+		 * segments as 1, even if the slices are direct-dispatched to
+		 * different segments. But this is pretty crude anyway. Ideally,
+		 * we would factor direct dispatch into the cost estimates
+		 * throughout the planner, so that it could affect the shape of the
+		 * plan.
+		 */
+		int			maxsegments = 1;
+		for (int i = 0; i < plannedstmt->numSlices; i++)
+		{
+			PlanSlice *slice = &plannedstmt->slices[i];
+
+			if (slice->gangType == GANGTYPE_PRIMARY_READER ||
+				slice->gangType == GANGTYPE_PRIMARY_WRITER)
+			{
+				int			nsegments;
+
+				/* How many segments are involved in this slice? */
+				if (slice->directDispatch.isDirectDispatch)
+					nsegments = list_length(slice->directDispatch.contentIds);
+				else
+					nsegments = slice->numsegments;
+				maxsegments = Max(maxsegments, nsegments);
+			}
+		}
+		result += 10.0 * seq_page_cost * (maxsegments - 1);
 	}
 
 	return result;
@@ -1140,7 +1263,7 @@ CachedPlan *
 GetCachedPlan(CachedPlanSource *plansource, ParamListInfo boundParams,
 			  bool useResOwner, IntoClause *intoClause)
 {
-	CachedPlan *plan;
+	CachedPlan *plan = NULL;
 	List	   *qlist;
 	bool		customplan;
 
@@ -1221,6 +1344,8 @@ GetCachedPlan(CachedPlanSource *plansource, ParamListInfo boundParams,
 			plansource->num_custom_plans++;
 		}
 	}
+
+	Assert(plan != NULL);
 
 	/* Flag the plan as in use by caller */
 	if (useResOwner)
@@ -1385,6 +1510,9 @@ CopyCachedPlan(CachedPlanSource *plansource)
 	if (plansource->search_path)
 		newsource->search_path = CopyOverrideSearchPath(plansource->search_path);
 	newsource->query_context = querytree_context;
+	newsource->rewriteRoleId = plansource->rewriteRoleId;
+	newsource->rewriteRowSecurity = plansource->rewriteRowSecurity;
+	newsource->dependsOnRLS = plansource->dependsOnRLS;
 
 	newsource->gplan = NULL;
 
@@ -1507,25 +1635,39 @@ AcquireExecutorLocks(List *stmt_list, bool acquire)
 				 * RowExclusiveLock is acquired in PostgreSQL here.  Greenplum
 				 * acquires ExclusiveLock to avoid distributed deadlock due to
 				 * concurrent UPDATE/DELETE on the same table.  This is in
-				 * parity with CdbTryOpenRelation().  Catalog tables are
-				 * replicated across cluster and don't suffer from the
-				 * deadlock.
-				 * Since we have introduced Global Deadlock Detector, only for ao
-				 * table should we upgrade the lock.
+				 * parity with CdbTryOpenRelation(). If it is heap table and
+				 * the GDD is enabled, we could acquire RowExclusiveLock here.
 				 */
-				if (rte->relid > FirstNormalObjectId &&
-					(plannedstmt->commandType == CMD_UPDATE ||
-					 plannedstmt->commandType == CMD_DELETE) &&
+				if ((plannedstmt->commandType == CMD_UPDATE ||
+					 plannedstmt->commandType == CMD_DELETE ||
+					 IsOnConflictUpdate(plannedstmt)) &&
 					CondUpgradeRelLock(rte->relid))
 					lockmode = ExclusiveLock;
 				else
 					lockmode = RowExclusiveLock;
 			}
-			else if ((rc = get_plan_rowmark(plannedstmt->rowMarks, rt_index)) != NULL &&
-					 RowMarkRequiresRowShareLock(rc->markType))
-				lockmode = RowShareLock;
 			else
-				lockmode = AccessShareLock;
+			{
+				/*
+				 * Greenplum specific behavior:
+				 * The implementation of select statement with locking clause
+				 * (for update | no key update | share | key share) in postgres
+				 * is to hold RowShareLock on tables during parsing stage, and
+				 * generate a LockRows plan node for executor to lock the tuples.
+				 * It is not easy to lock tuples in Greenplum database, since
+				 * tuples may be fetched through motion nodes.
+				 *
+				 * But when Global Deadlock Detector is enabled, and the select
+				 * statement with locking clause contains only one table, we are
+				 * sure that there are no motions. For such simple cases, we could
+				 * make the behavior just the same as Postgres.
+				 */
+				rc = get_plan_rowmark(plannedstmt->rowMarks, rt_index);
+				if (rc != NULL)
+					lockmode = rc->canOptSelectLockingClause ? RowShareLock : ExclusiveLock;
+				else
+					lockmode = AccessShareLock;
+			}
 
 			if (acquire)
 				LockRelationOid(rte->relid, lockmode);
@@ -1596,25 +1738,46 @@ ScanQueryForLocks(Query *parsetree, bool acquire)
 				if (rt_index == parsetree->resultRelation)
 				{
 					/*
-					 * RowExclusiveLock is acquired in PostgreSQL here.
-					 * Greenplum acquires ExclusiveLock to avoid distributed
-					 * deadlock due to concurrent UPDATE/DELETE on the same
-					 * table.  This is in parity with CdbTryOpenRelation().
-					 * Catalog tables are replicated across cluster and don't
-					 * suffer from the deadlock.
+					 * RowExclusiveLock is acquired in PostgreSQL here.  Greenplum
+					 * acquires ExclusiveLock to avoid distributed deadlock due to
+					 * concurrent UPDATE/DELETE on the same table.  This is in
+					 * parity with CdbTryOpenRelation(). If it is heap table and
+					 * the GDD is enabled, we could acquire RowExclusiveLock here.
 					 */
-					if (rte->relid > FirstNormalObjectId &&
-						(parsetree->commandType == CMD_UPDATE ||
-						 parsetree->commandType == CMD_DELETE) &&
+					if ((parsetree->commandType == CMD_UPDATE ||
+						 parsetree->commandType == CMD_DELETE ||
+						 (parsetree->onConflict &&
+						  parsetree->onConflict->action == ONCONFLICT_UPDATE)) &&
 						CondUpgradeRelLock(rte->relid))
 						lockmode = ExclusiveLock;
 					else
 						lockmode = RowExclusiveLock;
 				}
-				else if (get_parse_rowmark(parsetree, rt_index) != NULL)
-					lockmode = RowShareLock;
 				else
-					lockmode = AccessShareLock;
+				{
+					/*
+					 * Greenplum specific behavior:
+					 * The implementation of select statement with locking clause
+					 * (for update | no key update | share | key share) in postgres
+					 * is to hold RowShareLock on tables during parsing stage, and
+					 * generate a LockRows plan node for executor to lock the tuples.
+					 * It is not easy to lock tuples in Greenplum database, since
+					 * tuples may be fetched through motion nodes.
+					 *
+					 * But when Global Deadlock Detector is enabled, and the select
+					 * statement with locking clause contains only one table, we are
+					 * sure that there are no motions. For such simple cases, we could
+					 * make the behavior just the same as Postgres.
+					 */
+					RowMarkClause *rc;
+
+					rc = get_parse_rowmark(parsetree, rt_index);
+					if (rc != NULL)
+						lockmode = parsetree->canOptSelectLockingClause ? RowShareLock : ExclusiveLock;
+					else
+						lockmode = AccessShareLock;
+				}
+
 				if (acquire)
 					LockRelationOid(rte->relid, lockmode);
 				else
@@ -1678,29 +1841,12 @@ ScanQueryWalker(Node *node, bool *acquire)
 }
 
 /*
- * plan_list_is_transient: check if any of the plans in the list are transient.
- */
-static bool
-plan_list_is_transient(List *stmt_list)
-{
-	ListCell   *lc;
-
-	foreach(lc, stmt_list)
-	{
-		PlannedStmt *plannedstmt = (PlannedStmt *) lfirst(lc);
-
-		if (!IsA(plannedstmt, PlannedStmt))
-			continue;			/* Ignore utility statements */
-
-		if (plannedstmt->transientPlan)
-			return true;
-	}
-
-	return false;
-}
-
-/*
  * plan_list_is_oneoff: check if any of the plans in the list are one-off plans
+ *
+ *
+ * GPDB_96_MERGE_FIXME: This GPDB-specific function was inspired by upstream
+ * plan_list_is_transient() function. But that one was removed in PostgreSQL
+ * 9.6. Should we reconsider this one too?
  */
 static bool
 plan_list_is_oneoff(List *stmt_list)

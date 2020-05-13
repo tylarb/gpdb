@@ -3,7 +3,7 @@
  * lockcmds.c
  *	  LOCK command support code
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -181,8 +181,8 @@ LockTableRecurse(Oid reloid, LOCKMODE lockmode, bool nowait)
 				continue;		/* child concurrently dropped, just skip it */
 			ereport(ERROR,
 					(errcode(ERRCODE_LOCK_NOT_AVAILABLE),
-							errmsg("could not obtain lock on relation \"%s\"",
-								   relname)));
+					 errmsg("could not obtain lock on relation \"%s\"",
+							relname)));
 		}
 
 		/*
@@ -207,13 +207,17 @@ static AclResult
 LockTableAclCheck(Oid reloid, LOCKMODE lockmode)
 {
 	AclResult	aclresult;
+	AclMode		aclmask;
 
 	/* Verify adequate privilege */
 	if (lockmode == AccessShareLock)
-		aclresult = pg_class_aclcheck(reloid, GetUserId(),
-									  ACL_SELECT);
+		aclmask = ACL_SELECT;
+	else if (lockmode == RowExclusiveLock)
+		aclmask = ACL_INSERT | ACL_UPDATE | ACL_DELETE | ACL_TRUNCATE;
 	else
-		aclresult = pg_class_aclcheck(reloid, GetUserId(),
-									  ACL_UPDATE | ACL_DELETE | ACL_TRUNCATE);
+		aclmask = ACL_UPDATE | ACL_DELETE | ACL_TRUNCATE;
+
+	aclresult = pg_class_aclcheck(reloid, GetUserId(), aclmask);
+
 	return aclresult;
 }

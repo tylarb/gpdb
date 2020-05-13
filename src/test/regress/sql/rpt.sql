@@ -267,4 +267,81 @@ select * from foo;
 delete from foo where y = 1;
 select * from foo;
 
+-- Test replicate table within init plan
+insert into foo values (1, 1), (2, 1);
+select * from bar where exists (select * from foo);
+
+------
+-- Test Current Of is disabled for replicated table
+------
+begin;
+declare c1 cursor for select * from foo;
+fetch 1 from c1;
+delete from foo where current of c1;
+abort;
+
+begin;
+declare c1 cursor for select * from foo;
+fetch 1 from c1;
+update foo set y = 1 where current of c1;
+abort;
+
+-----
+-- Test updatable view works for replicated table
+----
+truncate foo;
+truncate bar;
+insert into foo values (1, 1);
+insert into foo values (2, 2);
+insert into bar values (1, 1);
+create view v_foo as select * from foo where y = 1;
+begin;
+update v_foo set y = 2; 
+select * from gp_dist_random('foo');
+abort;
+
+update v_foo set y = 3 from bar where bar.y = v_foo.y; 
+select * from gp_dist_random('foo');
+-- Test gp_segment_id for replicated table
+-- gp_segment_id is ambiguous for replicated table, it's been disabled now.
+create table baz (c1 int, c2 int) distributed replicated;
+create table qux (c1 int, c2 int);
+
+select gp_segment_id from baz;
+select xmin from baz;
+select xmax from baz;
+select ctid from baz;
+select * from baz where c2 = gp_segment_id;
+select * from baz, qux where baz.c1 = gp_segment_id;
+update baz set c2 = gp_segment_id;
+update baz set c2 = 1 where gp_segment_id = 1;
+update baz set c2 = 1 from qux where gp_segment_id = baz.c1;
+insert into baz select i, i from generate_series(1, 1000) i;
+vacuum baz;
+vacuum full baz;
+analyze baz;
+
+-- Test dependencies check when alter table to replicated table
+create view v_qux as select ctid from qux;
+alter table qux set distributed replicated;
+drop view v_qux;
+alter table qux set distributed replicated;
+
+-- Test cursor for update also works for replicated table
+create table cursor_update (c1 int, c2 int) distributed replicated;
+insert into cursor_update select i, i from generate_series(1, 10) i;
+begin;
+declare c1 cursor for select * from cursor_update order by c2 for update;
+fetch next from c1;
+end;
+
+-- Test MinMax path on replicated table
+create table minmaxtest (x int, y int) distributed replicated;
+create index on minmaxtest (x);
+insert into minmaxtest select generate_series(1, 10);
+set enable_seqscan=off;
+select min(x) from minmaxtest;
+
+-- start_ignore
 drop schema rpt cascade;
+-- end_ignore

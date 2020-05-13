@@ -134,14 +134,13 @@ struct AOCSAddColumnDescData;
  * to append data to the segment file.
  */
 extern AOCSFileSegInfo *GetAOCSFileSegInfo(Relation prel,
-				   Snapshot appendOnlyMetaDataSnapshot,
-				   int32 segno);
+										   Snapshot appendOnlyMetaDataSnapshot,
+										   int32 segno, bool locked);
 
 
 extern AOCSFileSegInfo **GetAllAOCSFileSegInfo(Relation prel,
 					  Snapshot appendOnlyMetaDataSnapshot,
 					  int *totalseg);
-
 extern void FreeAllAOCSSegFileInfo(AOCSFileSegInfo **allAOCSSegInfo, int totalSegFiles);
 
 extern int64 GetAOCSTotalBytes(
@@ -151,16 +150,14 @@ extern int64 GetAOCSTotalBytes(
 extern FileSegTotals *GetAOCSSSegFilesTotals(Relation parentrel,
 					   Snapshot appendOnlyMetaDataSnapshot);
 
-extern AOCSFileSegInfo *NewAOCSFileSegInfo(int32 segno, int32 nvp);
 extern void InsertInitialAOCSFileSegInfo(Relation prel, int32 segno, int32 nvp);
 extern void UpdateAOCSFileSegInfo(struct AOCSInsertDescData *desc);
 extern void AOCSFileSegInfoAddVpe(
 					  Relation prel, int32 segno,
 					  struct AOCSAddColumnDescData *desc, int num_newcols, bool empty);
 extern void AOCSFileSegInfoAddCount(Relation prel, int32 segno, int64 tupadded, int64 varblockadded, int64 modcount_added);
-extern void ClearAOCSFileSegInfo(Relation prel, int segno, FileSegInfoState newState);
-extern void SetAOCSFileSegInfoState(Relation parentrel, int segno, FileSegInfoState newState);
-extern int64 gp_update_aocol_master_stats_internal(Relation parentrel, Snapshot appendOnlyMetaDataSnapshot);
+extern void ClearAOCSFileSegInfo(Relation prel, int segno);
+extern void MarkAOCSFileSegInfoAwaitingDrop(Relation parentrel, int segno);
 extern float8 aocol_compression_ratio_internal(Relation parentrel);
 
 #endif

@@ -4,7 +4,7 @@
  *	  vacuuming routines for the postgres GiST index access method.
  *
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -25,34 +25,23 @@
 /*
  * VACUUM cleanup: update FSM
  */
-Datum
-gistvacuumcleanup(PG_FUNCTION_ARGS)
+IndexBulkDeleteResult *
+gistvacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
 {
-	IndexVacuumInfo *info = (IndexVacuumInfo *) PG_GETARG_POINTER(0);
-	IndexBulkDeleteResult *stats = (IndexBulkDeleteResult *) PG_GETARG_POINTER(1);
 	Relation	rel = info->index;
 	BlockNumber npages,
 				blkno;
 	BlockNumber totFreePages;
+	double		tuplesCount;
 	bool		needLock;
 
 	/* No-op in ANALYZE ONLY mode */
 	if (info->analyze_only)
-		PG_RETURN_POINTER(stats);
+		return stats;
 
 	/* Set up all-zero stats if gistbulkdelete wasn't called */
 	if (stats == NULL)
-	{
 		stats = (IndexBulkDeleteResult *) palloc0(sizeof(IndexBulkDeleteResult));
-		/* use heap's tuple count */
-		stats->num_index_tuples = info->num_heap_tuples;
-		stats->estimated_count = info->estimated_count;
-
-		/*
-		 * XXX the above is wrong if index is partial.  Would it be OK to just
-		 * return NULL, or is there work we must do below?
-		 */
-	}
 
 	/*
 	 * Need lock unless it's local to this backend.
@@ -67,6 +56,7 @@ gistvacuumcleanup(PG_FUNCTION_ARGS)
 		UnlockRelationForExtension(rel, ExclusiveLock);
 
 	totFreePages = 0;
+	tuplesCount = 0;
 	for (blkno = GIST_ROOT_BLKNO + 1; blkno < npages; blkno++)
 	{
 		Buffer		buffer;
@@ -84,6 +74,11 @@ gistvacuumcleanup(PG_FUNCTION_ARGS)
 			totFreePages++;
 			RecordFreeIndexPage(rel, blkno);
 		}
+		else if (GistPageIsLeaf(page))
+		{
+			/* count tuples in index (considering only leaf tuples) */
+			tuplesCount += PageGetMaxOffsetNumber(page);
+		}
 		UnlockReleaseBuffer(buffer);
 	}
 
@@ -97,8 +92,10 @@ gistvacuumcleanup(PG_FUNCTION_ARGS)
 	stats->num_pages = RelationGetNumberOfBlocks(rel);
 	if (needLock)
 		UnlockRelationForExtension(rel, ExclusiveLock);
+	stats->num_index_tuples = tuplesCount;
+	stats->estimated_count = false;
 
-	PG_RETURN_POINTER(stats);
+	return stats;
 }
 
 typedef struct GistBDItem
@@ -137,13 +134,10 @@ pushStackIfSplited(Page page, GistBDItem *stack)
  *
  * Result: a palloc'd struct containing statistical info for VACUUM displays.
  */
-Datum
-gistbulkdelete(PG_FUNCTION_ARGS)
+IndexBulkDeleteResult *
+gistbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
+			   IndexBulkDeleteCallback callback, void *callback_state)
 {
-	IndexVacuumInfo *info = (IndexVacuumInfo *) PG_GETARG_POINTER(0);
-	IndexBulkDeleteResult *stats = (IndexBulkDeleteResult *) PG_GETARG_POINTER(1);
-	IndexBulkDeleteCallback callback = (IndexBulkDeleteCallback) PG_GETARG_POINTER(2);
-	void	   *callback_state = (void *) PG_GETARG_POINTER(3);
 	Relation	rel = info->index;
 	GistBDItem *stack,
 			   *ptr;
@@ -208,14 +202,12 @@ gistbulkdelete(PG_FUNCTION_ARGS)
 				idxtuple = (IndexTuple) PageGetItem(page, iid);
 
 				if (callback(&(idxtuple->t_tid), callback_state))
-				{
-					todelete[ntodelete] = i - ntodelete;
-					ntodelete++;
-					stats->tuples_removed += 1;
-				}
+					todelete[ntodelete++] = i;
 				else
 					stats->num_index_tuples += 1;
 			}
+
+			stats->tuples_removed += ntodelete;
 
 			if (ntodelete)
 			{
@@ -223,15 +215,14 @@ gistbulkdelete(PG_FUNCTION_ARGS)
 
 				MarkBufferDirty(buffer);
 
-				for (i = 0; i < ntodelete; i++)
-					PageIndexTupleDelete(page, todelete[i]);
+				PageIndexMultiDelete(page, todelete, ntodelete);
 				GistMarkTuplesDeleted(page);
 
 				if (RelationNeedsWAL(rel))
 				{
 					XLogRecPtr	recptr;
 
-					recptr = gistXLogUpdate(rel->rd_node, buffer,
+					recptr = gistXLogUpdate(buffer,
 											todelete, ntodelete,
 											NULL, 0, InvalidBuffer);
 					PageSetLSN(page, recptr);
@@ -257,7 +248,7 @@ gistbulkdelete(PG_FUNCTION_ARGS)
 
 				ptr = (GistBDItem *) palloc(sizeof(GistBDItem));
 				ptr->blkno = ItemPointerGetBlockNumber(&(idxtuple->t_tid));
-				ptr->parentlsn = PageGetLSN(page);
+				ptr->parentlsn = BufferGetLSNAtomic(buffer);
 				ptr->next = stack->next;
 				stack->next = ptr;
 
@@ -279,5 +270,5 @@ gistbulkdelete(PG_FUNCTION_ARGS)
 		vacuum_delay_point();
 	}
 
-	PG_RETURN_POINTER(stats);
+	return stats;
 }

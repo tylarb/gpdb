@@ -4,11 +4,11 @@
  *		Shared definitions for the "raw" parser (flex and bison phases only)
  *
  * NOTE: this file is only meant to be included in the core parsing files,
- * ie, parser.c, gram.y, scan.l, and keywords.c.  Definitions that are needed
- * outside the core parser should be in parser.h.
+ * ie, parser.c, gram.y, scan.l, and src/common/keywords.c.
+ * Definitions that are needed outside the core parser should be in parser.h.
  *
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/parser/gramparse.h
@@ -46,6 +46,8 @@ typedef struct base_yy_extra_type
 	int			lookahead_token;	/* one-token lookahead */
 	core_YYSTYPE lookahead_yylval;		/* yylval for lookahead token */
 	YYLTYPE		lookahead_yylloc;		/* yylloc for lookahead token */
+	char	   *lookahead_end;	/* end of current token */
+	char		lookahead_hold_char;	/* to be put back at *lookahead_end */
 
 	/*
 	 * State variables that belong to the grammar.

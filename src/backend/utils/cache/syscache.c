@@ -5,7 +5,7 @@
  *
  * Portions Copyright (c) 2007-2010, Greenplum inc
  * Portions Copyright (c) 2012-Present Pivotal Software, Inc.
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -29,6 +29,7 @@
 #include "access/sysattr.h"
 #include "catalog/indexing.h"
 #include "catalog/pg_aggregate.h"
+#include "catalog/pg_am.h"
 #include "catalog/pg_amop.h"
 #include "catalog/pg_amproc.h"
 #include "catalog/pg_auth_members.h"
@@ -61,8 +62,10 @@
 #include "catalog/pg_shdepend.h"
 #include "catalog/pg_shdescription.h"
 #include "catalog/pg_shseclabel.h"
+#include "catalog/pg_replication_origin.h"
 #include "catalog/pg_statistic.h"
 #include "catalog/pg_tablespace.h"
+#include "catalog/pg_transform.h"
 #include "catalog/pg_ts_config.h"
 #include "catalog/pg_ts_config_map.h"
 #include "catalog/pg_ts_dict.h"
@@ -683,6 +686,28 @@ static const struct cachedesc cacheinfo[] = {
 		},
 		128
 	},
+	{ReplicationOriginRelationId,		/* REPLORIGIDENT */
+		ReplicationOriginIdentIndex,
+		1,
+		{
+			Anum_pg_replication_origin_roident,
+			0,
+			0,
+			0
+		},
+		16
+	},
+	{ReplicationOriginRelationId,		/* REPLORIGNAME */
+		ReplicationOriginNameIndex,
+		1,
+		{
+			Anum_pg_replication_origin_roname,
+			0,
+			0,
+			0
+		},
+		16
+	},
 	{ResGroupRelationId,		/* RESGROUPOID */
 		ResGroupOidIndexId,
 		1,
@@ -737,6 +762,28 @@ static const struct cachedesc cacheinfo[] = {
 			0,
 		},
 		4
+	},
+	{TransformRelationId,		/* TRFOID */
+		TransformOidIndexId,
+		1,
+		{
+			ObjectIdAttributeNumber,
+			0,
+			0,
+			0,
+		},
+		16
+	},
+	{TransformRelationId,		/* TRFTYPELANG */
+		TransformTypeLangIndexId,
+		2,
+		{
+			Anum_pg_transform_trftype,
+			Anum_pg_transform_trflang,
+			0,
+			0,
+		},
+		16
 	},
 	{TSConfigMapRelationId,		/* TSCONFIGMAP */
 		TSConfigMapIndexId,
@@ -883,16 +930,20 @@ static const struct cachedesc cacheinfo[] = {
 	}
 };
 
-static CatCache *SysCache[
-						  lengthof(cacheinfo)];
-static int	SysCacheSize = lengthof(cacheinfo);
+static CatCache *SysCache[SysCacheSize];
+
 static bool CacheInitialized = false;
 
-static Oid	SysCacheRelationOid[
-								lengthof(cacheinfo)];
+/* Sorted array of OIDs of tables that have caches on them */
+static Oid	SysCacheRelationOid[SysCacheSize];
 static int	SysCacheRelationOidSize;
 
+/* Sorted array of OIDs of tables and indexes used by caches */
+static Oid	SysCacheSupportingRelOid[SysCacheSize * 2];
+static int	SysCacheSupportingRelOidSize;
+
 static int	oid_compare(const void *a, const void *b);
+
 
 /*
  * InitCatalogCache - initialize the caches
@@ -907,11 +958,14 @@ InitCatalogCache(void)
 {
 	int			cacheId;
 	int			i,
-				j = 0;
+				j;
+
+	StaticAssertStmt(SysCacheSize == (int) lengthof(cacheinfo),
+					 "SysCacheSize does not match syscache.c's array");
 
 	Assert(!CacheInitialized);
 
-	MemSet(SysCache, 0, sizeof(SysCache));
+	SysCacheRelationOidSize = SysCacheSupportingRelOidSize = 0;
 
 	for (cacheId = 0; cacheId < SysCacheSize; cacheId++)
 	{
@@ -924,19 +978,38 @@ InitCatalogCache(void)
 		if (!PointerIsValid(SysCache[cacheId]))
 			elog(ERROR, "could not initialize cache %u (%d)",
 				 cacheinfo[cacheId].reloid, cacheId);
+		/* Accumulate data for OID lists, too */
 		SysCacheRelationOid[SysCacheRelationOidSize++] =
 			cacheinfo[cacheId].reloid;
+		SysCacheSupportingRelOid[SysCacheSupportingRelOidSize++] =
+			cacheinfo[cacheId].reloid;
+		SysCacheSupportingRelOid[SysCacheSupportingRelOidSize++] =
+			cacheinfo[cacheId].indoid;
 		/* see comments for RelationInvalidatesSnapshotsOnly */
 		Assert(!RelationInvalidatesSnapshotsOnly(cacheinfo[cacheId].reloid));
 	}
 
-	/* Sort and dedup OIDs. */
+	Assert(SysCacheRelationOidSize <= lengthof(SysCacheRelationOid));
+	Assert(SysCacheSupportingRelOidSize <= lengthof(SysCacheSupportingRelOid));
+
+	/* Sort and de-dup OID arrays, so we can use binary search. */
 	pg_qsort(SysCacheRelationOid, SysCacheRelationOidSize,
 			 sizeof(Oid), oid_compare);
-	for (i = 1; i < SysCacheRelationOidSize; ++i)
+	for (i = 1, j = 0; i < SysCacheRelationOidSize; i++)
+	{
 		if (SysCacheRelationOid[i] != SysCacheRelationOid[j])
 			SysCacheRelationOid[++j] = SysCacheRelationOid[i];
+	}
 	SysCacheRelationOidSize = j + 1;
+
+	pg_qsort(SysCacheSupportingRelOid, SysCacheSupportingRelOidSize,
+			 sizeof(Oid), oid_compare);
+	for (i = 1, j = 0; i < SysCacheSupportingRelOidSize; i++)
+	{
+		if (SysCacheSupportingRelOid[i] != SysCacheSupportingRelOid[j])
+			SysCacheSupportingRelOid[++j] = SysCacheSupportingRelOid[i];
+	}
+	SysCacheSupportingRelOidSize = j + 1;
 
 	CacheInitialized = true;
 }
@@ -1226,6 +1299,27 @@ SearchSysCacheList(int cacheId, int nkeys,
 }
 
 /*
+ * SysCacheInvalidate
+ *
+ *	Invalidate entries in the specified cache, given a hash value.
+ *	See CatCacheInvalidate() for more info.
+ *
+ *	This routine is only quasi-public: it should only be used by inval.c.
+ */
+void
+SysCacheInvalidate(int cacheId, uint32 hashValue)
+{
+	if (cacheId < 0 || cacheId >= SysCacheSize)
+		elog(ERROR, "invalid cache ID: %d", cacheId);
+
+	/* if this cache isn't initialized yet, no need to do anything */
+	if (!PointerIsValid(SysCache[cacheId]))
+		return;
+
+	CatCacheInvalidate(SysCache[cacheId], hashValue);
+}
+
+/*
  * Certain relations that do not have system caches send snapshot invalidation
  * messages in lieu of catcache messages.  This is for the benefit of
  * GetCatalogSnapshot(), which can then reuse its existing MVCC snapshot
@@ -1280,6 +1374,31 @@ RelationHasSysCache(Oid relid)
 	return false;
 }
 
+/*
+ * Test whether a relation supports a system cache, ie it is either a
+ * cached table or the index used for a cache.
+ */
+bool
+RelationSupportsSysCache(Oid relid)
+{
+	int			low = 0,
+				high = SysCacheSupportingRelOidSize - 1;
+
+	while (low <= high)
+	{
+		int			middle = low + (high - low) / 2;
+
+		if (SysCacheSupportingRelOid[middle] == relid)
+			return true;
+		if (SysCacheSupportingRelOid[middle] < relid)
+			low = middle + 1;
+		else
+			high = middle - 1;
+	}
+
+	return false;
+}
+
 
 /*
  * OID comparator for pg_qsort
@@ -1287,8 +1406,8 @@ RelationHasSysCache(Oid relid)
 static int
 oid_compare(const void *a, const void *b)
 {
-	Oid			oa = *((Oid *) a);
-	Oid			ob = *((Oid *) b);
+	Oid			oa = *((const Oid *) a);
+	Oid			ob = *((const Oid *) b);
 
 	if (oa == ob)
 		return 0;

@@ -4,7 +4,7 @@
  *	  POSTGRES low-level lock mechanism
  *
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/storage/lock.h
@@ -14,6 +14,11 @@
 #ifndef LOCK_H_
 #define LOCK_H_
 
+#ifdef FRONTEND
+#error "lock.h may not be included from frontend code"
+#endif
+
+#include "storage/lockdefs.h"
 #include "storage/backendid.h"
 #include "storage/lwlock.h"
 #include "storage/shmem.h"
@@ -77,15 +82,6 @@ typedef struct
 	((vxid).backendId = (proc).backendId, \
 	 (vxid).localTransactionId = (proc).lxid)
 
-
-/*
- * LOCKMODE is an integer (1..N) indicating a lock type.  LOCKMASK is a bit
- * mask indicating a set of held or requested lock types (the bit 1<<mode
- * corresponds to a particular lock mode).
- */
-typedef int LOCKMASK;
-typedef int LOCKMODE;
-
 /* MAX_LOCKMODES cannot be larger than the # of bits in LOCKMASK */
 #define MAX_LOCKMODES		10
 
@@ -135,27 +131,6 @@ typedef uint16 LOCKMETHODID;
 #define RESOURCE_LOCKMETHOD	3
 
 /*
- * These are the valid values of type LOCKMODE for all the standard lock
- * methods (both DEFAULT and USER).
- */
-
-/* NoLock is not a lock mode, but a flag value meaning "don't get a lock" */
-#define NoLock					0
-
-#define AccessShareLock			1		/* SELECT */
-#define RowShareLock			2		/* SELECT FOR UPDATE/FOR SHARE */
-#define RowExclusiveLock		3		/* INSERT, UPDATE, DELETE */
-#define ShareUpdateExclusiveLock 4		/* VACUUM (non-FULL),ANALYZE, CREATE
-										 * INDEX CONCURRENTLY */
-#define ShareLock				5		/* CREATE INDEX (WITHOUT CONCURRENTLY) */
-#define ShareRowExclusiveLock	6		/* like EXCLUSIVE MODE, but allows ROW
-										 * SHARE */
-#define ExclusiveLock			7		/* blocks ROW SHARE/SELECT...FOR
-										 * UPDATE */
-#define AccessExclusiveLock		8		/* ALTER TABLE, DROP TABLE, VACUUM
-										 * FULL, and unqualified LOCK TABLE */
-
-/*
  * Map from lock methods to lock table data structures.
  */
 extern const	LockMethodData resource_lockmethod;
@@ -191,8 +166,8 @@ typedef enum LockTagType
 	/* ID info for a transaction is its TransactionId */
 	LOCKTAG_VIRTUALTRANSACTION, /* virtual transaction (ditto) */
 	/* ID info for a virtual transaction is its VirtualTransactionId */
-	LOCKTAG_RELATION_APPENDONLY_SEGMENT_FILE,	/* Segment file within an Append-Only relation */
-	/* ID info for a relation is DB OID + REL OID + (LOGICAL) SEGMENT FILE # */
+	LOCKTAG_SPECULATIVE_TOKEN,	/* speculative insertion Xid and token */
+	/* ID info for a transaction is its TransactionId */
 	LOCKTAG_OBJECT,				/* non-relation database object */
 	/* ID info for an object is DB OID + CLASS OID + OBJECT OID + SUBID */
 
@@ -202,11 +177,14 @@ typedef enum LockTagType
 	 * Also, we use DB OID = 0 for shared objects such as tablespaces.
 	 */
 	LOCKTAG_RESOURCE_QUEUE,		/* ID info for resource queue is QUEUE ID */
+	LOCKTAG_DISTRIB_TRANSACTION,/* CDB: distributed transaction (for waiting for distributed xact done) */
 	LOCKTAG_USERLOCK,			/* reserved for old contrib/userlock code */
 	LOCKTAG_ADVISORY			/* advisory user locks */
 } LockTagType;
 
 #define LOCKTAG_LAST_TYPE	LOCKTAG_ADVISORY
+
+extern const char *const LockTagTypeNames[];
 
 /*
  * The LOCKTAG struct is defined with malice aforethought to fit into 16
@@ -271,6 +249,14 @@ typedef struct LOCKTAG
 	 (locktag).locktag_type = LOCKTAG_TRANSACTION, \
 	 (locktag).locktag_lockmethodid = DEFAULT_LOCKMETHOD)
 
+#define SET_LOCKTAG_DISTRIB_TRANSACTION(locktag,gxid) \
+	((locktag).locktag_field1 = (gxid), \
+	 (locktag).locktag_field2 = 0, \
+	 (locktag).locktag_field3 = 0, \
+	 (locktag).locktag_field4 = 0, \
+	 (locktag).locktag_type = LOCKTAG_DISTRIB_TRANSACTION, \
+	 (locktag).locktag_lockmethodid = DEFAULT_LOCKMETHOD)
+
 #define SET_LOCKTAG_VIRTUALTRANSACTION(locktag,vxid) \
 	((locktag).locktag_field1 = (vxid).backendId, \
 	 (locktag).locktag_field2 = (vxid).localTransactionId, \
@@ -279,12 +265,12 @@ typedef struct LOCKTAG
 	 (locktag).locktag_type = LOCKTAG_VIRTUALTRANSACTION, \
 	 (locktag).locktag_lockmethodid = DEFAULT_LOCKMETHOD)
 
-#define SET_LOCKTAG_RELATION_APPENDONLY_SEGMENT_FILE(locktag,dboid,reloid,segno) \
-	((locktag).locktag_field1 = (dboid), \
-	 (locktag).locktag_field2 = (reloid), \
-	 (locktag).locktag_field3 = (segno), \
+#define SET_LOCKTAG_SPECULATIVE_INSERTION(locktag,xid,token) \
+	((locktag).locktag_field1 = (xid), \
+	 (locktag).locktag_field2 = (token),		\
+	 (locktag).locktag_field3 = 0, \
 	 (locktag).locktag_field4 = 0, \
-	 (locktag).locktag_type = LOCKTAG_RELATION_APPENDONLY_SEGMENT_FILE, \
+	 (locktag).locktag_type = LOCKTAG_SPECULATIVE_TOKEN, \
 	 (locktag).locktag_lockmethodid = DEFAULT_LOCKMETHOD)
 
 #define SET_LOCKTAG_OBJECT(locktag,dboid,classoid,objoid,objsubid) \
@@ -397,6 +383,7 @@ typedef struct PROCLOCK
 	PROCLOCKTAG tag;			/* unique identifier of proclock object */
 
 	/* data */
+	PGPROC	   *groupLeader;	/* proc's lock group leader, or proc itself */
 	LOCKMASK	holdMask;		/* bitmask for lock types currently held */
 	LOCKMASK	releaseMask;	/* bitmask for lock types to be released */
 	SHM_QUEUE	lockLink;		/* list link in LOCK's list of proclocks */
@@ -465,6 +452,7 @@ typedef struct LOCALLOCK
 	int			numLockOwners;	/* # of relevant ResourceOwners */
 	int			maxLockOwners;	/* allocated size of array */
 	bool		holdsStrongLockCount;	/* bumped FastPathStrongRelationLocks */
+	bool		lockCleared;	/* we read all sinval msgs for lock */
 	LOCALLOCKOWNER *lockOwners; /* dynamically resizable array */
 } LOCALLOCK;
 
@@ -481,12 +469,13 @@ extern struct ResourceOwnerData *awaitedOwner;
 
 typedef struct LockInstanceData
 {
-	LOCKTAG		locktag;		/* locked object */
+	LOCKTAG		locktag;		/* tag for locked object */
 	LOCKMASK	holdMask;		/* locks held by this PGPROC */
 	LOCKMODE	waitLockMode;	/* lock awaited by this PGPROC, if any */
 	BackendId	backend;		/* backend ID of this PGPROC */
 	LocalTransactionId lxid;	/* local transaction ID of this PGPROC */
 	int			pid;			/* pid of this PGPROC */
+	int			leaderPid;		/* pid of group leader; = pid if no group */
 	bool		fastpath;		/* taken via fastpath? */
 	Oid			databaseId;		/* OID of database this backend is using */
 	int         mppSessionId;   /* serial num of the qDisp process */
@@ -498,8 +487,34 @@ typedef struct LockInstanceData
 typedef struct LockData
 {
 	int			nelements;		/* The length of the array */
-	LockInstanceData *locks;
+	LockInstanceData *locks;	/* Array of per-PROCLOCK information */
 } LockData;
+
+typedef struct BlockedProcData
+{
+	int			pid;			/* pid of a blocked PGPROC */
+	/* Per-PROCLOCK information about PROCLOCKs of the lock the pid awaits */
+	/* (these fields refer to indexes in BlockedProcsData.locks[]) */
+	int			first_lock;		/* index of first relevant LockInstanceData */
+	int			num_locks;		/* number of relevant LockInstanceDatas */
+	/* PIDs of PGPROCs that are ahead of "pid" in the lock's wait queue */
+	/* (these fields refer to indexes in BlockedProcsData.waiter_pids[]) */
+	int			first_waiter;	/* index of first preceding waiter */
+	int			num_waiters;	/* number of preceding waiters */
+} BlockedProcData;
+
+typedef struct BlockedProcsData
+{
+	BlockedProcData *procs;		/* Array of per-blocked-proc information */
+	LockInstanceData *locks;	/* Array of per-PROCLOCK information */
+	int		   *waiter_pids;	/* Array of PIDs of other blocked PGPROCs */
+	int			nprocs;			/* # of valid entries in procs[] array */
+	int			maxprocs;		/* Allocated length of procs[] array */
+	int			nlocks;			/* # of valid entries in locks[] array */
+	int			maxlocks;		/* Allocated length of locks[] array */
+	int			npids;			/* # of valid entries in waiter_pids[] array */
+	int			maxpids;		/* Allocated length of waiter_pids[] array */
+} BlockedProcsData;
 
 
 /* Result codes for LockAcquire() */
@@ -507,7 +522,8 @@ typedef enum
 {
 	LOCKACQUIRE_NOT_AVAIL,		/* lock not available, and dontWait=true */
 	LOCKACQUIRE_OK,				/* lock successfully acquired */
-	LOCKACQUIRE_ALREADY_HELD	/* incremented count for lock already held */
+	LOCKACQUIRE_ALREADY_HELD,	/* incremented count for lock already held */
+	LOCKACQUIRE_ALREADY_CLEAR	/* incremented count for lock already clear */
 } LockAcquireResult;
 
 /* Deadlock states identified by DeadLockCheck() */
@@ -520,7 +536,6 @@ typedef enum
 	DS_BLOCKED_BY_AUTOVACUUM	/* no deadlock; queue blocked by autovacuum
 								 * worker */
 } DeadLockState;
-
 
 /*
  * The lockmgr's shared hash tables are partitioned to reduce contention.
@@ -537,10 +552,23 @@ typedef enum
 	(&MainLWLockArray[LOCK_MANAGER_LWLOCK_OFFSET + (i)].lock)
 
 /*
+ * The deadlock detector needs to be able to access lockGroupLeader and
+ * related fields in the PGPROC, so we arrange for those fields to be protected
+ * by one of the lock hash partition locks.  Since the deadlock detector
+ * acquires all such locks anyway, this makes it safe for it to access these
+ * fields without doing anything extra.  To avoid contention as much as
+ * possible, we map different PGPROCs to different partition locks.  The lock
+ * used for a given lock group is determined by the group leader's pgprocno.
+ */
+#define LockHashPartitionLockByProc(leader_pgproc) \
+	LockHashPartitionLock((leader_pgproc)->pgprocno)
+
+/*
  * function prototypes
  */
 extern void InitLocks(void);
 extern LockMethod GetLocksMethodTable(const LOCK *lock);
+extern LockMethod GetLockTagsMethodTable(const LOCKTAG *locktag);
 extern uint32 LockTagHashCode(const LOCKTAG *locktag);
 /*
  * Compute the hash code associated with a PROCLOCKTAG, given the hashcode
@@ -571,8 +599,10 @@ extern LockAcquireResult LockAcquireExtended(const LOCKTAG *locktag,
 					LOCKMODE lockmode,
 					bool sessionLock,
 					bool dontWait,
-					bool report_memory_error);
+					bool reportMemoryError,
+					LOCALLOCK **locallockp);
 extern void AbortStrongLockAcquire(void);
+extern void MarkLockClear(LOCALLOCK *locallock);
 extern bool LockRelease(const LOCKTAG *locktag,
 			LOCKMODE lockmode, bool sessionLock);
 extern void LockSetHoldTillEndXact(const LOCKTAG *locktag);
@@ -596,15 +626,7 @@ extern void RemoveFromWaitQueue(PGPROC *proc, uint32 hashcode);
 extern void RemoveLocalLock(LOCALLOCK *locallock);
 extern Size LockShmemSize(void);
 extern LockData *GetLockStatusData(void);
-
-extern void ReportLockTableError(bool report);
-
-typedef struct xl_standby_lock
-{
-	TransactionId xid;			/* xid of holder of AccessExclusiveLock */
-	Oid			dbOid;
-	Oid			relOid;
-} xl_standby_lock;
+extern BlockedProcsData *GetBlockerStatusData(int blocked_pid);
 
 extern xl_standby_lock *GetRunningTransactionLocks(int *nlocks);
 extern const char *GetLockmodeName(LOCKMETHODID lockmethodid, LOCKMODE mode);
@@ -620,12 +642,14 @@ extern void lock_twophase_standby_recover(TransactionId xid, uint16 info,
 
 extern DeadLockState DeadLockCheck(PGPROC *proc);
 extern PGPROC *GetBlockingAutoVacuumPgproc(void);
-extern void DeadLockReport(void) __attribute__((noreturn));
+extern void DeadLockReport(void) pg_attribute_noreturn();
 extern void RememberSimpleDeadLock(PGPROC *proc1,
 					   LOCKMODE lockmode,
 					   LOCK *lock,
 					   PGPROC *proc2);
 extern void InitDeadLockChecking(void);
+
+extern int	LockWaiterCount(const LOCKTAG *locktag);
 
 #ifdef LOCK_DEBUG
 extern void DumpLocks(PGPROC *proc);
@@ -637,4 +661,6 @@ extern void VirtualXactLockTableInsert(VirtualTransactionId vxid);
 extern void VirtualXactLockTableCleanup(void);
 extern bool VirtualXactLock(VirtualTransactionId vxid, bool wait);
 
+/* Check whether a waiter's request lockmode conflict with the holder's hold mask */
+extern bool CheckWaitLockModeConflictHoldMask(LOCKTAG tag, LOCKMODE waitLockMode, LOCKMASK holderMask);
 #endif   /* LOCK_H */

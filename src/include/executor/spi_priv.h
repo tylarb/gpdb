@@ -3,7 +3,7 @@
  * spi_priv.h
  *				Server Programming Interface private declarations
  *
- * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/executor/spi_priv.h
@@ -31,6 +31,15 @@ typedef struct
 	MemoryContext execCxt;		/* executor context */
 	MemoryContext savedcxt;		/* context of SPI_connect's caller */
 	SubTransactionId connectSubid;		/* ID of connecting subtransaction */
+
+	/* subtransaction in which current Executor call was started */
+	SubTransactionId execSubid;
+
+	/* saved values of API global variables for previous nesting level */
+	uint32		outer_processed;
+	Oid			outer_lastoid;
+	SPITupleTable *outer_tuptable;
+	int			outer_result;
 } _SPI_connection;
 
 /*

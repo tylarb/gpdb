@@ -84,7 +84,7 @@ SELECT owner, property FROM GistTable1
    ->  Index Scan using propertyboxindex on gisttable1
          Index Cond: (property ~= '(7052,250),(6050,20)'::box)
          Filter: (property ~= '(7052,250),(6050,20)'::box)
- Optimizer: PQO version 2.74.0
+ Optimizer: Pivotal Optimizer (GPORCA) version 2.74.0
 (5 rows)
 
 SELECT id, property FROM GistTable1 
@@ -130,7 +130,7 @@ SELECT owner, property FROM GistTable1
    ->  Index Scan using propertyboxindex on gisttable1
          Index Cond: (property ~= '(7052,250),(6050,20)'::box)
          Filter: (property ~= '(7052,250),(6050,20)'::box)
- Optimizer: PQO version 2.74.0
+ Optimizer: Pivotal Optimizer (GPORCA) version 2.74.0
 (5 rows)
 
 SELECT id, property FROM GistTable1 
@@ -416,8 +416,6 @@ INFO:  GPORCA failed to produce a plan, falling back to planner
 DETAIL:  Feature not supported: SIRV functions
 INFO:  GPORCA failed to produce a plan, falling back to planner
 DETAIL:  No plan has been computed for required properties
-CONTEXT:  SQL statement "EXPLAIN SELECT owner, property FROM GistTable1 WHERE property IS NULL ORDER BY id;"
-PL/Python function "count_index_scans"
  count_index_scans 
 -------------------
                  1
@@ -438,7 +436,7 @@ INFO:  GPORCA failed to produce a plan, falling back to planner
          Sort Key: id
          ->  Index Scan using propertyisnullindex on gisttable1  (cost=0.00..701.27 rows=1 width=51)
                Index Cond: (property IS NULL)
- Optimizer: legacy query optimizer
+ Optimizer: Postgres query optimizer
 (7 rows)
 
 --end_ignore
@@ -463,8 +461,6 @@ INFO:  GPORCA failed to produce a plan, falling back to planner
 DETAIL:  Feature not supported: SIRV functions
 INFO:  GPORCA failed to produce a plan, falling back to planner
 DETAIL:  No plan has been computed for required properties
-CONTEXT:  SQL statement "EXPLAIN SELECT id, property FROM GistTable1 WHERE property IS NULL ORDER BY id;"
-PL/Python function "count_index_scans"
  count_index_scans 
 -------------------
                  1
@@ -485,7 +481,7 @@ INFO:  GPORCA failed to produce a plan, falling back to planner
          Sort Key: id
          ->  Index Scan using propertyisnullindex on gisttable1  (cost=0.00..701.27 rows=1 width=36)
                Index Cond: (property IS NULL)
- Optimizer: legacy query optimizer
+ Optimizer: Postgres query optimizer
 (7 rows)
 
 --end_ignore
@@ -582,7 +578,7 @@ EXPLAIN (COSTS OFF) SELECT id, property AS "ProperTee" FROM GistTable13
    ->  Index Scan using gistindex13 on gisttable13
          Index Cond: (property ~= '(999,999),(998,998)'::box)
          Filter: (property ~= '(999,999),(998,998)'::box)
- Optimizer: PQO version 2.74.0
+ Optimizer: Pivotal Optimizer (GPORCA) version 2.74.0
 (5 rows)
 
 VACUUM GistTable13;
@@ -602,7 +598,7 @@ EXPLAIN (COSTS OFF) SELECT id, property AS "ProperTee" FROM GistTable13
    ->  Index Scan using gistindex13 on gisttable13
          Index Cond: (property ~= '(999,999),(998,998)'::box)
          Filter: (property ~= '(999,999),(998,998)'::box)
- Optimizer: PQO version 2.74.0
+ Optimizer: Pivotal Optimizer (GPORCA) version 2.74.0
 (5 rows)
 
 TRUNCATE TABLE GistTable13;
@@ -632,7 +628,7 @@ EXPLAIN (COSTS OFF) SELECT id, property AS "ProperTee" FROM GistTable13
    ->  Index Scan using gistindex13 on gisttable13
          Index Cond: (property ~= '(999,999),(998,998)'::box)
          Filter: (property ~= '(999,999),(998,998)'::box)
- Optimizer: PQO version 2.74.0
+ Optimizer: Pivotal Optimizer (GPORCA) version 2.74.0
 (5 rows)
 
 -- ----------------------------------------------------------------------
@@ -672,7 +668,7 @@ EXPLAIN (COSTS OFF) SELECT id FROM GistTable1
                ->  Index Scan using propertyboxindex on gisttable1
                      Index Cond: (property ~= '(3,4),(1,2)'::box)
                      Filter: (property ~= '(3,4),(1,2)'::box)
- Optimizer: PQO version 2.74.0
+ Optimizer: Pivotal Optimizer (GPORCA) version 2.74.0
 (9 rows)
 
 REINDEX INDEX propertyBoxIndex;
@@ -699,7 +695,7 @@ EXPLAIN (COSTS OFF) SELECT id FROM GistTable1
                ->  Index Scan using propertyboxindex on gisttable1
                      Index Cond: (property ~= '(3,4),(1,2)'::box)
                      Filter: (property ~= '(3,4),(1,2)'::box)
- Optimizer: PQO version 2.74.0
+ Optimizer: Pivotal Optimizer (GPORCA) version 2.74.0
 (9 rows)
 
 DROP INDEX propertyBoxIndex;
@@ -724,9 +720,9 @@ EXPLAIN (COSTS OFF) SELECT id FROM GistTable1
    Merge Key: id
    ->  Sort
          Sort Key: id
-         ->  Table Scan on gisttable1
+         ->  Seq Scan on gisttable1
                Filter: (property ~= '(3,4),(1,2)'::box)
- Optimizer: PQO version 2.74.0
+ Optimizer: Pivotal Optimizer (GPORCA) version 2.74.0
 (7 rows)
 
 -- ----------------------------------------------------------------------
@@ -811,11 +807,11 @@ SELECT owner, property FROM GistTable1
                              QUERY PLAN                              
 ---------------------------------------------------------------------
  Gather Motion 3:1  (slice1; segments: 3)
-   ->  Bitmap Table Scan on gisttable1
+   ->  Bitmap Heap Scan on gisttable1
          Recheck Cond: (property ~= '(7052,250),(6050,20)'::box)
          ->  Bitmap Index Scan on propertyboxindex
                Index Cond: (property ~= '(7052,250),(6050,20)'::box)
- Optimizer: PQO version 2.74.0
+ Optimizer: Pivotal Optimizer (GPORCA) version 2.74.0
 (6 rows)
 
 SELECT id, property FROM GistTable1 
@@ -1097,17 +1093,16 @@ SELECT owner, property FROM GistTable1
  WHERE property IS NULL
  ORDER BY id
  ;
-                           QUERY PLAN                           
-----------------------------------------------------------------
+                         QUERY PLAN                         
+------------------------------------------------------------
  Gather Motion 3:1  (slice1; segments: 3)
    Merge Key: id
    ->  Sort
          Sort Key: id
-         ->  Bitmap Append-Only Row-Oriented Scan on gisttable1
+         ->  Bitmap Heap Scan on gisttable1
                Recheck Cond: (property IS NULL)
                ->  Bitmap Index Scan on propertyisnullindex
-                     Index Cond: (property IS NULL)
- Optimizer: legacy query optimizer
+ Optimizer: Postgres query optimizer
 (9 rows)
 
 -- ----------------------------------------------------------------------
@@ -1200,11 +1195,11 @@ EXPLAIN (COSTS OFF) SELECT id, property AS "ProperTee" FROM GistTable13
                              QUERY PLAN                             
 --------------------------------------------------------------------
  Gather Motion 3:1  (slice1; segments: 3)
-   ->  Bitmap Table Scan on gisttable13
+   ->  Bitmap Heap Scan on gisttable13
          Recheck Cond: (property ~= '(999,999),(998,998)'::box)
          ->  Bitmap Index Scan on gistindex13
                Index Cond: (property ~= '(999,999),(998,998)'::box)
- Optimizer: PQO version 2.74.0
+ Optimizer: Pivotal Optimizer (GPORCA) version 2.74.0
 (6 rows)
 
 VACUUM GistTable13;
@@ -1221,11 +1216,11 @@ EXPLAIN (COSTS OFF) SELECT id, property AS "ProperTee" FROM GistTable13
                              QUERY PLAN                             
 --------------------------------------------------------------------
  Gather Motion 3:1  (slice1; segments: 3)
-   ->  Bitmap Table Scan on gisttable13
+   ->  Bitmap Heap Scan on gisttable13
          Recheck Cond: (property ~= '(999,999),(998,998)'::box)
          ->  Bitmap Index Scan on gistindex13
                Index Cond: (property ~= '(999,999),(998,998)'::box)
- Optimizer: PQO version 2.74.0
+ Optimizer: Pivotal Optimizer (GPORCA) version 2.74.0
 (6 rows)
 
 TRUNCATE TABLE GistTable13;
@@ -1252,11 +1247,11 @@ EXPLAIN (COSTS OFF) SELECT id, property AS "ProperTee" FROM GistTable13
                              QUERY PLAN                             
 --------------------------------------------------------------------
  Gather Motion 3:1  (slice1; segments: 3)
-   ->  Bitmap Table Scan on gisttable13
+   ->  Bitmap Heap Scan on gisttable13
          Recheck Cond: (property ~= '(999,999),(998,998)'::box)
          ->  Bitmap Index Scan on gistindex13
                Index Cond: (property ~= '(999,999),(998,998)'::box)
- Optimizer: PQO version 2.74.0
+ Optimizer: Pivotal Optimizer (GPORCA) version 2.74.0
 (6 rows)
 
 -- ----------------------------------------------------------------------
@@ -1293,11 +1288,11 @@ EXPLAIN (COSTS OFF) SELECT id FROM GistTable1
    ->  Result
          ->  Sort
                Sort Key: id
-               ->  Bitmap Table Scan on gisttable1
+               ->  Bitmap Heap Scan on gisttable1
                      Recheck Cond: (property ~= '(3,4),(1,2)'::box)
                      ->  Bitmap Index Scan on propertyboxindex
                            Index Cond: (property ~= '(3,4),(1,2)'::box)
- Optimizer: PQO version 2.74.0
+ Optimizer: Pivotal Optimizer (GPORCA) version 2.74.0
 (10 rows)
 
 REINDEX INDEX propertyBoxIndex;
@@ -1321,11 +1316,11 @@ EXPLAIN (COSTS OFF) SELECT id FROM GistTable1
    ->  Result
          ->  Sort
                Sort Key: id
-               ->  Bitmap Table Scan on gisttable1
+               ->  Bitmap Heap Scan on gisttable1
                      Recheck Cond: (property ~= '(3,4),(1,2)'::box)
                      ->  Bitmap Index Scan on propertyboxindex
                            Index Cond: (property ~= '(3,4),(1,2)'::box)
- Optimizer: PQO version 2.74.0
+ Optimizer: Pivotal Optimizer (GPORCA) version 2.74.0
 (10 rows)
 
 DROP INDEX propertyBoxIndex;
@@ -1350,9 +1345,9 @@ EXPLAIN (COSTS OFF) SELECT id FROM GistTable1
    Merge Key: id
    ->  Sort
          Sort Key: id
-         ->  Table Scan on gisttable1
+         ->  Seq Scan on gisttable1
                Filter: (property ~= '(3,4),(1,2)'::box)
- Optimizer: PQO version 2.74.0
+ Optimizer: Pivotal Optimizer (GPORCA) version 2.74.0
 (7 rows)
 
 -- ----------------------------------------------------------------------
@@ -1437,11 +1432,11 @@ SELECT owner, property FROM GistTable1
                              QUERY PLAN                              
 ---------------------------------------------------------------------
  Gather Motion 3:1  (slice1; segments: 3)
-   ->  Bitmap Table Scan on gisttable1
+   ->  Bitmap Heap Scan on gisttable1
          Recheck Cond: (property ~= '(7052,250),(6050,20)'::box)
          ->  Bitmap Index Scan on propertyboxindex
                Index Cond: (property ~= '(7052,250),(6050,20)'::box)
- Optimizer: PQO version 2.74.0
+ Optimizer: Pivotal Optimizer (GPORCA) version 2.74.0
 (6 rows)
 
 SELECT id, property FROM GistTable1 
@@ -1723,17 +1718,16 @@ SELECT owner, property FROM GistTable1
  WHERE property IS NULL
  ORDER BY id
  ;
-                           QUERY PLAN                           
-----------------------------------------------------------------
+                         QUERY PLAN                         
+------------------------------------------------------------
  Gather Motion 3:1  (slice1; segments: 3)
    Merge Key: id
    ->  Sort
          Sort Key: id
-         ->  Bitmap Append-Only Row-Oriented Scan on gisttable1
+         ->  Bitmap Heap Scan on gisttable1
                Recheck Cond: (property IS NULL)
                ->  Bitmap Index Scan on propertyisnullindex
-                     Index Cond: (property IS NULL)
- Optimizer: legacy query optimizer
+ Optimizer: Postgres query optimizer
 (9 rows)
 
 -- ----------------------------------------------------------------------
@@ -1826,11 +1820,11 @@ EXPLAIN (COSTS OFF) SELECT id, property AS "ProperTee" FROM GistTable13
                              QUERY PLAN                             
 --------------------------------------------------------------------
  Gather Motion 3:1  (slice1; segments: 3)
-   ->  Bitmap Table Scan on gisttable13
+   ->  Bitmap Heap Scan on gisttable13
          Recheck Cond: (property ~= '(999,999),(998,998)'::box)
          ->  Bitmap Index Scan on gistindex13
                Index Cond: (property ~= '(999,999),(998,998)'::box)
- Optimizer: PQO version 2.74.0
+ Optimizer: Pivotal Optimizer (GPORCA) version 2.74.0
 (6 rows)
 
 VACUUM GistTable13;
@@ -1847,11 +1841,11 @@ EXPLAIN (COSTS OFF) SELECT id, property AS "ProperTee" FROM GistTable13
                              QUERY PLAN                             
 --------------------------------------------------------------------
  Gather Motion 3:1  (slice1; segments: 3)
-   ->  Bitmap Table Scan on gisttable13
+   ->  Bitmap Heap Scan on gisttable13
          Recheck Cond: (property ~= '(999,999),(998,998)'::box)
          ->  Bitmap Index Scan on gistindex13
                Index Cond: (property ~= '(999,999),(998,998)'::box)
- Optimizer: PQO version 2.74.0
+ Optimizer: Pivotal Optimizer (GPORCA) version 2.74.0
 (6 rows)
 
 TRUNCATE TABLE GistTable13;
@@ -1878,11 +1872,11 @@ EXPLAIN (COSTS OFF) SELECT id, property AS "ProperTee" FROM GistTable13
                              QUERY PLAN                             
 --------------------------------------------------------------------
  Gather Motion 3:1  (slice1; segments: 3)
-   ->  Bitmap Table Scan on gisttable13
+   ->  Bitmap Heap Scan on gisttable13
          Recheck Cond: (property ~= '(999,999),(998,998)'::box)
          ->  Bitmap Index Scan on gistindex13
                Index Cond: (property ~= '(999,999),(998,998)'::box)
- Optimizer: PQO version 2.74.0
+ Optimizer: Pivotal Optimizer (GPORCA) version 2.74.0
 (6 rows)
 
 -- ----------------------------------------------------------------------
@@ -1919,11 +1913,11 @@ EXPLAIN (COSTS OFF) SELECT id FROM GistTable1
    ->  Result
          ->  Sort
                Sort Key: id
-               ->  Bitmap Table Scan on gisttable1
+               ->  Bitmap Heap Scan on gisttable1
                      Recheck Cond: (property ~= '(3,4),(1,2)'::box)
                      ->  Bitmap Index Scan on propertyboxindex
                            Index Cond: (property ~= '(3,4),(1,2)'::box)
- Optimizer: PQO version 2.74.0
+ Optimizer: Pivotal Optimizer (GPORCA) version 2.74.0
 (10 rows)
 
 REINDEX INDEX propertyBoxIndex;
@@ -1947,11 +1941,11 @@ EXPLAIN (COSTS OFF) SELECT id FROM GistTable1
    ->  Result
          ->  Sort
                Sort Key: id
-               ->  Bitmap Table Scan on gisttable1
+               ->  Bitmap Heap Scan on gisttable1
                      Recheck Cond: (property ~= '(3,4),(1,2)'::box)
                      ->  Bitmap Index Scan on propertyboxindex
                            Index Cond: (property ~= '(3,4),(1,2)'::box)
- Optimizer: PQO version 2.74.0
+ Optimizer: Pivotal Optimizer (GPORCA) version 2.74.0
 (10 rows)
 
 DROP INDEX propertyBoxIndex;
@@ -1976,9 +1970,9 @@ EXPLAIN (COSTS OFF) SELECT id FROM GistTable1
    Merge Key: id
    ->  Sort
          Sort Key: id
-         ->  Table Scan on gisttable1
+         ->  Seq Scan on gisttable1
                Filter: (property ~= '(3,4),(1,2)'::box)
- Optimizer: PQO version 2.74.0
+ Optimizer: Pivotal Optimizer (GPORCA) version 2.74.0
 (7 rows)
 
 -- ----------------------------------------------------------------------
@@ -2063,11 +2057,11 @@ SELECT owner, property FROM GistTable1
                              QUERY PLAN                              
 ---------------------------------------------------------------------
  Gather Motion 3:1  (slice1; segments: 3)
-   ->  Bitmap Table Scan on gisttable1
+   ->  Bitmap Heap Scan on gisttable1
          Recheck Cond: (property ~= '(7052,250),(6050,20)'::box)
          ->  Bitmap Index Scan on propertyboxindex
                Index Cond: (property ~= '(7052,250),(6050,20)'::box)
- Optimizer: PQO version 2.74.0
+ Optimizer: Pivotal Optimizer (GPORCA) version 2.74.0
 (6 rows)
 
 SELECT id, property FROM GistTable1 
@@ -2349,17 +2343,16 @@ SELECT owner, property FROM GistTable1
  WHERE property IS NULL
  ORDER BY id
  ;
-                            QUERY PLAN                             
--------------------------------------------------------------------
+                         QUERY PLAN                          
+-------------------------------------------------------------
  Gather Motion 3:1  (slice1; segments: 3)
    Merge Key: id
    ->  Sort
          Sort Key: id
-         ->  Bitmap Append-Only Column-Oriented Scan on gisttable1
+         ->  Bitmap Heap Scan on gisttable1
                Recheck Cond: (property IS NULL)
                ->  Bitmap Index Scan on propertyisnullindex
-                     Index Cond: (property IS NULL)
- Optimizer: legacy query optimizer
+ Optimizer: Postgres query optimizer
 (9 rows)
 
 -- ----------------------------------------------------------------------
@@ -2452,11 +2445,11 @@ EXPLAIN (COSTS OFF) SELECT id, property AS "ProperTee" FROM GistTable13
                              QUERY PLAN                             
 --------------------------------------------------------------------
  Gather Motion 3:1  (slice1; segments: 3)
-   ->  Bitmap Table Scan on gisttable13
+   ->  Bitmap Heap Scan on gisttable13
          Recheck Cond: (property ~= '(999,999),(998,998)'::box)
          ->  Bitmap Index Scan on gistindex13
                Index Cond: (property ~= '(999,999),(998,998)'::box)
- Optimizer: PQO version 2.74.0
+ Optimizer: Pivotal Optimizer (GPORCA) version 2.74.0
 (6 rows)
 
 VACUUM GistTable13;
@@ -2473,11 +2466,11 @@ EXPLAIN (COSTS OFF) SELECT id, property AS "ProperTee" FROM GistTable13
                              QUERY PLAN                             
 --------------------------------------------------------------------
  Gather Motion 3:1  (slice1; segments: 3)
-   ->  Bitmap Table Scan on gisttable13
+   ->  Bitmap Heap Scan on gisttable13
          Recheck Cond: (property ~= '(999,999),(998,998)'::box)
          ->  Bitmap Index Scan on gistindex13
                Index Cond: (property ~= '(999,999),(998,998)'::box)
- Optimizer: PQO version 2.74.0
+ Optimizer: Pivotal Optimizer (GPORCA) version 2.74.0
 (6 rows)
 
 TRUNCATE TABLE GistTable13;
@@ -2504,11 +2497,11 @@ EXPLAIN (COSTS OFF) SELECT id, property AS "ProperTee" FROM GistTable13
                              QUERY PLAN                             
 --------------------------------------------------------------------
  Gather Motion 3:1  (slice1; segments: 3)
-   ->  Bitmap Table Scan on gisttable13
+   ->  Bitmap Heap Scan on gisttable13
          Recheck Cond: (property ~= '(999,999),(998,998)'::box)
          ->  Bitmap Index Scan on gistindex13
                Index Cond: (property ~= '(999,999),(998,998)'::box)
- Optimizer: PQO version 2.74.0
+ Optimizer: Pivotal Optimizer (GPORCA) version 2.74.0
 (6 rows)
 
 -- ----------------------------------------------------------------------
@@ -2545,11 +2538,11 @@ EXPLAIN (COSTS OFF) SELECT id FROM GistTable1
    ->  Result
          ->  Sort
                Sort Key: id
-               ->  Bitmap Table Scan on gisttable1
+               ->  Bitmap Heap Scan on gisttable1
                      Recheck Cond: (property ~= '(3,4),(1,2)'::box)
                      ->  Bitmap Index Scan on propertyboxindex
                            Index Cond: (property ~= '(3,4),(1,2)'::box)
- Optimizer: PQO version 2.74.0
+ Optimizer: Pivotal Optimizer (GPORCA) version 2.74.0
 (10 rows)
 
 REINDEX INDEX propertyBoxIndex;
@@ -2573,11 +2566,11 @@ EXPLAIN (COSTS OFF) SELECT id FROM GistTable1
    ->  Result
          ->  Sort
                Sort Key: id
-               ->  Bitmap Table Scan on gisttable1
+               ->  Bitmap Heap Scan on gisttable1
                      Recheck Cond: (property ~= '(3,4),(1,2)'::box)
                      ->  Bitmap Index Scan on propertyboxindex
                            Index Cond: (property ~= '(3,4),(1,2)'::box)
- Optimizer: PQO version 2.74.0
+ Optimizer: Pivotal Optimizer (GPORCA) version 2.74.0
 (10 rows)
 
 DROP INDEX propertyBoxIndex;
@@ -2602,9 +2595,9 @@ EXPLAIN (COSTS OFF) SELECT id FROM GistTable1
    Merge Key: id
    ->  Sort
          Sort Key: id
-         ->  Table Scan on gisttable1
+         ->  Seq Scan on gisttable1
                Filter: (property ~= '(3,4),(1,2)'::box)
- Optimizer: PQO version 2.74.0
+ Optimizer: Pivotal Optimizer (GPORCA) version 2.74.0
 (7 rows)
 
 -- ----------------------------------------------------------------------
@@ -2689,11 +2682,11 @@ SELECT owner, property FROM GistTable1
                              QUERY PLAN                              
 ---------------------------------------------------------------------
  Gather Motion 3:1  (slice1; segments: 3)
-   ->  Bitmap Table Scan on gisttable1
+   ->  Bitmap Heap Scan on gisttable1
          Recheck Cond: (property ~= '(7052,250),(6050,20)'::box)
          ->  Bitmap Index Scan on propertyboxindex
                Index Cond: (property ~= '(7052,250),(6050,20)'::box)
- Optimizer: PQO version 2.74.0
+ Optimizer: Pivotal Optimizer (GPORCA) version 2.74.0
 (6 rows)
 
 SELECT id, property FROM GistTable1 
@@ -2975,17 +2968,16 @@ SELECT owner, property FROM GistTable1
  WHERE property IS NULL
  ORDER BY id
  ;
-                            QUERY PLAN                             
--------------------------------------------------------------------
+                         QUERY PLAN                         
+------------------------------------------------------------
  Gather Motion 3:1  (slice1; segments: 3)
    Merge Key: id
    ->  Sort
          Sort Key: id
-         ->  Bitmap Append-Only Column-Oriented Scan on gisttable1
+         ->  Bitmap Heap Scan on gisttable1
                Recheck Cond: (property IS NULL)
                ->  Bitmap Index Scan on propertyisnullindex
-                     Index Cond: (property IS NULL)
- Optimizer: legacy query optimizer
+ Optimizer: Postgres query optimizer
 (9 rows)
 
 -- ----------------------------------------------------------------------
@@ -3078,11 +3070,11 @@ EXPLAIN (COSTS OFF) SELECT id, property AS "ProperTee" FROM GistTable13
                              QUERY PLAN                             
 --------------------------------------------------------------------
  Gather Motion 3:1  (slice1; segments: 3)
-   ->  Bitmap Table Scan on gisttable13
+   ->  Bitmap Heap Scan on gisttable13
          Recheck Cond: (property ~= '(999,999),(998,998)'::box)
          ->  Bitmap Index Scan on gistindex13
                Index Cond: (property ~= '(999,999),(998,998)'::box)
- Optimizer: PQO version 2.74.0
+ Optimizer: Pivotal Optimizer (GPORCA) version 2.74.0
 (6 rows)
 
 VACUUM GistTable13;
@@ -3099,11 +3091,11 @@ EXPLAIN (COSTS OFF) SELECT id, property AS "ProperTee" FROM GistTable13
                              QUERY PLAN                             
 --------------------------------------------------------------------
  Gather Motion 3:1  (slice1; segments: 3)
-   ->  Bitmap Table Scan on gisttable13
+   ->  Bitmap Heap Scan on gisttable13
          Recheck Cond: (property ~= '(999,999),(998,998)'::box)
          ->  Bitmap Index Scan on gistindex13
                Index Cond: (property ~= '(999,999),(998,998)'::box)
- Optimizer: PQO version 2.74.0
+ Optimizer: Pivotal Optimizer (GPORCA) version 2.74.0
 (6 rows)
 
 TRUNCATE TABLE GistTable13;
@@ -3130,11 +3122,11 @@ EXPLAIN (COSTS OFF) SELECT id, property AS "ProperTee" FROM GistTable13
                              QUERY PLAN                             
 --------------------------------------------------------------------
  Gather Motion 3:1  (slice1; segments: 3)
-   ->  Bitmap Table Scan on gisttable13
+   ->  Bitmap Heap Scan on gisttable13
          Recheck Cond: (property ~= '(999,999),(998,998)'::box)
          ->  Bitmap Index Scan on gistindex13
                Index Cond: (property ~= '(999,999),(998,998)'::box)
- Optimizer: PQO version 2.74.0
+ Optimizer: Pivotal Optimizer (GPORCA) version 2.74.0
 (6 rows)
 
 -- ----------------------------------------------------------------------
@@ -3171,11 +3163,11 @@ EXPLAIN (COSTS OFF) SELECT id FROM GistTable1
    ->  Result
          ->  Sort
                Sort Key: id
-               ->  Bitmap Table Scan on gisttable1
+               ->  Bitmap Heap Scan on gisttable1
                      Recheck Cond: (property ~= '(3,4),(1,2)'::box)
                      ->  Bitmap Index Scan on propertyboxindex
                            Index Cond: (property ~= '(3,4),(1,2)'::box)
- Optimizer: PQO version 2.74.0
+ Optimizer: Pivotal Optimizer (GPORCA) version 2.74.0
 (10 rows)
 
 REINDEX INDEX propertyBoxIndex;
@@ -3199,11 +3191,11 @@ EXPLAIN (COSTS OFF) SELECT id FROM GistTable1
    ->  Result
          ->  Sort
                Sort Key: id
-               ->  Bitmap Table Scan on gisttable1
+               ->  Bitmap Heap Scan on gisttable1
                      Recheck Cond: (property ~= '(3,4),(1,2)'::box)
                      ->  Bitmap Index Scan on propertyboxindex
                            Index Cond: (property ~= '(3,4),(1,2)'::box)
- Optimizer: PQO version 2.74.0
+ Optimizer: Pivotal Optimizer (GPORCA) version 2.74.0
 (10 rows)
 
 DROP INDEX propertyBoxIndex;
@@ -3228,9 +3220,9 @@ EXPLAIN (COSTS OFF) SELECT id FROM GistTable1
    Merge Key: id
    ->  Sort
          Sort Key: id
-         ->  Table Scan on gisttable1
+         ->  Seq Scan on gisttable1
                Filter: (property ~= '(3,4),(1,2)'::box)
- Optimizer: PQO version 2.74.0
+ Optimizer: Pivotal Optimizer (GPORCA) version 2.74.0
 (7 rows)
 
 -- ----------------------------------------------------------------------

@@ -14,10 +14,11 @@
 #ifndef BITMAP_H
 #define BITMAP_H
 
+#include "access/genam.h"
 #include "access/htup.h"
-#include "access/relscan.h"
 #include "access/xlog.h"
 #include "access/xlogutils.h"
+#include "utils/hsearch.h"
 
 #define BM_READ		BUFFER_LOCK_SHARE
 #define BM_WRITE	BUFFER_LOCK_EXCLUSIVE
@@ -37,6 +38,9 @@ typedef uint64			BM_HRL_WORD;
 
 #define BITMAP_VERSION 2
 #define BITMAP_MAGIC 0x4249544D
+
+/* This file can not and should not depend on execnodes.h */
+struct IndexInfo;
 
 /*
  * Metapage, always the first page (page 0) in the index.
@@ -317,19 +321,6 @@ typedef struct BMTidBuildBuf
 #define WORDNO_GET_HEADER_BIT(cw_no) \
 	((BM_HRL_WORD)1 << (BM_HRL_WORD_SIZE - 1 - ((cw_no) % BM_HRL_WORD_SIZE)))
 
-/*
- * To see if the content word at n is a compressed word or not we must look
- * look in the header words h_words. Each bit in the header words corresponds
- * to a word amongst the content words. If the bit is 1, the word is compressed
- * (i.e., it is a fill word) otherwise it is uncompressed.
- *
- * See src/backend/access/bitmap/README for more details
- */
-
-#define IS_FILL_WORD(h, n) \
-	(bool) ((((h)[(n)/BM_HRL_WORD_SIZE]) & (WORDNO_GET_HEADER_BIT(n))) > 0 ? \
-			true : false)
-
 /* A simplified interface to IS_FILL_WORD */
 
 #define CUR_WORD_IS_FILL(b) \
@@ -548,6 +539,20 @@ typedef struct BMScanOpaqueData
 typedef BMScanOpaqueData *BMScanOpaque;
 
 /*
+ * To see if the content word at wordno is a compressed word or not we must look
+ * in the header words. Each bit in the header words corresponds to a word
+ * amongst the content words. If the bit is 1, the word is compressed (i.e., it
+ * is a fill word) otherwise it is uncompressed.
+ *
+ * See src/backend/access/bitmap/README for more details
+ */
+static inline bool
+IS_FILL_WORD(const BM_HRL_WORD *words, int16 wordno)
+{
+	return (words[wordno / BM_HRL_WORD_SIZE] & WORDNO_GET_HEADER_BIT(wordno)) > 0;
+}
+
+/*
  * XLOG records for bitmap index operations
  *
  * Some information in high 4 bits of log record xl_info field.
@@ -734,19 +739,30 @@ typedef struct xl_bm_metapage
 } xl_bm_metapage;
 
 /* public routines */
-extern Datum bmbuild(PG_FUNCTION_ARGS);
-extern Datum bmbuildempty(PG_FUNCTION_ARGS);
-extern Datum bminsert(PG_FUNCTION_ARGS);
-extern Datum bmbeginscan(PG_FUNCTION_ARGS);
-extern Datum bmgettuple(PG_FUNCTION_ARGS);
-extern Datum bmgetbitmap(PG_FUNCTION_ARGS);
-extern Datum bmrescan(PG_FUNCTION_ARGS);
-extern Datum bmendscan(PG_FUNCTION_ARGS);
-extern Datum bmmarkpos(PG_FUNCTION_ARGS);
-extern Datum bmrestrpos(PG_FUNCTION_ARGS);
-extern Datum bmbulkdelete(PG_FUNCTION_ARGS);
-extern Datum bmvacuumcleanup(PG_FUNCTION_ARGS);
-extern Datum bmoptions(PG_FUNCTION_ARGS);
+extern Datum bmhandler(PG_FUNCTION_ARGS);
+extern IndexBuildResult *bmbuild(Relation heap, Relation index,
+		struct IndexInfo *indexInfo);
+extern void bmbuildempty(Relation index);
+extern bool bminsert(Relation rel, Datum *values, bool *isnull,
+		 ItemPointer ht_ctid, Relation heapRel,
+		 IndexUniqueCheck checkUnique);
+extern IndexScanDesc bmbeginscan(Relation rel, int nkeys, int norderbys);
+extern bool bmgettuple(IndexScanDesc scan, ScanDirection dir);
+extern Node *bmgetbitmap(IndexScanDesc scan, Node *tbm);
+extern void bmrescan(IndexScanDesc scan, ScanKey scankey, int nscankeys,
+		 ScanKey orderbys, int norderbys);
+extern void bmendscan(IndexScanDesc scan);
+extern void bmmarkpos(IndexScanDesc scan);
+extern void bmrestrpos(IndexScanDesc scan);
+extern IndexBulkDeleteResult *bmbulkdelete(IndexVacuumInfo *info,
+			 IndexBulkDeleteResult *stats,
+			 IndexBulkDeleteCallback callback,
+			 void *callback_state);
+extern IndexBulkDeleteResult *bmvacuumcleanup(IndexVacuumInfo *info,
+				IndexBulkDeleteResult *stats);
+extern bool bmcanreturn(Relation index, int attno);
+extern bytea *bmoptions(Datum reloptions, bool validate);
+extern bool bmvalidate(Oid opclassoid);
 
 extern void GetBitmapIndexAuxOids(Relation index, Oid *heapId, Oid *indexId);
 
@@ -838,8 +854,9 @@ extern bool _bitmap_findvalue(Relation lovHeap, Relation lovIndex,
 /*
  * prototypes for functions in bitmapxlog.c
  */
-extern void bitmap_redo(XLogRecPtr beginLoc, XLogRecPtr lsn, XLogRecord *record);
-extern void bitmap_desc(StringInfo buf, XLogRecord *record);
+extern void bitmap_redo(XLogReaderState *record);
+extern void bitmap_desc(StringInfo buf, XLogReaderState *record);
+extern const char *bitmap_identify(uint8 info);
 
 /* reloptions.c */
 #define BITMAP_MIN_FILLFACTOR		10

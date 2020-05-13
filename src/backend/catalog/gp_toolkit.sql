@@ -8,6 +8,8 @@
 
 BEGIN;
 
+CREATE SCHEMA gp_toolkit;
+
 GRANT USAGE ON SCHEMA gp_toolkit TO public;
 
 --------------------------------------------------------------------------------
@@ -112,7 +114,8 @@ AS
         SELECT aunoid
         FROM gp_toolkit.__gp_user_namespaces
     )
-    AND pgc.relkind = 'r'
+    AND (pgc.relkind = 'r' OR pgc.relkind = 'm')
+    AND pgc.relispopulated = 't'
     AND pgc.oid = fn.fnoid;
 
 GRANT SELECT ON TABLE gp_toolkit.__gp_user_tables TO public;
@@ -577,16 +580,13 @@ DECLARE
     skewaot bool;
     skewsegid int;
     skewtablename record;
-
+    skewreplicated record;
 BEGIN
-
     SELECT INTO skewrec *
     FROM pg_catalog.pg_appendonly pga, pg_catalog.pg_roles pgr
     WHERE pga.relid = $1::regclass and pgr.rolname = current_user and pgr.rolsuper = 't';
-
     IF FOUND THEN
         -- append only table
-
         FOR skewrec IN
             SELECT $1, segid, COALESCE(tupcount, 0)::bigint AS cnt
             FROM (SELECT generate_series(0, numsegments - 1) FROM gp_toolkit.__gp_number_of_segments) segs(segid)
@@ -595,26 +595,38 @@ BEGIN
         LOOP
             RETURN NEXT skewrec;
         END LOOP;
-
     ELSE
         -- heap table
-
         SELECT * INTO skewtablename FROM gp_toolkit.__gp_fullname
         WHERE fnoid = $1;
-
-        OPEN skewcrs
-            FOR
-            EXECUTE
-                'SELECT ' || $1 || '::oid, segid, CASE WHEN gp_segment_id IS NULL THEN 0 ELSE cnt END ' ||
-                'FROM (SELECT generate_series(0, numsegments - 1) FROM gp_toolkit.__gp_number_of_segments) segs(segid) ' ||
-                'LEFT OUTER JOIN ' ||
-                    '(SELECT gp_segment_id, COUNT(*) AS cnt FROM ' ||
+        SELECT * INTO skewreplicated FROM gp_distribution_policy WHERE policytype = 'r' AND localoid = $1;
+        IF FOUND THEN
+            -- replicated table, gp_segment_id is user-invisible and all replicas have same count of tuples.
+            OPEN skewcrs
+                FOR
+                EXECUTE
+                    'SELECT ' || $1 || '::oid, segid, ' ||
+                    '(' ||
+                        'SELECT COUNT(*) AS cnt FROM ' ||
                         quote_ident(skewtablename.fnnspname) ||
                         '.' ||
                         quote_ident(skewtablename.fnrelname) ||
-                    ' GROUP BY 1) details ' ||
-                'ON segid = gp_segment_id';
-
+                    ') '
+                    'FROM (SELECT generate_series(0, numsegments - 1) FROM gp_toolkit.__gp_number_of_segments) segs(segid)';
+        ELSE
+            OPEN skewcrs
+                FOR
+                EXECUTE
+                    'SELECT ' || $1 || '::oid, segid, CASE WHEN gp_segment_id IS NULL THEN 0 ELSE cnt END ' ||
+                    'FROM (SELECT generate_series(0, numsegments - 1) FROM gp_toolkit.__gp_number_of_segments) segs(segid) ' ||
+                    'LEFT OUTER JOIN ' ||
+                        '(SELECT gp_segment_id, COUNT(*) AS cnt FROM ' ||
+                            quote_ident(skewtablename.fnnspname) ||
+                            '.' ||
+                            quote_ident(skewtablename.fnrelname) ||
+                        ' GROUP BY 1) details ' ||
+                    'ON segid = gp_segment_id';
+        END IF;
         FOR skewsegid IN
             SELECT generate_series(1, numsegments)
             FROM gp_toolkit.__gp_number_of_segments
@@ -628,11 +640,10 @@ BEGIN
         END LOOP;
         CLOSE skewcrs;
     END IF;
-
     RETURN;
-END
+END;
 $$
-LANGUAGE plpgSQL READS SQL DATA;
+LANGUAGE plpgsql READS SQL DATA;
 
 GRANT EXECUTE ON FUNCTION gp_toolkit.gp_skew_details(oid) TO public;
 
@@ -664,7 +675,6 @@ AS
 --
 -- @doc:
 --        Compute coefficient of variance given an array of rowcounts;
---        Multiply by 100 to be in sync with gpperfmon's measure
 --
 --------------------------------------------------------------------------------
 CREATE FUNCTION gp_toolkit.gp_skew_coefficient(targetoid oid, OUT skcoid oid, OUT skccoeff numeric)
@@ -709,7 +719,6 @@ $$
 DECLARE
     skcoid oid;
     skcrec record;
-
 BEGIN
     FOR skcoid IN SELECT autoid from gp_toolkit.__gp_user_data_tables_readable WHERE autrelstorage != 'x'
     LOOP
@@ -718,7 +727,7 @@ BEGIN
             gp_toolkit.gp_skew_coefficient(skcoid);
         RETURN NEXT skcrec;
     END LOOP;
-END
+END;
 $$
 LANGUAGE plpgsql READS SQL DATA;
 
@@ -808,7 +817,6 @@ $$
 DECLARE
     skcoid oid;
     skcrec record;
-
 BEGIN
     FOR skcoid IN SELECT autoid from gp_toolkit.__gp_user_data_tables_readable WHERE autrelstorage != 'x'
     LOOP
@@ -817,7 +825,7 @@ BEGIN
             gp_toolkit.gp_skew_idle_fraction(skcoid);
         RETURN NEXT skcrec;
     END LOOP;
-END
+END;
 $$
 LANGUAGE plpgsql READS SQL DATA;
 
@@ -1229,7 +1237,8 @@ AS
         pgl.pid           AS lorpid,
         pgl.mode          AS lormode,
         pgl.granted       AS lorgranted,
-        pgsa.waiting      AS lorwaiting
+        pgsa.wait_event   AS lorwaitevent,
+        pgsa.wait_event_type AS lorwaiteventtype
     FROM pg_catalog.pg_stat_activity pgsa
 
     JOIN pg_catalog.pg_locks pgl
@@ -1772,14 +1781,10 @@ CREATE VIEW gp_toolkit.gp_resgroup_config AS
     SELECT G.oid       AS groupid
          , G.rsgname   AS groupname
          , T1.value    AS concurrency
-         , T1.proposed AS proposed_concurrency
          , T2.value    AS cpu_rate_limit
          , T3.value    AS memory_limit
-         , T3.proposed AS proposed_memory_limit
          , T4.value    AS memory_shared_quota
-         , T4.proposed AS proposed_memory_shared_quota
          , T5.value    AS memory_spill_ratio
-         , T5.proposed AS proposed_memory_spill_ratio
          , CASE WHEN T6.value IS NULL THEN 'vmtracker'
                 WHEN T6.value='0'     THEN 'vmtracker'
                 WHEN T6.value='1'     THEN 'cgroup'
@@ -1816,11 +1821,98 @@ CREATE VIEW gp_toolkit.gp_resgroup_status AS
 GRANT SELECT ON gp_toolkit.gp_resgroup_status TO public;
 
 --------------------------------------------------------------------------------
+-- @view:
+--              gp_toolkit.gp_resgroup_status_per_host
+--
+-- @doc:
+--              Resource group runtime status information grouped by host
+--
+--------------------------------------------------------------------------------
+
+CREATE VIEW gp_toolkit.gp_resgroup_status_per_host AS
+    WITH s AS (
+        SELECT
+            rsgname
+          , groupid
+          , (json_each(cpu_usage)).key::smallint AS segment_id
+          , (json_each(cpu_usage)).value AS cpu
+          , (json_each(memory_usage)).value AS memory
+        FROM gp_toolkit.gp_resgroup_status
+    )
+    SELECT
+        s.rsgname
+      , s.groupid
+      , c.hostname
+      , sum((s.cpu                       )::text::numeric) AS cpu
+      , sum((s.memory->'used'            )::text::integer) AS memory_used
+      , sum((s.memory->'available'       )::text::integer) AS memory_available
+      , sum((s.memory->'quota_used'      )::text::integer) AS memory_quota_used
+      , sum((s.memory->'quota_available' )::text::integer) AS memory_quota_available
+      , sum((s.memory->'shared_used'     )::text::integer) AS memory_shared_used
+      , sum((s.memory->'shared_available')::text::integer) AS memory_shared_available
+    FROM s
+    INNER JOIN pg_catalog.gp_segment_configuration AS c
+        ON s.segment_id = c.content
+        AND c.role = 'p'
+    GROUP BY
+        s.rsgname
+      , s.groupid
+      , c.hostname
+    ;
+
+GRANT SELECT ON gp_toolkit.gp_resgroup_status_per_host TO public;
+
+--------------------------------------------------------------------------------
+-- @view:
+--              gp_toolkit.gp_resgroup_status_per_segment
+--
+-- @doc:
+--              Resource group runtime status information grouped by segment
+--
+--------------------------------------------------------------------------------
+
+CREATE VIEW gp_toolkit.gp_resgroup_status_per_segment AS
+    WITH s AS (
+        SELECT
+            rsgname
+          , groupid
+          , (json_each(cpu_usage)).key::smallint AS segment_id
+          , (json_each(cpu_usage)).value AS cpu
+          , (json_each(memory_usage)).value AS memory
+        FROM gp_toolkit.gp_resgroup_status
+    )
+    SELECT
+        s.rsgname
+      , s.groupid
+      , c.hostname
+      , s.segment_id
+      , sum((s.cpu                       )::text::numeric) AS cpu
+      , sum((s.memory->'used'            )::text::integer) AS memory_used
+      , sum((s.memory->'available'       )::text::integer) AS memory_available
+      , sum((s.memory->'quota_used'      )::text::integer) AS memory_quota_used
+      , sum((s.memory->'quota_available' )::text::integer) AS memory_quota_available
+      , sum((s.memory->'shared_used'     )::text::integer) AS memory_shared_used
+      , sum((s.memory->'shared_available')::text::integer) AS memory_shared_available
+    FROM s
+    INNER JOIN pg_catalog.gp_segment_configuration AS c
+        ON s.segment_id = c.content
+        AND c.role = 'p'
+    GROUP BY
+        s.rsgname
+      , s.groupid
+      , c.hostname
+      , s.segment_id
+    ;
+
+GRANT SELECT ON gp_toolkit.gp_resgroup_status_per_segment TO public;
+
+--------------------------------------------------------------------------------
 -- AO/CO diagnostics functions
 --------------------------------------------------------------------------------
 
 CREATE FUNCTION gp_toolkit.__gp_aoseg_history(regclass)
-RETURNS TABLE(gp_tid tid,
+RETURNS TABLE(segment_id integer,
+    gp_tid tid,
     gp_xmin integer,
     gp_xmin_status text,
     gp_xmin_commit_distrib_id text,
@@ -1839,11 +1931,12 @@ RETURNS TABLE(gp_tid tid,
     formatversion smallint,
     state smallint)
 AS '$libdir/gp_ao_co_diagnostics', 'gp_aoseg_history_wrapper'
-LANGUAGE C STRICT;
+LANGUAGE C STRICT EXECUTE ON ALL SEGMENTS;
 GRANT EXECUTE ON FUNCTION gp_toolkit.__gp_aoseg_history(regclass) TO public;
 
 CREATE FUNCTION gp_toolkit.__gp_aocsseg(regclass)
-RETURNS TABLE(gp_tid tid,
+RETURNS TABLE(segment_id integer,
+    gp_tid tid,
     segno integer,
     column_num smallint,
     physical_segno integer,
@@ -1854,11 +1947,12 @@ RETURNS TABLE(gp_tid tid,
     formatversion smallint,
     state smallint)
 AS '$libdir/gp_ao_co_diagnostics', 'gp_aocsseg_wrapper'
-LANGUAGE C STRICT;
+LANGUAGE C STRICT EXECUTE ON ALL SEGMENTS;
 GRANT EXECUTE ON FUNCTION gp_toolkit.__gp_aocsseg(regclass) TO public;
 
 CREATE FUNCTION gp_toolkit.__gp_aocsseg_history(regclass)
-RETURNS TABLE(gp_tid tid,
+RETURNS TABLE(segment_id integer,
+    gp_tid tid,
     gp_xmin integer,
     gp_xmin_status text,
     gp_xmin_distrib_id text,
@@ -1879,7 +1973,7 @@ RETURNS TABLE(gp_tid tid,
     formatversion smallint,
     state smallint)
 AS '$libdir/gp_ao_co_diagnostics' , 'gp_aocsseg_history_wrapper'
-LANGUAGE C STRICT;
+LANGUAGE C STRICT EXECUTE ON ALL SEGMENTS;
 GRANT EXECUTE ON FUNCTION gp_toolkit.__gp_aocsseg_history(regclass) TO public;
 
 CREATE FUNCTION gp_toolkit.__gp_aovisimap(regclass)
@@ -1895,7 +1989,7 @@ RETURNS TABLE (segno integer,
     hidden_tupcount bigint,
     total_tupcount bigint)
 AS '$libdir/gp_ao_co_diagnostics', 'gp_aovisimap_hidden_info_wrapper'
-LANGUAGE C STRICT;
+LANGUAGE C STRICT EXECUTE ON ALL SEGMENTS;
 GRANT EXECUTE ON FUNCTION gp_toolkit.__gp_aovisimap_hidden_info(regclass) TO public;
 
 CREATE FUNCTION gp_toolkit.__gp_aovisimap_entry(regclass)
@@ -1908,7 +2002,8 @@ LANGUAGE C STRICT;
 GRANT EXECUTE ON FUNCTION gp_toolkit.__gp_aovisimap_entry(regclass) TO public;
 
 CREATE FUNCTION gp_toolkit.__gp_aoseg(regclass)
-RETURNS TABLE (segno integer, eof bigint,
+RETURNS TABLE (segment_id integer,
+    segno integer, eof bigint,
     tupcount bigint,
     varblockcount bigint,
     eof_uncompressed bigint,
@@ -1916,7 +2011,7 @@ RETURNS TABLE (segno integer, eof bigint,
     formatversion smallint,
     state smallint)
 AS '$libdir/gp_ao_co_diagnostics', 'gp_aoseg_wrapper'
-LANGUAGE C STRICT;
+LANGUAGE C STRICT EXECUTE ON ALL SEGMENTS;
 GRANT EXECUTE ON FUNCTION gp_toolkit.__gp_aoseg(regclass) TO public;
 
 CREATE TYPE gp_toolkit.__gp_aovisimap_hidden_t AS (seg int, hidden bigint, total bigint);
@@ -1955,25 +2050,8 @@ BEGIN
     RAISE NOTICE 'gp_appendonly_compaction_threshold = %', threshold;
     RETURN;
 END;
-$$ LANGUAGE plpgsql;
-
--- gp_toolkit.__gp_remove_ao_entry_from_cache
---   Helper function to evict an entry from AppendOnlyHash cache that is
---   suspected of not being correct (e.g. segment files having wrong states).
---   This should only be used for troubleshooting purposes.
-CREATE OR REPLACE FUNCTION gp_toolkit.__gp_remove_ao_entry_from_cache(oid)
-RETURNS VOID
-AS '$libdir/gp_ao_co_diagnostics', 'gp_remove_ao_entry_from_cache'
-LANGUAGE C IMMUTABLE STRICT NO SQL;
-
-CREATE OR REPLACE FUNCTION gp_toolkit.__gp_get_ao_entry_from_cache(ao_oid oid,
-       OUT segno smallint, OUT total_tupcount bigint, OUT tuples_added bigint,
-       OUT inserting_transaction xid, OUT latest_committed_inserting_dxid xid,
-       OUT state smallint, OUT format_version smallint, OUT is_full boolean,
-       OUT aborted boolean)
-RETURNS SETOF RECORD
-AS '$libdir/gp_ao_co_diagnostics', 'gp_get_ao_entry_from_cache'
-LANGUAGE C IMMUTABLE STRICT NO SQL;
+$$
+LANGUAGE plpgsql;
 
 -- Workfile views
 --------------------------------------------------------------------------------
@@ -1987,15 +2065,11 @@ LANGUAGE C IMMUTABLE STRICT NO SQL;
 -- @out:
 --        int - segment id
 --        text - path to workfile set,
---        int - hash value of the spilling operator,
 --        bigint - size in bytes,
---        int - state,
---        int - workmem in kilobytes,
---        int - type of the spilling operator,
+--        text - type of the spilling operation,
 --        int - containing slice,
 --        int - sessionid,
 --        int - command_cnt,
---        timestamptz - time of query start,
 --        int - number of files
 --
 -- @doc:
@@ -2032,48 +2106,38 @@ WITH all_entries AS (
    SELECT C.*
           FROM gp_toolkit.__gp_workfile_entries_f_on_master() AS C (
             segid int,
-            path text,
-            hash int,
+            prefix text,
             size bigint,
-            state int,
-            workmem int,
             optype text,
             slice int,
             sessionid int,
             commandid int,
-            query_start timestamptz,
             numfiles int
           )
     UNION ALL
     SELECT C.*
           FROM gp_toolkit.__gp_workfile_entries_f_on_segments() AS C (
             segid int,
-            path text,
-            hash int,
+            prefix text,
             size bigint,
-            state int,
-            workmem int,
             optype text,
             slice int,
             sessionid int,
             commandid int,
-            query_start timestamptz,
             numfiles int
           ))
 SELECT S.datname,
-       (CASE WHEN (C.state = 1) THEN S.pid ELSE NULL END) AS pid,
+       S.pid,
        C.sessionid as sess_id,
        C.commandid as command_cnt,
        S.usename,
-       (CASE WHEN (C.state = 1) THEN S.query ELSE NULL END) as query,
+       S.query,
        C.segid,
        C.slice,
        C.optype,
-       C.workmem,
        C.size,
        C.numfiles,
-       C.path as directory,
-       (CASE WHEN (C.state = 1) THEN 'RUNNING' WHEN (C.state = 2) THEN 'CACHED' WHEN (C.state = 3) THEN 'DELETING' ELSE 'UNKNOWN' END) as state
+       C.prefix
 FROM all_entries C LEFT OUTER JOIN
 pg_stat_activity as S
 ON C.sessionid = S.sess_id;
@@ -2112,10 +2176,10 @@ GRANT SELECT ON gp_toolkit.gp_workfile_usage_per_segment TO public;
 --------------------------------------------------------------------------------
 
 CREATE VIEW gp_toolkit.gp_workfile_usage_per_query AS
-SELECT datname, pid, sess_id, command_cnt, usename, query, segid, state,
+SELECT datname, pid, sess_id, command_cnt, usename, query, segid,
     SUM(size) AS size, SUM(numfiles) AS numfiles
 FROM gp_toolkit.gp_workfile_entries
-GROUP BY (datname, pid, sess_id, command_cnt, usename, query, segid, state);
+GROUP BY datname, pid, sess_id, command_cnt, usename, query, segid;
 
 GRANT SELECT ON gp_toolkit.gp_workfile_usage_per_query TO public;
 
