@@ -53,7 +53,7 @@ stream:
 #
 # PyGreSQL
 #
-PYGRESQL_VERSION=5.0.6
+PYGRESQL_VERSION=5.0.7
 PYGRESQL_DIR=PyGreSQL-$(PYGRESQL_VERSION)
 pygresql:
 	@echo "--- PyGreSQL"
