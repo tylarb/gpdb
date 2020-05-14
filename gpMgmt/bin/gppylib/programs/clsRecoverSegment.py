@@ -19,7 +19,7 @@
 from gppylib.mainUtils import *
 
 from optparse import OptionGroup
-import os, sys, signal, time, pg
+import os, sys, signal, time
 
 from gppylib import gparray, gplog, userinput, utils
 from gppylib.util import gp_utils
@@ -111,9 +111,8 @@ class RemoteQueryCommand(Command):
             self.qname, self.query, self.hostname, self.port, self.dbname))
         with dbconn.connect(dbconn.DbURL(hostname=self.hostname, port=self.port, dbname=self.dbname),
                             utility=True) as conn:
-            res = dbconn.query(conn, self.query)
-            self.res = res.fetchall()
-
+            self.res = dbconn.query(conn, self.query).fetchall()
+        conn.close()
 
 # -------------------------------------------------------------------------
 
@@ -551,6 +550,7 @@ class GpRecoverSegmentProgram:
         # template0 does not accept any connections so we exclude it
         with dbconn.connect(dbconn.DbURL()) as conn:
             res = dbconn.query(conn, "SELECT datname FROM PG_DATABASE WHERE datname != 'template0'")
+        conn.close()
         return res.fetchall()
 
     def run(self):
@@ -682,9 +682,9 @@ class GpRecoverSegmentProgram:
 
     def trigger_fts_probe(self, port=0):
         self.logger.info('Triggering FTS probe')
-        with dbconn.connect(dbconn.DbURL(port=port)) as conn:
-            res = dbconn.execSQL(conn, "SELECT gp_request_fts_probe_scan()")
-        return res.fetchall()
+        conn = dbconn.connect(dbconn.DbURL(port=port))
+        dbconn.execSQL(conn, "SELECT gp_request_fts_probe_scan()")
+        conn.close()
 
     def validate_heap_checksum_consistency(self, gpArray, mirrorBuilder):
         live_segments = [target.getLiveSegment() for target in mirrorBuilder.getMirrorsToBuild()]
