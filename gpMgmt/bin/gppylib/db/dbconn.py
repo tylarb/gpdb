@@ -275,7 +275,7 @@ def execSQL(conn, sql, autocommit=True):
     transaction.
     For SQL that captures some expected output, use "query()"
     Using with `dbconn.connect() as conn` syntax will override autocommit and complete
-    queries in a transaction followed by a commit on context close?
+    queries in a transaction followed by a commit on context close
     """
     conn.autocommit = autocommit
     with conn.cursor() as cursor:
