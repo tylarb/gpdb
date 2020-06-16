@@ -167,8 +167,8 @@ $(MOCK_BIN):
 	   PYTHONPATH=$(PYTHONSRC_INSTALL_PYTHON_PATH) python setup.py install --prefix $(PYTHONSRC_INSTALL) ; \
 	 fi;
 
-PYTHON_FILES=`grep -l --exclude=Makefile --exclude=gplogfilter "/bin/env python" *`\
-			 `grep -l "/bin/env python" $(SRC)/../sbin/*`\
+PYTHON_FILES=`grep -l --exclude=Makefile --exclude=gplogfilter "/bin/env python3" *`\
+			 `grep -l "/bin/env python3" $(SRC)/../sbin/*`\
 			 `find ./gppylib -name "*.py"`\
 			 `find $(SRC)/../sbin -name "*.py"`
 
