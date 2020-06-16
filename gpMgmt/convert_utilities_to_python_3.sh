@@ -10,15 +10,17 @@
 
 set -ex
 
+WORKDIR="/tmp/workdir"
+
 # Set up working directories
-rm -rf /tmp/workdir
-mkdir /tmp/workdir
+rm -rf "$WORKDIR"
+mkdir "$WORKDIR"
 
-cp -R ./bin /tmp/workdir
-cp -R ./sbin /tmp/workdir
-cp -R ./test /tmp/workdir
+cp -R ./bin "$WORKDIR"
+cp -R ./sbin "$WORKDIR"
+cp -R ./test "$WORKDIR"
 
-cd /tmp/workdir
+cd "$WORKDIR"
 
 # Convert gpMgmt/bin
 pushd bin/
@@ -45,9 +47,6 @@ rm -f crashreport.gdb *.sh*
 rm -rf multidd pexpect/ stream 
 popd
 
-pushd src/
-rm -rf stream/
-popd
 
 popd
 
@@ -82,8 +81,8 @@ popd
 popd
 
 # Run conversion
-2to3 --no-diffs -n -o converted -W .
+2to3 --no-diffs -n -j1 -o converted -W .
 
 set +ex
 echo "Conversion complete.  Please copy files back to gpMgmt with the following command:"
-echo "cp -R /tmp/workdir/* ."
+echo "cp -R "$WORKDIR"/* ."
