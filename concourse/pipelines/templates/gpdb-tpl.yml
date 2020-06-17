@@ -503,7 +503,7 @@ resources:
   type: docker-image
   source:
     repository: pivotaldata/gpdb7-centos7-build
-    tag: latest
+    tag: devv40
 
 {% endif %}
 {% if "centos7" in os_types or "CLI" in test_sections %}
@@ -511,7 +511,7 @@ resources:
   type: docker-image
   source:
     repository: pivotaldata/gpdb7-centos7-test
-    tag: latest
+    tag: devv45
 
 {% endif %}
 
@@ -519,14 +519,14 @@ resources:
   type: docker-image
   source:
     repository: pivotaldata/gpdb7-ubuntu18.04-build
-    tag: latest
+    tag: devv41
 
 {% if "ubuntu18.04" in os_types %}
 - name: gpdb7-ubuntu18.04-test
   type: docker-image
   source:
     repository: pivotaldata/gpdb7-ubuntu18.04-test
-    tag: latest
+    tag: devv38
 
 {% endif %}
 
