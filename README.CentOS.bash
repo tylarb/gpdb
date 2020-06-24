@@ -26,5 +26,5 @@ sudo yum install -y \
     zlib-devel
 
 sudo pip install conan
-sudo pip install -r python-dependencies.txt
-sudo pip install -r python-developer-dependencies.txt
+sudo pip install -r requirements.txt
+sudo pip install -r developer-requirements.txt
