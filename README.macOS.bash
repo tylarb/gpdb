@@ -29,8 +29,8 @@ brew install dep
 
 # Installing python libraries
 brew install python2
-pip install --user -r python-dependencies.txt
-pip install --user -r python-developer-dependencies.txt
+pip install --user -r requirements.txt
+pip install --user -r developer-requirements.txt
 
 #echo -e "127.0.0.1\t$HOSTNAME" | sudo tee -a /etc/hosts
 echo 127.0.0.1$'\t'$HOSTNAME | sudo tee -a /etc/hosts
