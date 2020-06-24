@@ -1,0 +1,10 @@
+paramiko==1.18.4
+ecdsa==0.13
+lockfile==0.9.1
+pycrypto==2.0.1
+pygresql==4.0
+pylint==0.21.0
+mock==1.0.1
+argparse==1.2.1
+parse==1.5.3
+psutil==4.0.0
