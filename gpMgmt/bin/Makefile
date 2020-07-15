@@ -75,9 +75,24 @@ PYGRESQL_VERSION=5.2
 PYGRESQL_DIR=PyGreSQL-$(PYGRESQL_VERSION)
 pygresql:
 	@echo "--- PyGreSQL"
-	cd $(PYLIB_SRC_EXT)/ && $(TAR) xzf $(PYGRESQL_DIR).tar.gz
-	cd $(PYLIB_SRC_EXT)/$(PYGRESQL_DIR)/ && PATH=$(bindir):$$PATH python setup.py build build_ext --no-ssl-info
-	cp -r $(PYLIB_SRC_EXT)/$(PYGRESQL_DIR)/build/lib*/* $(PYLIB_DIR)/
+	if [ ! -f $(DESTDIR)$(prefix)/greenplum_path.sh ]; then \
+		unset LIBPATH; \
+		./generate-greenplum-path.sh $(prefix) > $(DESTDIR)$(prefix)/greenplum_path.sh ; \
+	fi
+	cd $(PYLIB_SRC_EXT) && $(TAR) xzf $(PYGRESQL_DIR).tar.gz
+	. $(DESTDIR)$(prefix)/greenplum_path.sh && unset PYTHONHOME && \
+	if [ "$(BLD_ARCH)" = 'aix7_ppc_64' ]; then \
+		unset PYTHONPATH && cd $(PYLIB_SRC_EXT)/$(PYGRESQL_DIR) && PATH=$(bindir):$$PATH CC="$(CC)" python_64 setup.py build build_ext --no-ssl-info; \
+	else \
+		cd $(PYLIB_SRC_EXT)/$(PYGRESQL_DIR) && PATH=$(bindir):$$PATH LDFLAGS='$(LDFLAGS) $(PYGRESQL_LDFLAGS)' python setup.py build build_ext --no-ssl-info; \
+	fi
+	if [ `uname -s` = 'Darwin' ]; then \
+	  cp -r $(PYLIB_SRC_EXT)/$(PYGRESQL_DIR)/build/lib.macosx*/* $(PYLIB_DIR)/; \
+	elif [ `uname -s` = 'AIX' ]; then \
+	  cp -r $(PYLIB_SRC_EXT)/$(PYGRESQL_DIR)/build/lib.aix*/* $(PYLIB_DIR)/; \
+	else \
+	  cp -r $(PYLIB_SRC_EXT)/$(PYGRESQL_DIR)/build/lib.linux*/* $(PYLIB_DIR)/; \
+	fi
 
 
 #
