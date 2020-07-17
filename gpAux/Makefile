@@ -432,7 +432,7 @@ CLIENTS_FILESET_BIN = $(strip $(tmpCLIENTS_FILESET_BIN))
 define tmpCLIENTS_FILESET_BINEXT
 	pg.py
 	pgdb.py
-	_pg.so
+	_pg*.so
 	yaml
 endef
 CLIENTS_FILESET_BINEXT = $(strip $(tmpCLIENTS_FILESET_BINEXT))
