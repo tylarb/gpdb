@@ -7,6 +7,7 @@
 TODO: docs!
 """
 import os, pickle, base64, time
+import shlex
 import os.path
 import pipes
 import subprocess
@@ -1050,11 +1051,11 @@ class GpConfigHelper(Command):
 
         addParameter = (not getParameter) and (not removeParameter)
         if addParameter:
-            args = '--add-parameter %s --value %s ' % (name, base64.urlsafe_b64encode(pickle.dumps(value)))
+            args = "--add-parameter %s --value %s " % (name, shlex.quote(value))
         if getParameter:
-            args = '--get-parameter %s' % name
+            args = "--get-parameter %s" % name
         if removeParameter:
-            args = '--remove-parameter %s' % name
+            args = "--remove-parameter %s" % name
 
         cmdStr = "$GPHOME/sbin/gpconfig_helper.py --file %s %s" % (
             os.path.join(postgresconf_dir, 'postgresql.conf'),
@@ -1064,8 +1065,7 @@ class GpConfigHelper(Command):
 
     # FIXME: figure out how callers of this can handle exceptions here
     def get_value(self):
-        raw_value = self.get_results().stdout
-        return pickle.loads(base64.urlsafe_b64decode(raw_value))
+        return self.get_results().stdout
 
 
 #-----------------------------------------------
