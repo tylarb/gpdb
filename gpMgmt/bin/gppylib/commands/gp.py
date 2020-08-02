@@ -20,7 +20,7 @@ from gppylib import gparray
 from gppylib.commands.base import *
 from .unix import *
 from gppylib import pgconf
-from gppylib.utils import writeLinesToFile, createFromSingleHostFile, shellEscape
+from gppylib.utils import writeLinesToFile, createFromSingleHostFile
 
 
 logger = get_default_logger()
