@@ -1245,7 +1245,7 @@ def impl(context):
     with dbconn.connect(dbconn.DbURL(dbname='postgres'), unsetSearchPath=False) as conn:
         segconfig = dbconn.query(conn, check_segment_config_query).fetchall()
         statrep = dbconn.query(conn, check_stat_replication_query).fetchall()
-        conn.close()
+    conn.close()
 
     context.standby_dbid = segconfig[0][0]
 
@@ -1260,7 +1260,7 @@ def impl(context):
     check_segment_config_query = "SELECT * FROM gp_segment_configuration WHERE content = -1 AND role = 'p' AND preferred_role = 'p' AND dbid = %s" % context.standby_dbid
     with dbconn.connect(dbconn.DbURL(hostname=context.standby_hostname, dbname='postgres', port=context.standby_port), unsetSearchPath=False) as conn:
         segconfig = dbconn.query(conn, check_segment_config_query).fetchall()
-        conn.close()
+    conn.close()
     if len(segconfig) != 1:
         raise Exception("gp_segment_configuration did not have standby master acting as new master")
 
