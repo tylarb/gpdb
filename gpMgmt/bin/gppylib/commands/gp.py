@@ -6,7 +6,8 @@
 """
 TODO: docs!
 """
-import os, pickle, base64, time
+import json
+import os, time
 import shlex
 import os.path
 import pipes
@@ -535,11 +536,17 @@ class GpGetSegmentStatusValues(Command):
         if self.get_results().rc != 0:
             return ("Error getting status from host %s" % self.remoteHost, None)
 
+        # JSON turns int keys (like DBIDs) to string keys on dump, so we parse them back to ints on load
+        def keys_to_ints(d):
+            if isinstance(d, dict):
+                return {(int(k) if k.isdigit() else k):v for k,v in d.items()}
+            return d
+
         outputFromCmd = None
         for line in self.get_results().stdout.split('\n'):
             if line.startswith("STATUS_RESULTS:"):
                 toDecode = line[len("STATUS_RESULTS:"):]
-                outputFromCmd = pickle.loads(base64.urlsafe_b64decode(toDecode))
+                outputFromCmd = json.loads(toDecode, object_hook=keys_to_ints)
                 break
         if outputFromCmd is None:
             return ("No status output provided from host %s" % self.remoteHost, None)
