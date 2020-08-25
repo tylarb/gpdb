@@ -32,6 +32,8 @@ function configure() {
       # tree must be used here as well since the toplevel Makefile depends
       # on these options for deciding what to test. Since we don't ship
       ./configure --prefix=/usr/local/greenplum-db-devel --with-perl --with-python --with-libxml --enable-mapreduce --enable-orafce --enable-tap-tests --disable-orca --with-openssl ${CONFIGURE_FLAGS}
+      # Run configure again to add PL/Python3
+      PYTHON=/usr/bin/python3 ./configure --prefix=/usr/local/greenplum-db-devel --with-perl --with-python --with-libxml --enable-mapreduce --enable-orafce --enable-tap-tests --disable-orca --with-openssl ${CONFIGURE_FLAGS}
 
   popd
 }
