@@ -484,7 +484,9 @@ class SQLIsolationExecutor(object):
             command = ""
             for line in sql_file:
                 #tinctest.logger.info("re.match: %s" %re.match(r"^\d+[q\\<]:$", line))
-                print(line.strip(), file=output_file)
+                # this logic replicates the python2 behavior of a trailing comma at the end of print
+                # i.e. ''' print >>output_file, line.strip(), '''
+                print((" " if command else "") + line.strip(), end="", file=output_file)
                 if line[0] == "!":
                     command_part = line # shell commands can use -- for multichar options like --include
                 elif re.match(r";.*--", line) or re.match(r"^--", line):
