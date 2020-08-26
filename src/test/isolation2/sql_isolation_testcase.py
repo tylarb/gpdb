@@ -108,7 +108,7 @@ class SQLIsolationExecutor(object):
             print(r.rstrip(), file=self.out_file)
 
         def fork(self, command, blocking):
-            print(" <waiting ...>", file=self.out_file)
+            print("  <waiting ...>", file=self.out_file)
             self.pipe.send((command, True))
 
             if blocking:
@@ -120,7 +120,7 @@ class SQLIsolationExecutor(object):
 
         def join(self):
             r = None
-            print(" <... completed>", file=self.out_file)
+            print("  <... completed>", file=self.out_file)
             if self.has_open:
                 r = self.pipe.recv()
             if r is None:
@@ -135,7 +135,7 @@ class SQLIsolationExecutor(object):
                 raise Exception("Should not finish test case while waiting for results")
 
         def quit(self):
-            print("... <quitting>", file=self.out_file)
+            print(" ... <quitting>", file=self.out_file)
             self.stop()
         
         def terminate(self):
