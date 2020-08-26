@@ -94,7 +94,7 @@ class SQLIsolationExecutor(object):
             sp.do()
 
         def query(self, command):
-            print("\n", file=self.out_file)
+            print(file=self.out_file)
             self.out_file.flush()
             if len(command.strip()) == 0:
                 return
@@ -105,7 +105,7 @@ class SQLIsolationExecutor(object):
             r = self.pipe.recv()
             if r is None:
                 raise Exception("Execution failed")
-            print(r.rstrip(), end="" file=self.out_file)
+            print(r.rstrip(), file=self.out_file)
 
         def fork(self, command, blocking):
             print(" <waiting ...>", file=self.out_file)
@@ -484,7 +484,7 @@ class SQLIsolationExecutor(object):
             command = ""
             for line in sql_file:
                 #tinctest.logger.info("re.match: %s" %re.match(r"^\d+[q\\<]:$", line))
-                print(line.strip(), end="", file=output_file)
+                print(line.strip(), file=output_file)
                 if line[0] == "!":
                     command_part = line # shell commands can use -- for multichar options like --include
                 elif re.match(r";.*--", line) or re.match(r"^--", line):
