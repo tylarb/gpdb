@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 
 import unittest
 import sys
@@ -9,17 +9,14 @@ import socket
 import fileinput
 import platform
 import re
-try:
-    import subprocess32 as subprocess
-except:
-    import subprocess
+import subprocess
 import pg
 
 def get_port_from_conf():
     file = os.environ.get('MASTER_DATA_DIRECTORY')+'/postgresql.conf'
     if os.path.isfile(file):
         with open(file) as f:
-            for line in f.xreadlines():
+            for line in f:
                 match = re.search('port=\d+',line)
                 if match:
                     match1 = re.search('\d+', match.group())
@@ -348,7 +345,7 @@ def modify_sql_file(num):
     if os.path.isfile(file):
         for line in fileinput.FileInput(file,inplace=1):
             line = line.replace("gpload.py ","gpload ")
-            print str(re.sub('\n','',line))
+            print((str(re.sub('\n','',line))))
 
 def copy_data(source='',target=''):
     cmd = 'cp '+ mkpath('data/' + source) + ' ' + mkpath(target)
@@ -364,9 +361,9 @@ def get_table_name():
                   ,host='localhost'
                   ,port=int(PGPORT)
                   )
-    except Exception,e:
+    except Exception as e:
         errorMessage = str(e)
-        print 'could not connect to database: ' + errorMessage
+        print(('could not connect to database: ' + errorMessage))
     queryString = """SELECT relname
                      from pg_class
                      WHERE relname
@@ -382,9 +379,9 @@ def drop_tables():
                   ,host='localhost'
                   ,port=int(PGPORT)
                   )
-    except Exception,e:
+    except Exception as e:
         errorMessage = str(e)
-        print 'could not connect to database: ' + errorMessage
+        print(('could not connect to database: ' + errorMessage))
 
     list = get_table_name()
     for i in list:
@@ -472,9 +469,9 @@ class GPLoad_FormatOpts_TestCase(unittest.TestCase):
         self.doTest(3)
 
     def test_04_gpload_formatOpts_delimiter(self):
-        "4  gpload formatOpts delimiter E'\u0009' with reuse"
+        "4  gpload formatOpts delimiter E'\\u0009' with reuse"
         copy_data('external_file_02.txt','data_file.txt')
-        write_config_file(reuse_flag='true',formatOpts='text',file='data_file.txt',table='texttable',delimiter="E'\u0009'")
+        write_config_file(reuse_flag='true',formatOpts='text',file='data_file.txt',table='texttable',delimiter="E'\\u0009'")
         self.doTest(4)
 
     def test_05_gpload_formatOpts_delimiter(self):

@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 
 from gppylib.gplog import *
 from gppylib.gpcatalog import *
@@ -21,8 +21,7 @@ class ForeignKeyCheck:
 
     def runCheck(self, tables):
         foreign_key_issues = dict()
-        for cat in sorted(tables):
-
+        for cat in tables:
             issues = self.checkTableForeignKey(cat)
             if issues:
                 foreign_key_issues[cat.getTableName()] = issues
@@ -97,7 +96,7 @@ class ForeignKeyCheck:
             # are foreign keys--using a very specific filtering condition, since the full join would otherwise contain
             # unwanted entries from pg_class.
             #
-            can_use_full_join = self.query_filters.has_key(catname_filter) and pkcatname == 'pg_class'
+            can_use_full_join = catname_filter in self.query_filters and pkcatname == 'pg_class'
             if can_use_full_join:
                 qry = self.get_fk_query_full_join(catname, pkcatname, fkeystr, pkeystr,
                                                   pkey_aliases, cat1pkeys=cat1_pkeys_column_rename, filter=self.query_filters[catname_filter])

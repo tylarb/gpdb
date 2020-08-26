@@ -10,8 +10,7 @@ from test.behave_utils.utils import (
     wait_for_unblocked_transactions,
 )
 
-
-from mirrors_mgmt_utils import (add_three_mirrors)
+from test.behave.mgmt_utils.steps.mirrors_mgmt_utils import (add_three_mirrors)
 
 
 def assert_successful_command(context):
@@ -74,13 +73,13 @@ def ensure_primary_mirror_switched_roles():
         raise Exception("expected 2 segments to not be in preferred roles")
 
 
-@given(u'I have a machine with no cluster')
+@given('I have a machine with no cluster')
 def step_impl(context):
     stop_database(context)
 
 
-@given(u'a mirror has crashed')
-@when(u'a mirror has crashed')
+@given('a mirror has crashed')
+@when('a mirror has crashed')
 def step_impl(context):
     host, datadir = query_sql("postgres",
         "SELECT hostname, datadir FROM gp_segment_configuration WHERE role='m' AND content=0"
@@ -100,12 +99,12 @@ def step_impl(context):
     wait_for_unblocked_transactions(context)
 
 
-@when(u'I create a cluster')
+@when('I create a cluster')
 def step_impl(context):
     create_cluster(context)
 
 
-@then(u'the primaries and mirrors should be replicating using replication slots')
+@then('the primaries and mirrors should be replicating using replication slots')
 def step_impl(context):
     result_cursor = query_sql(
         "postgres",
@@ -123,7 +122,7 @@ def step_impl(context):
                 (content_id, result[0])
             )
 
-@then(u'the mirrors should not have replication slots')
+@then('the mirrors should not have replication slots')
 def step_impl(context):
     result_cursor = query_sql(
         "postgres",
@@ -136,7 +135,7 @@ def step_impl(context):
             raise Exception("expected replication slot directory to be empty")
 
 
-@given(u'a preferred primary has failed')
+@given('a preferred primary has failed')
 def step_impl(context):
     stop_primary(context, 0)
     wait_for_unblocked_transactions(context)

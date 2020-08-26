@@ -5,7 +5,7 @@ DROP ROLE IF EXISTS role2_cpu_test;
 DROP RESOURCE GROUP rg1_cpu_test;
 DROP RESOURCE GROUP rg2_cpu_test;
 
-CREATE LANGUAGE plpythonu;
+CREATE LANGUAGE plpython3u;
 -- end_ignore
 
 --
@@ -30,7 +30,7 @@ CREATE OR REPLACE FUNCTION fetch_sample() RETURNS text AS $$
         INSERT INTO cpu_usage_samples VALUES ('{value}')
     '''.format(value=json_text))
     return json_text
-$$ LANGUAGE plpythonu;
+$$ LANGUAGE plpython3u;
 
 -- verify_cpu_usage: calculate each QE's average cpu usage using all the data in
 -- the table cpu_usage_sample. And compare the average value to the expected value.
@@ -57,7 +57,7 @@ RETURNS BOOL AS $$
         return abs(avg - expect_cpu_usage) <= err_rate
 
     return verify_cpu_usage()
-$$ LANGUAGE plpythonu;
+$$ LANGUAGE plpython3u;
 
 CREATE OR REPLACE FUNCTION busy() RETURNS void AS $$
     import os
@@ -76,7 +76,7 @@ CREATE OR REPLACE FUNCTION busy() RETURNS void AS $$
                 pass
 
     os.wait()
-$$ LANGUAGE plpythonu;
+$$ LANGUAGE plpython3u;
 
 CREATE VIEW cancel_all AS
     SELECT pg_cancel_backend(pid)
@@ -100,7 +100,7 @@ DO LANGUAGE PLPYTHONU $$
         return int(open(fullpath).readline())
 
     def run_command(cmd):
-        return subprocess.check_output(cmd.split())
+        return subprocess.check_output(cmd.split()).decode()
 
     def show_guc(guc):
         return plpy.execute('SHOW {}'.format(guc))[0][guc]
@@ -320,4 +320,4 @@ DROP ROLE role1_cpu_test;
 DROP ROLE role2_cpu_test;
 DROP RESOURCE GROUP rg1_cpu_test;
 DROP RESOURCE GROUP rg2_cpu_test;
-DROP LANGUAGE plpythonu CASCADE;
+DROP LANGUAGE plpython3u CASCADE;

@@ -39,7 +39,8 @@ class RawRemoteOperation(Operation):
         cmd = Command(name = self.__class__.__name__,
                       cmdStr = self.cmd_str,
                       ctxt = REMOTE,
-                      remoteHost = self.host)
+                      remoteHost = self.host,
+                      pickled=True)
         cmd.run(validateAfter=True)
         # TODO! If exception is raised remotely, there's no stdout, thereby causing a pickling error.
         return pickle.loads(cmd.get_results().stdout)
@@ -104,7 +105,7 @@ class MakeDir(Operation):
     def execute(self):
          try:
              return os.makedirs(self.path)
-         except OSError, e:
+         except OSError as e:
              if e.errno != errno.EEXIST:
                  raise
     def __str__(self):
