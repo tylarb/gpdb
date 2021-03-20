@@ -1,5 +1,5 @@
 enum34==1.1.6
-Jinja2==2.10
+Jinja2==2.11.3
 parse-type==0.4.2
 pexpect==4.4.0
 PSI==0.3b2
